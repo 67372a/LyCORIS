@@ -189,8 +189,9 @@ class ButterflyOFTModule(LycorisBaseModule):
         scaled = norm != desired
         if scaled:
             self.oft_blocks *= ratio
-
-        return scaled, orig_norm * ratio
+            return scaled, orig_norm * ratio
+        else:
+            return 0, orig_norm
 
     def _bypass_forward(self, x, scale=1, diff=False):
         m = self.boft_m

@@ -444,8 +444,9 @@ class LokrModule(LycorisBaseModule):
                     self.lokr_t2 *= ratio ** (1 / modules)
                 self.lokr_w2_a *= ratio ** (1 / modules)
                 self.lokr_w2_b *= ratio ** (1 / modules)
-
-        return scaled, orig_norm * ratio
+            return scaled, orig_norm * ratio
+        else:
+            return 0, orig_norm
 
     def bypass_forward_diff(self, h, scale=1):
         is_conv = self.module_type.startswith("conv")
