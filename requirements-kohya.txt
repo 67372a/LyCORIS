@@ -9,7 +9,7 @@ einops==0.7.0
 pytorch-lightning==1.9.0
 bitsandbytes==0.43.0
 prodigyopt==1.0
-lion-pytorch==0.0.6
+lion-pytorch==0.2.3
 tensorboard
 safetensors==0.4.2
 # gradio==3.16.2
