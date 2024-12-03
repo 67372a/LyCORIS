@@ -13,7 +13,7 @@ lion-pytorch==0.2.3
 tensorboard
 safetensors==0.4.2
 # gradio==3.16.2
-altair==4.2.2
+altair==5.5.0
 easygui==0.98.3
 toml==0.10.2
 voluptuous==0.13.1
