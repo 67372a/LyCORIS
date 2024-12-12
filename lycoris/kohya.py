@@ -599,9 +599,6 @@ class LycorisNetworkKohya(LycorisNetwork):
             norms.append(norm)
             key_scaled += scaled
 
-        if key_scaled == 0:
-            return 0, 0, 0
-
         return key_scaled, sum(norms) / len(norms), max(norms)
 
     def prepare_optimizer_params(self, text_encoder_lr, unet_lr, learning_rate):
