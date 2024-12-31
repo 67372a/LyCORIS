@@ -38,6 +38,6 @@ imagesize==1.4.1
 # open clip for SDXL
 # open-clip-torch==2.20.0
 # For logging
-rich==13.7.0
+rich==13.9.4
 # for kohya_ss library
 git+https://github.com/kohya-ss/sd-scripts
