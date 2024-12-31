@@ -1,4 +1,4 @@
-accelerate==0.25.0
+accelerate==1.2.1
 transformers==4.47.0
 diffusers[torch]==0.31.0
 ftfy==6.3.1
