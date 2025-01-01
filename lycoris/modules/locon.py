@@ -13,8 +13,8 @@ from ..logging import logger
 @cache
 def log_wd():
     return logger.warning(
-        "Using weight_decompose=True with LoRA (DoRA) will ignore network_dropout."
-        "Only rank dropout and module dropout will be applied"
+        "Using weight_decompose=True with LoRA (DoRA) will cause network dropout to be applied to the forward input,"
+        "instead of to the layers. Much smaller values than are typically used are advised e.x. 10x smaller."
     )
 
 
@@ -321,6 +321,8 @@ class LoConModule(LycorisBaseModule):
                 weight = self.apply_weight_decompose(
                     weight + diff_weight, self.multiplier
                 )
+                # Apply dropout to the input as per the DORA paper
+                x = self.dropout(x)
             else:
                 weight = weight + diff_weight * self.multiplier
             bias = (
