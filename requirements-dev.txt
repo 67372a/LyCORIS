@@ -3,4 +3,4 @@ parameterized
 numpy
 safetensors
 tqdm
-diffusers==0.31.0
+diffusers==0.32.1
