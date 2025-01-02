@@ -13,8 +13,8 @@ from ..logging import logger
 @cache
 def log_wd():
     return logger.warning(
-        "Using weight_decompose=True with LoRA (DoRA) will cause network dropout to be applied to the forward input,"
-        "instead of to the layers. Much smaller values than are typically used are advised e.x. 10x smaller."
+        "Using weight_decompose=True with LoRA (DoRA) will cause network dropout to be applied to the forward input, "
+        "instead of to the layers, as per the DoRA paper."
     )
 
 
