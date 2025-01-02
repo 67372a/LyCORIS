@@ -199,6 +199,14 @@ class ButterflyOFTModule(LycorisBaseModule):
             return scaled, orig_norm * ratio
         else:
             return 0, orig_norm
+        
+    @torch.no_grad()
+    def get_norm(self, device=None):
+        # Norm before scale determined by alpha / r_factor
+        unscaled_norm = self.oft_blocks.norm()
+        # Norm after scale determined by alpha / r_factor
+        scaled_norm = unscaled_norm * self.scale
+        return unscaled_norm.item(), scaled_norm.item()
 
     def _bypass_forward(self, x, scale=1, diff=False):
         m = self.boft_m

@@ -465,6 +465,14 @@ class LokrModule(LycorisBaseModule):
             return scaled, orig_norm * ratio
         else:
             return 0, orig_norm
+        
+    @torch.no_grad()
+    def get_norm(self, device=None):
+        weight = self.get_weight(self.shape)
+        # Unscaled and scaled are the same for lokr(?)
+        unscaled_norm = weight.norm()
+        scaled_norm = weight.norm()
+        return unscaled_norm.item(), scaled_norm.item()
 
     def bypass_forward_diff(self, h, scale=1):
         is_conv = self.module_type.startswith("conv")

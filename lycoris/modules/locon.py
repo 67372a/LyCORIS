@@ -283,6 +283,14 @@ class LoConModule(LycorisBaseModule):
             return scaled, orig_norm * ratio
         else:
             return 0, orig_norm
+        
+    @torch.no_grad()
+    def get_norm(self, device=None):
+        # Norm before scale determined by alpha / r_factor
+        unscaled_norm = self.make_weight(device).norm()
+        # Norm after scale determined by alpha / r_factor
+        scaled_norm = unscaled_norm * self.scale
+        return unscaled_norm.item(), scaled_norm.item()
 
     def bypass_forward_diff(self, x, scale=1):
         if self.tucker:
