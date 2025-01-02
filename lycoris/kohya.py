@@ -5,6 +5,8 @@ import logging
 
 from typing import Any, List
 
+import numpy as np
+
 import torch
 
 from .utils import precalculate_safetensors_hashes
@@ -600,6 +602,18 @@ class LycorisNetworkKohya(LycorisNetwork):
             key_scaled += scaled
 
         return key_scaled, sum(norms) / len(norms), max(norms)
+    
+    def get_norms(self, device):
+        scaled_norms = []
+        unscaled_norms = []
+        for module in self.unet_loras + self.text_encoder_loras:
+            unscaled_norm, scaled_norm = module.get_norm(device)
+            if not (unscaled_norm is None or np.isnan(unscaled_norm) or np.isinf(unscaled_norm)):
+                unscaled_norms.append(unscaled_norm)
+            if not (scaled_norm is None or np.isnan(scaled_norm) or np.isinf(scaled_norm)):
+                scaled_norms.append(scaled_norm)
+
+        return unscaled_norms, scaled_norms
 
     def prepare_optimizer_params(self, text_encoder_lr, unet_lr, learning_rate):
         def enumerate_params(loras):
