@@ -1,5 +1,5 @@
 accelerate==1.2.1
-transformers==4.47.1
+transformers==4.48.0
 diffusers==0.32.1
 ftfy==6.3.1
 # albumentations==1.3.0
@@ -10,18 +10,18 @@ bitsandbytes==0.45.0
 prodigyopt==1.1.1
 lion-pytorch==0.2.3
 schedulefree==1.4
-tensorboard
+tensorboard==2.18.0
 safetensors==0.5.2
+hpsv2==1.2.0
 # gradio==3.16.2
-# Breaking changes with newer versions
-altair==4.2.2 
+altair==5.5.0
+narwhals==1.21.1
 easygui==0.98.3
 toml==0.10.2
 voluptuous==0.15.2
-# Breaking changes with newer versions
 huggingface-hub==0.27.1
-matplotlib
-scipy
+matplotlib==3.10.0
+scipy==1.15.0
 # for Image utils
 imagesize==1.4.1
 # for BLIP captioning

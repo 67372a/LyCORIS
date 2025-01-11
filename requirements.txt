@@ -1,4 +1,4 @@
-torch
+torch==2.5.1+cu124
 toml
 einops
 setuptools>=70.0.0 # not directly required, pinned by Snyk to avoid a vulnerability
