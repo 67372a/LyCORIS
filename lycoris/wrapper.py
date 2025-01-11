@@ -615,7 +615,7 @@ class LycorisNetwork(torch.nn.Module):
 
         param_data = {"params": enumerate_params(self.loras)}
         if lr is not None:
-            param_data["lr"] = lr
+            param_data["lr"] = torch.tensor(lr)
         all_params.append(param_data)
         return all_params
 

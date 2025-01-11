@@ -628,13 +628,13 @@ class LycorisNetworkKohya(LycorisNetwork):
         if self.text_encoder_loras:
             param_data = {"params": enumerate_params(self.text_encoder_loras)}
             if text_encoder_lr is not None:
-                param_data["lr"] = text_encoder_lr
+                param_data["lr"] = torch.tensor(text_encoder_lr)
             all_params.append(param_data)
 
         if self.unet_loras:
             param_data = {"params": enumerate_params(self.unet_loras)}
             if unet_lr is not None:
-                param_data["lr"] = unet_lr
+                param_data["lr"] = torch.tensor(unet_lr)
             all_params.append(param_data)
 
         return all_params
