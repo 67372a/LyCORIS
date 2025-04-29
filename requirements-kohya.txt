@@ -47,7 +47,7 @@ imagesize==1.4.1
 rich==14.0.0
 # for T5XXL tokenizer (SD3/FLUX)
 sentencepiece==0.2.0
-torchjd==0.5.0
+torchjd==0.6.0
 dadaptation==3.2
 wandb==0.19.10
 came-pytorch==0.1.3
