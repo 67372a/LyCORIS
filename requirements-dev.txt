@@ -7,6 +7,6 @@ numpy==1.26.4
 tqdm==4.67.1
 safetensors==0.5.3
 diffusers==0.33.1
-setuptools==79.0.1
+setuptools==80.3.1
 wheel==0.45.1
 packaging==25.0
