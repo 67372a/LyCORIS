@@ -2,4 +2,4 @@ torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 toml==0.10.2
 einops==0.8.1
 tqdm==4.67.1
-setuptools==80.4.0
+setuptools==80.7.1
