@@ -38,6 +38,6 @@ prodigy-plus-schedule-free==1.9.2
 kornia==0.8.0
 xformers==v0.0.29.post3 --index-url https://download.pytorch.org/whl/cu124
 PyWavelets==1.8.0
-hf-xet==1.0.5
+hf-xet==1.1.5
 # for kohya_ss library
 git+https://github.com/67372a/sd-scripts
