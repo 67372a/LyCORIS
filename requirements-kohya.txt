@@ -19,7 +19,7 @@ narwhals==1.39.0
 toml==0.10.2
 voluptuous==0.15.2
 huggingface-hub[hf_xet]==0.31.2
-matplotlib==3.10.1
+matplotlib==3.10.3
 scipy==1.15.3
 imagesize==1.4.1
 rich==14.0.0
