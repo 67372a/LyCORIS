@@ -16,7 +16,7 @@ safetensors==0.5.3
 toml==0.10.2
 voluptuous==0.15.2
 huggingface-hub[hf_xet]==0.33.4
-matplotlib==3.10.1
+matplotlib==3.10.5
 scipy==1.15.2
 imagesize==1.4.1
 rich==14.1.0
