@@ -203,7 +203,7 @@ PRESET = {
         "text_encoder_target_name": [],
     },
     "anima": {
-        "enable_conv": True,
+        "enable_conv": False,
         "unet_target_module": [
             "Block"
         ],
@@ -213,7 +213,7 @@ PRESET = {
         "exclude_name": [r".*(_modulation|_embedder|final_layer).*"],
     },
     "anima-inpaint": {
-        "enable_conv": True,
+        "enable_conv": False,
         "unet_target_module": [
             "Block",
             "PatchEmbed",
@@ -229,7 +229,7 @@ PRESET = {
         "exclude_patterns": [r".*_te_layers_.*", r".*adaln_modulation.*"],
     },
     "anima-full-no-excludes": {
-        "enable_conv": True,
+        "enable_conv": False,
         "unet_target_module": [
             "Block",
             "PatchEmbed",
