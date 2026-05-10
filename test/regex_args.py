@@ -1,7 +1,7 @@
 """
 Unit tests for regex-based network args:
   - exclude_patterns / include_patterns
-  - reg_dims / reg_lrs
+  - network_reg_dims / network_reg_lrs
   - Preset fallback with network arg priority
   - exclude_patterns precedence over exclude_name
 """
@@ -37,8 +37,8 @@ def reset_globals():
             "exclude_name": [],
             "exclude_patterns": None,
             "include_patterns": None,
-            "reg_dims": None,
-            "reg_lrs": None,
+            "network_reg_dims": None,
+            "network_reg_lrs": None,
         }
     )
 
@@ -61,7 +61,7 @@ class SimpleNet(nn.Module):
 
 
 class LycorisRegexArgsTests(unittest.TestCase):
-    """Tests for exclude_patterns, include_patterns, reg_dims, reg_lrs."""
+    """Tests for exclude_patterns, include_patterns, network_reg_dims, network_reg_lrs."""
 
     def _get_lora_names(self, network):
         return sorted([lora.lora_name for lora in network.loras])
@@ -190,15 +190,15 @@ class LycorisRegexArgsTests(unittest.TestCase):
         finally:
             reset_globals()
 
-    # ── reg_dims ──────────────────────────────────────────────────────
+    # ── network_reg_dims ──────────────────────────────────────────────────────
 
     def test_reg_dims_overrides_module_dim(self):
-        """reg_dims should override the default dim for matching modules."""
+        """network_reg_dims should override the default dim for matching modules."""
         try:
             net = SimpleNet()
             lycoris_net = create_lycoris(
                 net, 1, linear_dim=4, linear_alpha=1,
-                reg_dims={r".*attn.*": 32},
+                network_reg_dims={r".*attn.*": 32},
             )
             for lora in lycoris_net.loras:
                 orig = getattr(lora, 'original_name', '')
@@ -210,12 +210,12 @@ class LycorisRegexArgsTests(unittest.TestCase):
             reset_globals()
 
     def test_reg_dims_multiple_patterns(self):
-        """Multiple reg_dims patterns should each apply to their matching modules."""
+        """Multiple network_reg_dims patterns should each apply to their matching modules."""
         try:
             net = SimpleNet()
             lycoris_net = create_lycoris(
                 net, 1, linear_dim=4, linear_alpha=1,
-                reg_dims={r".*attn.*": 16, r".*mlp.*": 64},
+                network_reg_dims={r".*attn.*": 16, r".*mlp.*": 64},
             )
             for lora in lycoris_net.loras:
                 orig = getattr(lora, 'original_name', '')
@@ -226,18 +226,18 @@ class LycorisRegexArgsTests(unittest.TestCase):
         finally:
             reset_globals()
 
-    # ── reg_lrs ──────────────────────────────────────────────────────
+    # ── network_reg_lrs ──────────────────────────────────────────────────────
 
     def test_reg_lrs_stored_on_network(self):
-        """reg_lrs should be stored on the network object for optimizer use."""
+        """network_reg_lrs should be stored on the network object for optimizer use."""
         try:
             net = SimpleNet()
             lycoris_net = create_lycoris(
                 net, 1, linear_dim=4, linear_alpha=1,
-                reg_lrs={r".*attn.*": 1e-4, r".*mlp.*": 5e-5},
+                network_reg_lrs={r".*attn.*": 1e-4, r".*mlp.*": 5e-5},
             )
-            self.assertIsNotNone(lycoris_net.reg_lrs)
-            self.assertEqual(len(lycoris_net.reg_lrs), 2)
+            self.assertIsNotNone(lycoris_net.network_reg_lrs)
+            self.assertEqual(len(lycoris_net.network_reg_lrs), 2)
         finally:
             reset_globals()
 
@@ -297,7 +297,7 @@ class LycorisRegexArgsTests(unittest.TestCase):
             reset_globals()
 
     def test_preset_reg_dims_fallback(self):
-        """reg_dims from preset should be used when not set via network args."""
+        """network_reg_dims from preset should be used when not set via network args."""
         try:
             LycorisNetwork.apply_preset({
                 "network_reg_dims": {r".*attn.*": 32},
@@ -314,7 +314,7 @@ class LycorisRegexArgsTests(unittest.TestCase):
             reset_globals()
 
     def test_preset_reg_lrs_fallback(self):
-        """reg_lrs from preset should be used when not set via network args."""
+        """network_reg_lrs from preset should be used when not set via network args."""
         try:
             LycorisNetwork.apply_preset({
                 "network_reg_lrs": {r".*attn.*": 1e-4},
@@ -323,8 +323,8 @@ class LycorisRegexArgsTests(unittest.TestCase):
             lycoris_net = create_lycoris(
                 net, 1, linear_dim=4, linear_alpha=1,
             )
-            self.assertIsNotNone(lycoris_net.reg_lrs)
-            self.assertIn(r".*attn.*", lycoris_net.reg_lrs)
+            self.assertIsNotNone(lycoris_net.network_reg_lrs)
+            self.assertIn(r".*attn.*", lycoris_net.network_reg_lrs)
         finally:
             reset_globals()
 
@@ -354,7 +354,7 @@ class LycorisRegexArgsTests(unittest.TestCase):
             reset_globals()
 
     def test_network_args_override_preset_reg_dims(self):
-        """Network arg reg_dims should override preset."""
+        """Network arg network_reg_dims should override preset."""
         try:
             LycorisNetwork.apply_preset({
                 "network_reg_dims": {r".*attn.*": 8},
@@ -362,7 +362,7 @@ class LycorisRegexArgsTests(unittest.TestCase):
             net = SimpleNet()
             lycoris_net = create_lycoris(
                 net, 1, linear_dim=4, linear_alpha=1,
-                reg_dims={r".*attn.*": 64},
+                network_reg_dims={r".*attn.*": 64},
             )
             for lora in lycoris_net.loras:
                 orig = getattr(lora, 'original_name', '')
@@ -374,13 +374,13 @@ class LycorisRegexArgsTests(unittest.TestCase):
     # ── Combined scenarios ────────────────────────────────────────────
 
     def test_exclude_and_reg_dims_together(self):
-        """exclude_patterns and reg_dims should work together."""
+        """exclude_patterns and network_reg_dims should work together."""
         try:
             net = SimpleNet()
             lycoris_net = create_lycoris(
                 net, 1, linear_dim=4, linear_alpha=1,
                 exclude_patterns=[r".*conv.*"],
-                reg_dims={r".*attn.*": 32},
+                network_reg_dims={r".*attn.*": 32},
             )
             names = self._get_original_names(lycoris_net)
             conv_names = [n for n in names if "conv" in n]
@@ -418,8 +418,8 @@ class LycorisRegexArgsTests(unittest.TestCase):
                 orig = getattr(lora, 'original_name', '')
                 if "attn" in orig and hasattr(lora, 'lora_dim'):
                     self.assertEqual(lora.lora_dim, 16)
-            # reg_lrs should be stored
-            self.assertIsNotNone(lycoris_net.reg_lrs)
+            # network_reg_lrs should be stored
+            self.assertIsNotNone(lycoris_net.network_reg_lrs)
         finally:
             reset_globals()
 

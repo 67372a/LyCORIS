@@ -130,10 +130,10 @@ def create_network(
 
     # regex-specific learning rates / dimensions
     network_reg_lrs_str = kwargs.get("network_reg_lrs", None)
-    reg_lrs = _parse_kv_pairs(network_reg_lrs_str, is_int=False) if network_reg_lrs_str is not None else None
+    network_reg_lrs = _parse_kv_pairs(network_reg_lrs_str, is_int=False) if network_reg_lrs_str is not None else None
 
     network_reg_dims_str = kwargs.get("network_reg_dims", None)
-    reg_dims = _parse_kv_pairs(network_reg_dims_str, is_int=True) if network_reg_dims_str is not None else None
+    network_reg_dims = _parse_kv_pairs(network_reg_dims_str, is_int=True) if network_reg_dims_str is not None else None
 
     ggpo_beta = kwargs.get("ggpo_beta", None)
     ggpo_sigma = kwargs.get("ggpo_sigma", None)
@@ -252,8 +252,8 @@ def create_network(
         train_llm_adapter=train_llm_adapter,
         exclude_patterns=exclude_patterns,
         include_patterns=include_patterns,
-        reg_dims=reg_dims,
-        reg_lrs=reg_lrs,
+        network_reg_dims=network_reg_dims,
+        network_reg_lrs=network_reg_lrs,
     )
     if (
         loraplus_lr_ratio is not None
@@ -416,8 +416,8 @@ class LycorisNetworkKohya(LycorisNetwork):
     TARGET_EXCLUDE_NAME = []
     EXCLUDE_PATTERNS = None
     INCLUDE_PATTERNS = None
-    REG_DIMS = None
-    REG_LRS = None
+    NETWORK_REG_DIMS = None
+    NETWORK_REG_LRS = None
 
     @classmethod
     def apply_preset(cls, preset):
@@ -445,10 +445,10 @@ class LycorisNetworkKohya(LycorisNetwork):
             cls.EXCLUDE_PATTERNS = preset["exclude_patterns"]
         if "include_patterns" in preset:
             cls.INCLUDE_PATTERNS = preset["include_patterns"]
-        if "reg_dims" in preset:
-            cls.REG_DIMS = preset["reg_dims"]
-        if "reg_lrs" in preset:
-            cls.REG_LRS = preset["reg_lrs"]
+        if "network_reg_dims" in preset:
+            cls.NETWORK_REG_DIMS = preset["network_reg_dims"]
+        if "network_reg_lrs" in preset:
+            cls.NETWORK_REG_LRS = preset["network_reg_lrs"]
         return cls
 
     def __init__(
@@ -471,8 +471,8 @@ class LycorisNetworkKohya(LycorisNetwork):
         train_llm_adapter=False,
         exclude_patterns=None,
         include_patterns=None,
-        reg_dims=None,
-        reg_lrs=None,
+        network_reg_dims=None,
+        network_reg_lrs=None,
         **kwargs,
     ) -> None:
         torch.nn.Module.__init__(self)
@@ -548,12 +548,12 @@ class LycorisNetworkKohya(LycorisNetwork):
         # Merge preset values with network arg values (network args take priority)
         effective_exclude_patterns = exclude_patterns if exclude_patterns is not None else self.EXCLUDE_PATTERNS
         effective_include_patterns = include_patterns if include_patterns is not None else self.INCLUDE_PATTERNS
-        effective_reg_dims = reg_dims if reg_dims is not None else self.REG_DIMS
-        effective_reg_lrs = reg_lrs if reg_lrs is not None else self.REG_LRS
+        effective_reg_dims = network_reg_dims if network_reg_dims is not None else self.NETWORK_REG_DIMS
+        effective_reg_lrs = network_reg_lrs if network_reg_lrs is not None else self.NETWORK_REG_LRS
 
-        # Store reg_dims and reg_lrs
-        self.reg_dims = effective_reg_dims
-        self.reg_lrs = effective_reg_lrs
+        # Store network_reg_dims and network_reg_lrs
+        self.network_reg_dims = effective_reg_dims
+        self.network_reg_lrs = effective_reg_lrs
 
         # Compile include/exclude regex patterns
         def _compile_patterns(patterns):
@@ -573,10 +573,10 @@ class LycorisNetworkKohya(LycorisNetwork):
             logger.info(f"Exclude patterns: {[p.pattern for p in exclude_re_patterns]}")
         if include_re_patterns:
             logger.info(f"Include patterns (override exclude): {[p.pattern for p in include_re_patterns]}")
-        if self.reg_dims:
-            logger.info(f"Regex-specific dimensions: {self.reg_dims}")
-        if self.reg_lrs:
-            logger.info(f"Regex-specific learning rates: {self.reg_lrs}")
+        if self.network_reg_dims:
+            logger.info(f"Regex-specific dimensions: {self.network_reg_dims}")
+        if self.network_reg_lrs:
+            logger.info(f"Regex-specific learning rates: {self.network_reg_lrs}")
 
         def _is_excluded(full_name):
             """Check if a module name should be excluded, respecting include overrides.
@@ -595,9 +595,9 @@ class LycorisNetworkKohya(LycorisNetwork):
             return excluded
 
         def _get_reg_dim(full_name):
-            """Check if a module name matches any reg_dims regex and return the override dim."""
-            if self.reg_dims:
-                for reg_pattern, d in self.reg_dims.items():
+            """Check if a module name matches any network_reg_dims regex and return the override dim."""
+            if self.network_reg_dims:
+                for reg_pattern, d in self.network_reg_dims.items():
                     if re.fullmatch(reg_pattern, full_name):
                         logger.info(f"Module {full_name} matched regex '{reg_pattern}' -> dim: {d}")
                         return d
@@ -1121,8 +1121,8 @@ class LycorisNetworkKohya(LycorisNetwork):
         # Build reg_lr lookup: lora_name -> reg_lr_idx
         reg_lr_lookup = {}  # lora_name -> reg_lr_idx
         reg_lr_values = {}  # reg_lr_idx -> lr_value
-        if self.reg_lrs:
-            reg_lrs_list = list(self.reg_lrs.items())
+        if self.network_reg_lrs:
+            reg_lrs_list = list(self.network_reg_lrs.items())
             for i, (_, lr_val) in enumerate(reg_lrs_list):
                 reg_lr_values[i] = lr_val
             for lora in self.loras:
