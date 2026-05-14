@@ -76,19 +76,30 @@ There are three different ways to train LyCORIS models.
 - With [Naifu-Diffusion](https://github.com/Mikubill/naifu)
 - With your own script by using LyCORIS as standalone wrappers for **ANY** pytorch modules.
 
-In any case, please install this package in the corresponding virtual environment. You can either install it
+In any case, please install this package in the corresponding virtual environment.
 
-- through pip
+- with [uv](https://docs.astral.sh/uv/) (recommended)
+
+  ```bash
+  uv add lycoris-lora
+  # or with kohya support
+  uv add "lycoris-lora[kohya]"
+  ```
+- with pip
 
   ```bash
   pip install lycoris-lora
+  # or with kohya support
+  pip install "lycoris-lora[kohya]"
   ```
-- or from source
+- from source
 
   ```bash
   git clone https://github.com/KohakuBlueleaf/LyCORIS
   cd LyCORIS
-  pip install .
+  uv sync
+  # or with kohya support
+  uv sync --extra kohya
   ```
 
 A detailed description of the network arguments is provided in [docs/Network-Args.md](docs/Network-Args.md).

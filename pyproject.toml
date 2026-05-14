@@ -1,0 +1,93 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lycoris_lora"
+version = "3.2.0.dev17"
+description = "Lora beYond Conventional methods, Other Rank adaptation Implementations for Stable diffusion"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [
+    { name = "Shih-Ying Yeh (KohakuBlueLeaf)", email = "kohaku@kblueleaf.net" },
+    { name = "Yu-Guan Hsieh" },
+    { name = "Zhidong Gao" },
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: GPU :: NVIDIA CUDA :: 11.8",
+    "Environment :: GPU :: NVIDIA CUDA :: 12",
+    "Environment :: GPU :: NVIDIA CUDA :: 12 :: 12.1",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "torch>=2.4.1",
+    "einops>=0.8.1",
+    "toml>=0.10.2",
+    "tqdm>=4.67.1",
+]
+
+[project.optional-dependencies]
+kohya = [
+    "accelerate>=1.2.0",
+    "transformers>=4.38.0",
+    "diffusers>=0.25.0",
+    "opencv-python>=4.7.0",
+    "einops>=0.7.0",
+    "pytorch-lightning>=2.1.0",
+    "bitsandbytes>=0.43.0",
+    "prodigyopt>=1.0",
+    "lion-pytorch>=0.1.2",
+    "schedulefree>=1.2.0",
+    "tensorboard>=2.14.0",
+    "safetensors>=0.4.0",
+    "toml>=0.10.2",
+    "voluptuous>=0.13.0",
+    "huggingface-hub>=0.20.0",
+    "matplotlib>=3.7.0",
+    "scipy>=1.11.0",
+    "imagesize>=1.4.1",
+    "rich>=13.0.0",
+    "sentencepiece>=0.1.98",
+    "dadaptation>=3.1",
+    "wandb>=0.16.0",
+    "pytorch-optimizer>=3.0.0",
+    "wheel>=0.41.0",
+    "ninja>=1.11.0",
+    "cmake>=3.28.0",
+    "setuptools>=69.0.0",
+    "triton>=2.0.0; platform_system == 'Linux'",
+    "triton-windows>=3.0.0; platform_system == 'Windows'",
+    "prodigy-plus-schedule-free>=1.0.0",
+    "kornia>=0.7.0",
+    "PyWavelets>=1.5.0",
+    "hf-xet>=1.0.0",
+    "RamTorch>=0.1.0",
+    # sd-scripts: install separately via pip install git+https://github.com/67372a/sd-scripts
+]
+
+[dependency-groups]
+dev = [
+    "coverage~=7.10.1",
+    "parameterized~=0.9.0",
+    "numpy>=2.0.0",
+    "safetensors>=0.5.3",
+    "diffusers>=0.34.0",
+    "wheel~=0.45.1",
+    "packaging~=25.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["lycoris"]
+
+[project.urls]
+Homepage = "https://github.com/KohakuBlueleaf/LyCORIS"
+Repository = "https://github.com/KohakuBlueleaf/LyCORIS"
+Issues = "https://github.com/KohakuBlueleaf/LyCORIS/issues"

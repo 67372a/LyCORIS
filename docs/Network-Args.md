@@ -61,9 +61,16 @@ Arguments to put in `network_args` for kohya sd scripts
 ### Scalar
 
 - Enabled with `use_scalar=True`
-- Valid for LoRA, LoHa, and LoKr.
+- Valid for LoRA, LoHa, LoKr, GLoRA, ABBA, and T-LoRA.
 - Train an additional scalar in front of the weight difference
 - Use a different weight initialization strategy
+
+### Scalar Init Value
+
+- Set with `scalar_init_value=FLOAT`
+- Valid for all modules that support `use_scalar`
+- Set the initial value of the learnable scalar parameter when `use_scalar=True`
+- Default: 0.01 for LoRA/LoHa/LoKr/GLoRA, 0.99 for ABBA/T-LoRA
 
 ### Weight Decompose
 
