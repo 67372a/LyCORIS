@@ -55,6 +55,7 @@ class AbbaModule(LycorisBaseModule):
         module_dropout=0.0,
         use_tucker=False,
         use_scalar=False,
+        scalar_init_value=None,
         rank_dropout_scale=False,
         weight_decompose=False,
         wd_on_output=True,
@@ -176,7 +177,8 @@ class AbbaModule(LycorisBaseModule):
             self.scale = 0.0
         
         if use_scalar:
-            self.scalar = nn.Parameter(torch.tensor(1.0))
+            init_val = scalar_init_value if scalar_init_value is not None else 0.99
+            self.scalar = nn.Parameter(torch.tensor(init_val))
         else:
             self.register_buffer("scalar", torch.tensor(1.0), persistent=False)
         

@@ -167,6 +167,7 @@ class TLoraModule(LycorisBaseModule):
         module_dropout: float = 0.0,
         use_tucker: bool = False,
         use_scalar: bool = False,
+        scalar_init_value: float = None,
         rank_dropout_scale: bool = False,
         bypass_mode: bool = None,
         sig_type: SigType = "principal",
@@ -308,7 +309,8 @@ class TLoraModule(LycorisBaseModule):
         # because T-LoRA's residual subtraction already ensures zero init;
         # scalar=0.0 would create dead gradients.
         if use_scalar:
-            self.scalar = nn.Parameter(torch.tensor(1.0))
+            init_val = scalar_init_value if scalar_init_value is not None else 0.99
+            self.scalar = nn.Parameter(torch.tensor(init_val))
         else:
             self.register_buffer("scalar", torch.tensor(1.0), persistent=False)
 

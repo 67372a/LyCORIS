@@ -107,6 +107,9 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
         or kwargs.get("use_tucker", False)
     )
     use_scalar = str_bool(kwargs.get("use_scalar", False))
+    scalar_init_value = kwargs.get("scalar_init_value", None)
+    if scalar_init_value is not None:
+        scalar_init_value = float(scalar_init_value)
     block_size = int(kwargs.get("block_size", 4) or 4)
     train_norm = str_bool(kwargs.get("train_norm", False))
     constraint = float(kwargs.get("constraint", 0) or 0)
@@ -217,6 +220,7 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
         module_dropout=module_dropout,
         use_tucker=use_tucker,
         use_scalar=use_scalar,
+        scalar_init_value=scalar_init_value,
         network_module=algo,
         train_norm=train_norm,
         decompose_both=kwargs.get("decompose_both", False),
