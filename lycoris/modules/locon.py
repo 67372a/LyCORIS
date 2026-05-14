@@ -189,6 +189,55 @@ class LoConModule(LycorisBaseModule):
 
         self.init_ggpo()
 
+        # SVD segment initialization (PiSSA-style)
+        svd_segment = kwargs.get("svd_segment", None)
+        if svd_segment is not None:
+            if self.use_orthogonal_init:
+                logger.warning(
+                    f"svd_segment='{svd_segment}' and orthogonal_init=True are mutually exclusive. "
+                    f"SVD segment init will replace orthogonal initialization for {self.lora_name}."
+                )
+            self._init_svd_segment(svd_segment)
+
+    @torch.no_grad()
+    def _init_svd_segment(self, segment: str):
+        """Initialize LoCon weights from a segment of the SVD spectrum."""
+        if self.tucker:
+            logger.warning(
+                f"SVD segment init is not supported for tucker decomposition "
+                f"(module {self.lora_name}), skipping."
+            )
+            return
+
+        org_weight_2d = self._get_weight_2d(self.org_module[0])
+        result = self._compute_svd_segment(org_weight_2d, self.lora_dim, segment)
+        if result is None:
+            logger.warning(
+                f"Weight {self.lora_name} has fewer singular values than "
+                f"lora_dim={self.lora_dim}, skipping SVD segment init."
+            )
+            return
+        Vr, Sr, Uhr = result
+
+        sqrt_Sr = torch.sqrt(Sr)
+        lora_down_2d = torch.diag(sqrt_Sr) @ Uhr   # (r, in)
+        lora_up_2d = Vr @ torch.diag(sqrt_Sr)      # (out, r)
+
+        orig_shape = self.org_module[0].weight.shape
+        if self.isconv:
+            self.lora_down.weight.data.copy_(
+                lora_down_2d.reshape(self.lora_dim, *orig_shape[1:])
+            )
+        else:
+            self.lora_down.weight.data.copy_(lora_down_2d)
+        self.lora_up.weight.data.copy_(lora_up_2d.reshape(self.lora_up.weight.shape))
+
+        diff = (lora_up_2d @ lora_down_2d).reshape(orig_shape)
+        self.org_module[0].weight.data -= (
+            diff.to(self.org_module[0].weight.dtype) * self.scale
+        )
+        logger.info(f"SVD segment init ({segment}): {self.lora_name}")
+
     @classmethod
     def make_module_from_state_dict(
         cls, lora_name, orig_module, up, down, mid, alpha, dora_scale

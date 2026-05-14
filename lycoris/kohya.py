@@ -123,6 +123,10 @@ def create_network(
     torch_compile_fullgraph = str_bool(kwargs.get("torch_compile_fullgraph", True))
     train_llm_adapter = str_bool(kwargs.get("train_llm_adapter", False))
 
+    svd_segment = kwargs.get("svd_segment", None)
+    if svd_segment is not None:
+        logger.info(f"SVD segment initialization: {svd_segment}")
+
     # exclude patterns
     exclude_patterns = kwargs.get("exclude_patterns", None)
     if exclude_patterns is not None:

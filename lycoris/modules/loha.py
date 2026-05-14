@@ -5,6 +5,7 @@ import torch.nn as nn
 
 from .base import LycorisBaseModule
 from ..functional.loha import diff_weight as loha_diff_weight
+from ..logging import logger
 
 from typing import Optional
 
@@ -177,6 +178,59 @@ class LohaModule(LycorisBaseModule):
                 torch.nn.init.normal_(self.hada_w2_a, std=0.1)
             else:
                 torch.nn.init.constant_(self.hada_w2_a, 0)
+
+        # SVD segment initialization
+        svd_segment = kwargs.get("svd_segment", None)
+        if svd_segment is not None:
+            if self.use_orthogonal_init:
+                logger.warning(
+                    f"svd_segment='{svd_segment}' and orthogonal_init=True are mutually exclusive. "
+                    f"SVD segment init will replace orthogonal initialization for {self.lora_name}."
+                )
+            self._init_svd_segment(svd_segment)
+
+    @torch.no_grad()
+    def _init_svd_segment(self, segment: str):
+        """Initialize LoHa weights from a segment of the SVD spectrum.
+
+        Strategy: set the first Hadamard pair (w1a, w1b) to the SVD segment,
+        and the second pair (w2a, w2b) to produce an all-ones matrix so that
+        the Hadamard product equals the SVD segment.
+        """
+        if self.tucker:
+            logger.warning(
+                f"SVD segment init is not supported for tucker decomposition "
+                f"(module {self.lora_name}), skipping."
+            )
+            return
+
+        org_weight_2d = self._get_weight_2d(self.org_module[0])
+        result = self._compute_svd_segment(org_weight_2d, self.lora_dim, segment)
+        if result is None:
+            logger.warning(
+                f"Weight {self.lora_name} has fewer singular values than "
+                f"lora_dim={self.lora_dim}, skipping SVD segment init."
+            )
+            return
+        Vr, Sr, Uhr = result
+
+        sqrt_Sr = torch.sqrt(Sr)
+
+        # First pair: encode the SVD segment
+        self.hada_w1_a.data.copy_((Vr @ torch.diag(sqrt_Sr)).to(self.hada_w1_a.dtype))
+        self.hada_w1_b.data.copy_((torch.diag(sqrt_Sr) @ Uhr).to(self.hada_w1_b.dtype))
+
+        # Second pair: produce all-ones matrix via outer product
+        # ones(out, r)/r @ ones(r, in) = ones(out, in)
+        self.hada_w2_a.data.fill_(1.0 / self.lora_dim)
+        self.hada_w2_b.data.fill_(1.0)
+
+        orig_shape = self.org_module[0].weight.shape
+        diff = (Vr @ torch.diag(Sr) @ Uhr).reshape(orig_shape)
+        self.org_module[0].weight.data -= (
+            diff.to(self.org_module[0].weight.dtype) * self.scale
+        )
+        logger.info(f"SVD segment init ({segment}): {self.lora_name}")
 
     @classmethod
     def make_module_from_state_dict(

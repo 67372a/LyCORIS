@@ -716,6 +716,49 @@ class LycorisBaseModule(ModuleCustomSD):
             # Distribute based on weight magnitudes (channels with larger weights get larger gradients)
             self.grad_norms = up_channel_magnitudes * (grad_magnitude / magnitude_sum)
 
+    @staticmethod
+    def _compute_svd_segment(org_weight_2d, lora_dim, segment):
+        """Compute SVD segment from a 2D weight matrix.
+
+        Slices the SVD spectrum of *org_weight_2d* into a contiguous segment
+        of width *lora_dim* determined by *segment*.
+
+        Args:
+            org_weight_2d: Weight matrix of shape ``(out, in)``.
+            lora_dim: Number of singular values (rank) to select.
+            segment: One of ``"top"``, ``"middle"``, or ``"bottom"``.
+
+        Returns:
+            ``(Vr, Sr, Uhr)`` tuple, or ``None`` if the matrix has fewer
+            singular values than *lora_dim*.
+        """
+        V, S, Uh = torch.linalg.svd(org_weight_2d.float(), full_matrices=False)
+        h = len(S)
+        if h < lora_dim:
+            return None
+        if segment == "top":
+            start = 0
+        elif segment == "middle":
+            start = (h - lora_dim) // 2
+        elif segment == "bottom":
+            start = h - lora_dim
+        else:
+            raise ValueError(
+                f"Unknown svd_segment '{segment}'. Use 'top', 'middle', or 'bottom'."
+            )
+        Vr = V[:, start : start + lora_dim]
+        Sr = S[start : start + lora_dim]
+        Uhr = Uh[start : start + lora_dim]
+        return Vr, Sr, Uhr
+
+    @staticmethod
+    def _get_weight_2d(org_module):
+        """Return the original module weight reshaped to 2-D ``(out, in)``."""
+        w = org_module.weight.data.clone()
+        if w.dim() > 2:
+            w = w.reshape(w.shape[0], -1)
+        return w
+
     @torch.no_grad()
     def init_ggpo(self):
         if self.ggpo_beta is not None and self.ggpo_sigma is not None:

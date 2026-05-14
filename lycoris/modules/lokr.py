@@ -88,6 +88,7 @@ class LokrModule(LycorisBaseModule):
             raise ValueError(f"{self.module_type} is not supported in LoKr algo.")
 
         factor = int(factor)
+        self.lokr_factor = factor
         self.lora_dim = lora_dim
         self.tucker = False
         self.use_w1 = False
@@ -278,6 +279,114 @@ class LokrModule(LycorisBaseModule):
             else:
                 torch.nn.init.kaiming_uniform_(self.lokr_w1_a, a=math.sqrt(5))
                 torch.nn.init.kaiming_uniform_(self.lokr_w1_b, a=math.sqrt(5))
+
+        # SVD segment initialization
+        svd_segment = kwargs.get("svd_segment", None)
+        if svd_segment is not None:
+            if self.use_orthogonal_init:
+                logger.warning(
+                    f"svd_segment='{svd_segment}' and orthogonal_init=True are mutually exclusive. "
+                    f"SVD segment init will replace orthogonal initialization for {self.lora_name}."
+                )
+            self._init_svd_segment(svd_segment)
+
+    @torch.no_grad()
+    def _init_svd_segment(self, segment: str):
+        """Initialize LoKr weights from a segment of the SVD spectrum.
+
+        Uses a Kronecker-SVD approximation: reshape the SVD segment into the
+        Kronecker factorization structure and use rank-1 SVD to split into
+        w1 and w2 factors.  Tucker convolutions are skipped.
+        """
+        if self.tucker:
+            logger.warning(
+                f"SVD segment init is not supported for tucker decomposition "
+                f"(module {self.lora_name}), skipping."
+            )
+            return
+
+        org_weight_2d = self._get_weight_2d(self.org_module[0])
+        result = self._compute_svd_segment(org_weight_2d, self.lora_dim, segment)
+        if result is None:
+            logger.warning(
+                f"Weight {self.lora_name} has fewer singular values than "
+                f"lora_dim={self.lora_dim}, skipping SVD segment init."
+            )
+            return
+        Vr, Sr, Uhr = result
+
+        # Build the SVD segment matrix M = V_r * diag(S_r) * U_r^T
+        M = Vr @ torch.diag(Sr) @ Uhr  # (out_dim, in_dim)
+
+        orig_shape = self.org_module[0].weight.shape
+        out_dim, in_dim = orig_shape[0], orig_shape[1]
+        k = orig_shape[2:] if len(orig_shape) > 2 else ()
+
+        # Determine Kronecker factorization dimensions
+        factor = self.lokr_factor
+        from ..functional import factorization
+        in_m, in_n = factorization(in_dim, factor)
+        out_l, out_k = factorization(out_dim, factor)
+
+        if k:
+            # Conv: reshape M to (out_l, out_k, in_m, in_n, *k) for kron structure
+            # For conv, the Kronecker is only over channel dims
+            M_reshaped = M.reshape(out_l, out_k, in_m, in_n)
+        else:
+            M_reshaped = M.reshape(out_l, out_k, in_m, in_n)
+
+        # Kronecker-SVD: permute to (out_l, in_m, out_k, in_n) → rank-1 SVD
+        M_perm = M_reshaped.permute(0, 2, 1, 3).reshape(out_l * in_m, out_k * in_n)
+        U_k, S_k, Vh_k = torch.linalg.svd(M_perm.float(), full_matrices=False)
+
+        sqrt_S0 = torch.sqrt(S_k[0])
+        w1_init = (U_k[:, 0] * sqrt_S0).reshape(out_l, in_m)
+        w2_init = (Vh_k[0, :] * sqrt_S0).reshape(out_k, in_n)
+
+        # Apply to the appropriate weight parameters
+        if self.use_w1:
+            self.lokr_w1.data.copy_(w1_init.to(self.lokr_w1.dtype))
+        else:
+            # Factor w1 into w1_a @ w1_b via SVD
+            U1, S1, Vh1 = torch.linalg.svd(w1_init, full_matrices=False)
+            r1 = min(self.lokr_w1_a.shape[1], len(S1))
+            self.lokr_w1_a.data.copy_((U1[:, :r1] @ torch.diag(torch.sqrt(S1[:r1]))).to(self.lokr_w1_a.dtype))
+            self.lokr_w1_b.data.copy_((torch.diag(torch.sqrt(S1[:r1])) @ Vh1[:r1, :]).to(self.lokr_w1_b.dtype))
+
+        if self.use_w2:
+            if k:
+                w2_expanded = w2_init.reshape(out_k, in_n, 1, 1).expand(out_k, in_n, *k)
+                self.lokr_w2.data.copy_(w2_expanded.to(self.lokr_w2.dtype))
+            else:
+                self.lokr_w2.data.copy_(w2_init.to(self.lokr_w2.dtype))
+        else:
+            # Factor w2 into w2_a @ w2_b via SVD
+            U2, S2, Vh2 = torch.linalg.svd(w2_init, full_matrices=False)
+            r2 = min(self.lokr_w2_a.shape[0], len(S2))
+            if k:
+                # Conv: w2_a is (r2, out_k), w2_b is (r2, in_n, *k)
+                self.lokr_w2_a.data.copy_(
+                    (U2[:, :r2] @ torch.diag(torch.sqrt(S2[:r2]))).T.to(self.lokr_w2_a.dtype)
+                )
+                w2b_2d = torch.diag(torch.sqrt(S2[:r2])) @ Vh2[:r2, :]
+                self.lokr_w2_b.data.copy_(
+                    w2b_2d.reshape(r2, in_n, 1, 1).expand(r2, in_n, *k).to(self.lokr_w2_b.dtype)
+                )
+            else:
+                self.lokr_w2_a.data.copy_(
+                    (U2[:, :r2] @ torch.diag(torch.sqrt(S2[:r2]))).to(self.lokr_w2_a.dtype)
+                )
+                self.lokr_w2_b.data.copy_(
+                    (torch.diag(torch.sqrt(S2[:r2])) @ Vh2[:r2, :]).to(self.lokr_w2_b.dtype)
+                )
+
+        # Adjust org_weight with the reconstructed Kronecker product
+        from ..functional.lokr import make_kron
+        diff = make_kron(w1_init.to(M.dtype), w2_init.to(M.dtype), 1.0)
+        if k:
+            diff = diff.unsqueeze(-1).unsqueeze(-1).expand(*orig_shape)
+        self.org_module[0].weight.data -= diff.to(self.org_module[0].weight.dtype) * self.scale
+        logger.info(f"SVD segment init ({segment}): {self.lora_name}")
 
     @classmethod
     def make_module_from_state_dict(
