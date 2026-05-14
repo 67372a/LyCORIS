@@ -69,6 +69,7 @@ class LokrModule(LycorisBaseModule):
         ggpo_beta: Optional[float] = None,
         ggpo_sigma: Optional[float] = None,
         orthogonalize=False,
+        orthogonal_init=False,
         **kwargs,
     ):
         super().__init__(
@@ -94,7 +95,10 @@ class LokrModule(LycorisBaseModule):
         self.full_matrix = full_matrix
         self.rs_lora = rs_lora
         self.use_orthogonal_weights = orthogonalize
-        if self.use_orthogonal_weights == True and use_scalar == False:
+        if orthogonalize and not orthogonal_init:
+            orthogonal_init = True
+        self.use_orthogonal_init = orthogonal_init
+        if self.use_orthogonal_init and not use_scalar:
             use_scalar = True
 
         if self.module_type.startswith("conv"):
@@ -235,8 +239,9 @@ class LokrModule(LycorisBaseModule):
         else:
             self.register_buffer("scalar", torch.tensor(1.0), persistent=False)
 
+        # Weight initialization
         if self.use_w2:
-            if self.use_orthogonal_weights:
+            if self.use_orthogonal_init:
                 torch.nn.init.orthogonal_(self.lokr_w2)
             elif use_scalar:
                 torch.nn.init.kaiming_uniform_(self.lokr_w2, a=math.sqrt(5))
@@ -244,17 +249,17 @@ class LokrModule(LycorisBaseModule):
                 torch.nn.init.constant_(self.lokr_w2, 0)
         else:
             if self.tucker:
-                if self.use_orthogonal_weights:
+                if self.use_orthogonal_init:
                     torch.nn.init.orthogonal_(self.lokr_t2)
                 else:
                     torch.nn.init.kaiming_uniform_(self.lokr_t2, a=math.sqrt(5))
 
-            if self.use_orthogonal_weights:
+            if self.use_orthogonal_init:
                 torch.nn.init.orthogonal_(self.lokr_w2_a)
             else:
                 torch.nn.init.kaiming_uniform_(self.lokr_w2_a, a=math.sqrt(5))
 
-            if self.use_orthogonal_weights:
+            if self.use_orthogonal_init:
                 torch.nn.init.orthogonal_(self.lokr_w2_b)
             elif use_scalar:
                 torch.nn.init.kaiming_uniform_(self.lokr_w2_b, a=math.sqrt(5))
@@ -262,12 +267,12 @@ class LokrModule(LycorisBaseModule):
                 torch.nn.init.constant_(self.lokr_w2_b, 0)
 
         if self.use_w1:
-            if self.use_orthogonal_weights:
+            if self.use_orthogonal_init:
                 torch.nn.init.orthogonal_(self.lokr_w1)
             else:
                 torch.nn.init.kaiming_uniform_(self.lokr_w1, a=math.sqrt(5))
         else:
-            if self.use_orthogonal_weights:
+            if self.use_orthogonal_init:
                 torch.nn.init.orthogonal_(self.lokr_w1_a)
                 torch.nn.init.orthogonal_(self.lokr_w1_b)
             else:

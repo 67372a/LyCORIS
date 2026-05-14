@@ -184,3 +184,140 @@ class LycorisModuleTests(unittest.TestCase):
         torch.sum(test_output).backward()
         state_dict = net.state_dict()
         net.load_state_dict(state_dict)
+
+    # --- Orthogonal init / runtime orthogonalization tests ---
+    _orthogonal_modules = [LoConModule, LokrModule, GLoRAModule, LohaModule]
+
+    def test_orthogonal_init_forces_scalar(self):
+        """orthogonal_init=True should force use_scalar=True."""
+        base = nn.Linear(16, 16)
+        for module_cls in self._orthogonal_modules:
+            net = module_cls(
+                "test",
+                base,
+                multiplier=1,
+                lora_dim=4,
+                alpha=1,
+                orthogonal_init=True,
+                use_scalar=False,
+            )
+            self.assertIsInstance(
+                net.scalar,
+                nn.Parameter,
+                f"{module_cls.__name__}: orthogonal_init should force scalar to be nn.Parameter",
+            )
+            net.restore()
+
+    def test_orthogonalize_forces_init_and_scalar(self):
+        """orthogonalize=True should force orthogonal_init=True and use_scalar=True."""
+        base = nn.Linear(16, 16)
+        for module_cls in self._orthogonal_modules:
+            net = module_cls(
+                "test",
+                base,
+                multiplier=1,
+                lora_dim=4,
+                alpha=1,
+                orthogonalize=True,
+                use_scalar=False,
+            )
+            self.assertTrue(
+                net.use_orthogonal_init,
+                f"{module_cls.__name__}: orthogonalize should force orthogonal_init",
+            )
+            self.assertTrue(
+                isinstance(net.scalar, nn.Parameter),
+                f"{module_cls.__name__}: orthogonalize should force scalar via orthogonal_init",
+            )
+            net.restore()
+
+    def test_orthogonal_init_produces_orthogonal_weights(self):
+        """Weights initialized with orthogonal_init should have near-orthogonal columns/rows."""
+        base = nn.Linear(16, 16)
+        for module_cls in self._orthogonal_modules:
+            net = module_cls(
+                "test",
+                base,
+                multiplier=1,
+                lora_dim=4,
+                alpha=1,
+                orthogonal_init=True,
+            )
+            # Check orthogonality of the primary weight matrix for each module type
+            weight_to_check = None
+            if hasattr(net, "lora_down"):
+                weight_to_check = net.lora_down.weight.data.float()
+            elif hasattr(net, "hada_w1_a"):
+                weight_to_check = net.hada_w1_a.weight.data.float() if isinstance(net.hada_w1_a, nn.Module) else net.hada_w1_a.data.float()
+            if weight_to_check is not None:
+                w2d = weight_to_check.reshape(weight_to_check.shape[0], -1)
+                if w2d.shape[0] <= w2d.shape[1]:
+                    gram = w2d @ w2d.T
+                else:
+                    gram = w2d.T @ w2d
+                off_diag = gram - torch.diag(gram.diag())
+                diag_scale = gram.diag().abs().mean().clamp(min=1e-8)
+                self.assertTrue(
+                    off_diag.abs().max() < diag_scale * 0.5,
+                    f"{module_cls.__name__}: primary weights not orthogonal after orthogonal_init",
+                )
+            net.restore()
+
+    def test_orthogonal_init_and_orthogonalize_independent(self):
+        """orthogonal_init and orthogonalize should work together; orthogonalize forces orthogonal_init."""
+        base = nn.Linear(16, 16)
+        for module_cls in self._orthogonal_modules:
+            # orthogonal_init only (no runtime orthogonalization)
+            net1 = module_cls(
+                "test", base, multiplier=1, lora_dim=4, alpha=1,
+                orthogonal_init=True, orthogonalize=False,
+            )
+            self.assertTrue(net1.use_orthogonal_init)
+            self.assertFalse(net1.use_orthogonal_weights)
+            net1.restore()
+
+            # orthogonalize forces orthogonal_init (and thus use_scalar)
+            net2 = module_cls(
+                "test", base, multiplier=1, lora_dim=4, alpha=1,
+                orthogonal_init=False, orthogonalize=True,
+            )
+            self.assertTrue(net2.use_orthogonal_init)
+            self.assertTrue(net2.use_orthogonal_weights)
+            net2.restore()
+
+            # both explicitly set
+            net3 = module_cls(
+                "test", base, multiplier=1, lora_dim=4, alpha=1,
+                orthogonal_init=True, orthogonalize=True,
+            )
+            self.assertTrue(net3.use_orthogonal_init)
+            self.assertTrue(net3.use_orthogonal_weights)
+            net3.restore()
+
+    def test_orthogonal_forward_pass(self):
+        """Forward/backward should work with each orthogonal configuration."""
+        base = nn.Linear(16, 16)
+        test_input = torch.randn(1, 16)
+        configs = [
+            {"orthogonal_init": True, "orthogonalize": False},
+            {"orthogonal_init": False, "orthogonalize": True},
+            {"orthogonal_init": True, "orthogonalize": True},
+        ]
+        for module_cls in self._orthogonal_modules:
+            for cfg in configs:
+                base_copy = nn.Linear(16, 16)
+                base_copy.weight.data.copy_(base.weight.data)
+                if base.bias is not None:
+                    base_copy.bias.data.copy_(base.bias.data)
+                net = module_cls(
+                    "test", base_copy, multiplier=1, lora_dim=4, alpha=1, **cfg,
+                )
+                net.apply_to()
+                output = base_copy(test_input)
+                output.sum().backward()
+                # Verify gradient flows through primary weight parameter
+                if hasattr(net, "lora_down"):
+                    self.assertIsNotNone(net.lora_down.weight.grad)
+                elif hasattr(net, "hada_w1_a"):
+                    self.assertIsNotNone(net.hada_w1_a.grad)
+                net.restore()

@@ -7,12 +7,14 @@ import torch.nn.functional as F
 from .general import rebuild_tucker, FUNC_LIST
 
 
-def weight_gen(org_weight, rank, tucker=True):
+def weight_gen(org_weight, rank, tucker=True, orthogonal=False):
     """### weight_gen
 
     Args:
         org_weight (torch.Tensor): the weight tensor
         rank (int): low rank
+        tucker (bool): whether to use tucker decomposition for conv weights
+        orthogonal (bool): use orthogonal initialization instead of kaiming
 
     Returns:
         torch.Tensor: down, up[, mid]
@@ -22,15 +24,24 @@ def weight_gen(org_weight, rank, tucker=True):
         down = torch.empty(rank, in_dim, *(1 for _ in k))
         up = torch.empty(out_dim, rank, *(1 for _ in k))
         mid = torch.empty(rank, rank, *k)
-        nn.init.kaiming_uniform_(down, a=math.sqrt(5))
-        nn.init.constant_(up, 0)
-        nn.init.kaiming_uniform_(mid, a=math.sqrt(5))
+        if orthogonal:
+            nn.init.orthogonal_(down)
+            nn.init.orthogonal_(up)
+            nn.init.orthogonal_(mid)
+        else:
+            nn.init.kaiming_uniform_(down, a=math.sqrt(5))
+            nn.init.constant_(up, 0)
+            nn.init.kaiming_uniform_(mid, a=math.sqrt(5))
         return down, up, mid
     else:
         down = torch.empty(rank, in_dim)
         up = torch.empty(out_dim, rank)
-        nn.init.kaiming_uniform_(down, a=math.sqrt(5))
-        nn.init.constant_(up, 0)
+        if orthogonal:
+            nn.init.orthogonal_(down)
+            nn.init.orthogonal_(up)
+        else:
+            nn.init.kaiming_uniform_(down, a=math.sqrt(5))
+            nn.init.constant_(up, 0)
         return down, up, None
 
 

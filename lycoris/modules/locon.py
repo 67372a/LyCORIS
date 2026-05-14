@@ -59,6 +59,7 @@ class LoConModule(LycorisBaseModule):
         ggpo_conv: bool = False,
         ggpo_conv_weight_sample_size: int = 100,
         orthogonalize=False,
+        orthogonal_init=False,
         **kwargs,
     ):
         """if alpha == 0 or None, alpha is rank (no scaling)."""
@@ -82,7 +83,10 @@ class LoConModule(LycorisBaseModule):
         self.tucker = False
         self.rs_lora = rs_lora
         self.use_orthogonal_weights = orthogonalize
-        if self.use_orthogonal_weights == True and use_scalar == False:
+        if orthogonalize and not orthogonal_init:
+            orthogonal_init = True
+        self.use_orthogonal_init = orthogonal_init
+        if self.use_orthogonal_init and not use_scalar:
             use_scalar = True
 
         if self.module_type.startswith("conv"):
@@ -163,15 +167,14 @@ class LoConModule(LycorisBaseModule):
         else:
             self.register_buffer("scalar", torch.tensor(1.0), persistent=False)
 
-        # same as microsoft's
-
-        if self.use_orthogonal_weights:
+        # Weight initialization
+        if self.use_orthogonal_init:
             torch.nn.init.orthogonal_(self.lora_down.weight)
         else:
             torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
 
-        if self.use_orthogonal_weights:
-                torch.nn.init.orthogonal_(self.lora_up.weight)
+        if self.use_orthogonal_init:
+            torch.nn.init.orthogonal_(self.lora_up.weight)
         else:
             if use_scalar:
                 torch.nn.init.kaiming_uniform_(self.lora_up.weight, a=math.sqrt(5))
@@ -179,7 +182,7 @@ class LoConModule(LycorisBaseModule):
                 torch.nn.init.constant_(self.lora_up.weight, 0)
 
         if self.tucker:
-            if self.use_orthogonal_weights:
+            if self.use_orthogonal_init:
                 torch.nn.init.orthogonal_(self.lora_mid.weight)
             else:
                 torch.nn.init.kaiming_uniform_(self.lora_mid.weight, a=math.sqrt(5))

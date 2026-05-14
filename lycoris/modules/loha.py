@@ -49,6 +49,8 @@ class LohaModule(LycorisBaseModule):
         rs_lora=False,
         ggpo_beta: Optional[float] = None,
         ggpo_sigma: Optional[float] = None,
+        orthogonalize=False,
+        orthogonal_init=False,
         **kwargs,
     ):
         super().__init__(
@@ -69,6 +71,12 @@ class LohaModule(LycorisBaseModule):
         self.lora_dim = lora_dim
         self.tucker = False
         self.rs_lora = rs_lora
+        self.use_orthogonal_weights = orthogonalize
+        if orthogonalize and not orthogonal_init:
+            orthogonal_init = True
+        self.use_orthogonal_init = orthogonal_init
+        if self.use_orthogonal_init and not use_scalar:
+            use_scalar = True
 
         w_shape = self.shape
         if self.module_type.startswith("conv"):
@@ -150,16 +158,25 @@ class LohaModule(LycorisBaseModule):
         else:
             self.register_buffer("scalar", torch.tensor(1.0), persistent=False)
         # Need more experiments on init method
-        if self.tucker:
-            torch.nn.init.normal_(self.hada_t1, std=0.1)
-            torch.nn.init.normal_(self.hada_t2, std=0.1)
-        torch.nn.init.normal_(self.hada_w1_b, std=1)
-        torch.nn.init.normal_(self.hada_w1_a, std=0.1)
-        torch.nn.init.normal_(self.hada_w2_b, std=1)
-        if use_scalar:
-            torch.nn.init.normal_(self.hada_w2_a, std=0.1)
+        if self.use_orthogonal_init:
+            if self.tucker:
+                torch.nn.init.orthogonal_(self.hada_t1)
+                torch.nn.init.orthogonal_(self.hada_t2)
+            torch.nn.init.orthogonal_(self.hada_w1_b)
+            torch.nn.init.orthogonal_(self.hada_w1_a)
+            torch.nn.init.orthogonal_(self.hada_w2_b)
+            torch.nn.init.orthogonal_(self.hada_w2_a)
         else:
-            torch.nn.init.constant_(self.hada_w2_a, 0)
+            if self.tucker:
+                torch.nn.init.normal_(self.hada_t1, std=0.1)
+                torch.nn.init.normal_(self.hada_t2, std=0.1)
+            torch.nn.init.normal_(self.hada_w1_b, std=1)
+            torch.nn.init.normal_(self.hada_w1_a, std=0.1)
+            torch.nn.init.normal_(self.hada_w2_b, std=1)
+            if use_scalar:
+                torch.nn.init.normal_(self.hada_w2_a, std=0.1)
+            else:
+                torch.nn.init.constant_(self.hada_w2_a, 0)
 
     @classmethod
     def make_module_from_state_dict(
@@ -203,22 +220,29 @@ class LohaModule(LycorisBaseModule):
         scale = torch.tensor(
             self.scale, dtype=self.hada_w1_b.dtype, device=self.hada_w1_b.device
         )
+        # Orthogonalize weights on the fly if runtime orthogonalization is enabled
+        w1_b = self._orthogonalize(self.hada_w1_b)
+        w1_a = self._orthogonalize(self.hada_w1_a)
+        w2_b = self._orthogonalize(self.hada_w2_b)
+        w2_a = self._orthogonalize(self.hada_w2_a)
         if self.tucker:
+            t1 = self._orthogonalize(self.hada_t1)
+            t2 = self._orthogonalize(self.hada_t2)
             weight = loha_diff_weight(
-                self.hada_w1_b,
-                self.hada_w1_a,
-                self.hada_w2_b,
-                self.hada_w2_a,
-                self.hada_t1,
-                self.hada_t2,
+                w1_b,
+                w1_a,
+                w2_b,
+                w2_a,
+                t1,
+                t2,
                 gamma=scale,
             )
         else:
             weight = loha_diff_weight(
-                self.hada_w1_b,
-                self.hada_w1_a,
-                self.hada_w2_b,
-                self.hada_w2_a,
+                w1_b,
+                w1_a,
+                w2_b,
+                w2_a,
                 None,
                 None,
                 gamma=scale,

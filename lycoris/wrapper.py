@@ -121,10 +121,16 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
     rs_lora = str_bool(kwargs.get("rs_lora", False))
     unbalanced_factorization = str_bool(kwargs.get("unbalanced_factorization", False))
     orthogonalize = str_bool(kwargs.get("orthogonalize", False))
+    orthogonal_init = str_bool(kwargs.get("orthogonal_init", False))
     if orthogonalize:
-        logger.info("Orthogonalization of weights for Lycoris is enabled")
-        if use_scalar == False:
-            logger.info("Forcing usage of use_scalar as orthogonalization is enabled")
+        logger.info("Runtime orthogonalization of weights for Lycoris is enabled")
+        if not orthogonal_init:
+            logger.info("Forcing orthogonal_init as orthogonalize is enabled")
+            orthogonal_init = True
+    if orthogonal_init:
+        logger.info("Orthogonal weight initialization for Lycoris is enabled")
+        if not use_scalar:
+            logger.info("Forcing usage of use_scalar as orthogonal_init is enabled")
             use_scalar = True
     torch_compile = str_bool(kwargs.get("torch_compile", False))
     torch_compile_mode = kwargs.get("torch_compile_mode", "max-autotune")
@@ -238,6 +244,7 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
         ggpo_sigma=ggpo_sigma,
         ggpo_conv_weight_sample_size=ggpo_conv_weight_sample_size,
         orthogonalize=orthogonalize,
+        orthogonal_init=orthogonal_init,
         train_llm_adapter=train_llm_adapter,
         exclude_patterns=exclude_patterns,
         include_patterns=include_patterns,

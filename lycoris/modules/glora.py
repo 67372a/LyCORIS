@@ -57,6 +57,7 @@ class GLoRAModule(LycorisBaseModule):
         bypass_mode=None,
         rs_lora=False,
         orthogonalize=False,
+        orthogonal_init=False,
         **kwargs,
     ):
         """
@@ -86,7 +87,10 @@ class GLoRAModule(LycorisBaseModule):
         self.tucker = False
         self.rs_lora = rs_lora
         self.use_orthogonal_weights = orthogonalize
-        if self.use_orthogonal_weights == True and use_scalar == False:
+        if orthogonalize and not orthogonal_init:
+            orthogonal_init = True
+        self.use_orthogonal_init = orthogonal_init
+        if self.use_orthogonal_init and not use_scalar:
             use_scalar = True
 
         if dropout and not bypass_mode:
@@ -149,15 +153,15 @@ class GLoRAModule(LycorisBaseModule):
         else:
             self.register_buffer("scalar", torch.tensor(1.0), persistent=False)
 
-        # same as microsoft's
-        if self.use_orthogonal_weights:
+        # Weight initialization
+        if self.use_orthogonal_init:
             torch.nn.init.orthogonal_(self.a1.weight)
             torch.nn.init.orthogonal_(self.b1.weight)
         else:
             torch.nn.init.kaiming_uniform_(self.a1.weight, a=math.sqrt(5))
             torch.nn.init.kaiming_uniform_(self.b1.weight, a=math.sqrt(5))
 
-        if self.use_orthogonal_weights:
+        if self.use_orthogonal_init:
             torch.nn.init.orthogonal_(self.a2.weight)
             torch.nn.init.orthogonal_(self.b2.weight)
         elif use_scalar:
@@ -168,7 +172,7 @@ class GLoRAModule(LycorisBaseModule):
             torch.nn.init.zeros_(self.b2.weight)
 
         if self.tucker:
-            if self.use_orthogonal_weights:
+            if self.use_orthogonal_init:
                 torch.nn.init.orthogonal_(self.bm.weight)
             else:
                 torch.nn.init.kaiming_uniform_(self.bm.weight, a=math.sqrt(5))

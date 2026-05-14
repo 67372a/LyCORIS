@@ -111,6 +111,21 @@ Arguments to put in `network_args` for kohya sd scripts
   - `last`: Bottom-k singular vectors (smallest singular values)
   - `middle`: Middle-k singular vectors
 
+### Orthogonal Weight Initialization
+
+- Enabled with `orthogonal_init=True`
+- Valid for LoRA, LoHa, LoKr, and GLoRA
+- Uses `torch.nn.init.orthogonal_()` instead of `kaiming_uniform_` for initial weight values
+- Will force `use_scalar=True` when enabled
+
+### Runtime Orthogonalization
+
+- Enabled with `orthogonalize=True`
+- Valid for LoRA, LoHa, LoKr, and GLoRA
+- Applies QR decomposition during forward pass to keep weights near-orthogonal during training
+- Will force `orthogonal_init=True` (and thus `use_scalar=True`) when enabled
+- Can be used together with `orthogonal_init` explicitly, or alone (which implies it)
+
 ### Data-Dependent Initialization (T-LoRA)
 
 - Enabled with `use_data_init=True` (default)
