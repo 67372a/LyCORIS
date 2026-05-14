@@ -177,7 +177,7 @@ class AbbaModule(LycorisBaseModule):
             self.scale = 0.0
         
         if use_scalar:
-            init_val = scalar_init_value if scalar_init_value is not None else 0.99
+            init_val = scalar_init_value if scalar_init_value is not None else 0.9
             self.scalar = nn.Parameter(torch.tensor(init_val))
         else:
             self.register_buffer("scalar", torch.tensor(1.0), persistent=False)

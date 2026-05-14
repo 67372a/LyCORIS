@@ -70,7 +70,7 @@ class LycorisFunctionalTests(unittest.TestCase):
         for idx, param in enumerate(params):
             if param is not None:
                 param = param.to(device, dtype)
-                params[idx] = param + torch.randn_like(param) * 0.01
+                params[idx] = param + torch.randn_like(param) * 0.1
 
         if module in {boft, diag_oft}:
             diff_w = module.diff_weight(w, *params)

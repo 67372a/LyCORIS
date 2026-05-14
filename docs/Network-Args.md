@@ -70,7 +70,7 @@ Arguments to put in `network_args` for kohya sd scripts
 - Set with `scalar_init_value=FLOAT`
 - Valid for all modules that support `use_scalar`
 - Set the initial value of the learnable scalar parameter when `use_scalar=True`
-- Default: 0.01 for LoRA/LoHa/LoKr/GLoRA, 0.99 for ABBA/T-LoRA
+- Default: 0.1 for LoRA/LoHa/LoKr/GLoRA, 0.9 for ABBA/T-LoRA
 
 ### Weight Decompose
 

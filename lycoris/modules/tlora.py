@@ -305,11 +305,11 @@ class TLoraModule(LycorisBaseModule):
         self.scale = alpha / lora_dim
         self.register_buffer("alpha", torch.tensor(alpha))
 
-        # Scalar: learnable global magnitude. Initialized to 1.0 (not 0.0)
+        # Scalar: learnable global magnitude. Initialized to 0.9 (not 0.0)
         # because T-LoRA's residual subtraction already ensures zero init;
         # scalar=0.0 would create dead gradients.
         if use_scalar:
-            init_val = scalar_init_value if scalar_init_value is not None else 0.99
+            init_val = scalar_init_value if scalar_init_value is not None else 0.9
             self.scalar = nn.Parameter(torch.tensor(init_val))
         else:
             self.register_buffer("scalar", torch.tensor(1.0), persistent=False)
