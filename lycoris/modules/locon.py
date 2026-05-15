@@ -1130,7 +1130,7 @@ class LoConModule(LycorisBaseModule):
             diff_weight = self.make_weight(x.device).to(dtype) * self.scale
         
         # Apply the weight to the input
-        weight = org_weight_gpu.data
+        weight = org_weight_gpu
         
         if self.wd:
             weight = self.apply_weight_decompose(weight + diff_weight, self.multiplier)
