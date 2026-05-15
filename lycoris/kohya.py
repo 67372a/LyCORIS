@@ -597,7 +597,7 @@ class LycorisNetworkKohya(LycorisNetwork):
                     'gora_temperature', 'gora_scale_importance', 'gora_features_func',
                     'gora_allocate_strategy', 'gora_adaptive_gamma', 'gora_weight_a_init',
                     'gora_scale_by_lr', 'gora_lr',
-                ) if k in kwargs
+                ) if k in kwargs and kwargs[k] is not None
             }
             self._gora_kwargs.setdefault('gora_ref_rank', lora_dim)
             self._gora_kwargs['scaling_alpha'] = alpha

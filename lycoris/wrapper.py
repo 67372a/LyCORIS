@@ -503,7 +503,7 @@ class LycorisNetwork(torch.nn.Module):
                     'gora_temperature', 'gora_scale_importance', 'gora_features_func',
                     'gora_allocate_strategy', 'gora_adaptive_gamma', 'gora_weight_a_init',
                     'gora_scale_by_lr', 'gora_lr',
-                ) if k in kwargs
+                ) if k in kwargs and kwargs[k] is not None
             }
             # Store ref_rank/lora_dim for prepare_gora defaults
             self._gora_kwargs.setdefault('gora_ref_rank', lora_dim)
@@ -1216,8 +1216,14 @@ class LycorisNetwork(torch.nn.Module):
         # Only use defaults when user hasn't explicitly passed the value.
         # In _gora_kwargs, explicitly-passed keys are present; absent = use default.
         ref_rank = gk.get('gora_ref_rank', 8)
-        min_rank = gk['gora_min_rank'] if 'gora_min_rank' in gk else max(1, ref_rank // 2)
-        max_rank = gk['gora_max_rank'] if 'gora_max_rank' in gk else (ref_rank * 4)
+        min_rank = gk.get('gora_min_rank') if gk.get('gora_min_rank') is not None else max(1, ref_rank // 2)
+        max_rank = gk.get('gora_max_rank') if gk.get('gora_max_rank') is not None else (ref_rank * 4)
+
+        logger.info(
+            f"GoRA: config ref_rank={ref_rank} min_rank={min_rank} max_rank={max_rank} "
+            f"gamma={gk.get('gora_gamma', 0.05)} alpha={gk.get('scaling_alpha', 1.0)} "
+            f"importance={gk.get('gora_importance_type', 'union_mean')}"
+        )
 
         from .modules.gora_utils import gora_precompute_gradients
         named_ranks = gora_precompute_gradients(
@@ -1255,20 +1261,41 @@ class LycorisNetwork(torch.nn.Module):
         # Mark done so repeated calls are safe
         self._gora_needs_init = False
 
-        # --- Summary logging ---
+        # --- Consolidated per-module logging ---
         ranks = list(named_ranks.values())
         if ranks:
             min_r, max_r, avg_r = min(ranks), max(ranks), sum(ranks) / len(ranks)
-            logger.info(
-                f"GoRA: prepare_gora complete — {len(named_ranks)} modules initialized. "
-                f"Ranks: min={min_r}, max={max_r}, avg={avg_r:.1f}"
-            )
-            # Per-module detail: name, allocated rank, forward scale (α/√r)
+            scales = []
+            errors = []
+            rel_errors = []
             for mod in gora_modules:
                 name = mod.lora_name
                 rank = named_ranks.get(name, mod.lora_dim)
                 scale = getattr(mod, 'scale', float('nan'))
-                logger.info(f"  {name}: rank={rank}, scale={scale:.4f}")
+                recon = getattr(mod, '_gora_recon_error', float('nan'))
+                rel = getattr(mod, '_gora_relative_error', float('nan'))
+                logger.info(
+                    f"  {name}: rank={rank}, scale={scale:.4f}, "
+                    f"recon_err={recon:.6f}, rel_err={rel:.6f}"
+                )
+                if not math.isnan(scale):
+                    scales.append(scale)
+                if not math.isnan(recon):
+                    errors.append(recon)
+                if not math.isnan(rel):
+                    rel_errors.append(rel)
+
+            avg_scale = sum(scales) / len(scales) if scales else float('nan')
+            avg_recon = sum(errors) / len(errors) if errors else float('nan')
+            avg_rel = sum(rel_errors) / len(rel_errors) if rel_errors else float('nan')
+            min_scale, max_scale = (min(scales), max(scales)) if scales else (float('nan'), float('nan'))
+
+            logger.info(
+                f"GoRA: prepare_gora complete — {len(named_ranks)} modules. "
+                f"Ranks: min={min_r}, max={max_r}, avg={avg_r:.1f} | "
+                f"Scales: min={min_scale:.4f}, max={max_scale:.4f}, avg={avg_scale:.4f} | "
+                f"Recon: avg_err={avg_recon:.6f}, avg_rel={avg_rel:.6f}"
+            )
         else:
             logger.info(f"GoRA: prepare_gora complete. {len(named_ranks)} modules initialized.")
 

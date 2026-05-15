@@ -629,11 +629,6 @@ def _grad_compress_init_single(
     module.scale = scaling_alpha / r_factor
     module.alpha.copy_(torch.tensor(scaling_alpha * (rank / r_factor)))
 
-    logger.info(
-        f"GoRA init: {module.lora_name}  rank={rank}  "
-        f"recon_error={recon_error:.6f}  relative_error={relative_error:.6f}"
-    )
-
 
 # ---------------------------------------------------------------------------
 # Main Entry Point: GoRA Pre-compute Gradients
@@ -723,7 +718,10 @@ def gora_precompute_gradients(
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    logger.info(f"GoRA: Pre-computing gradients (max_steps={max_steps}, adaptive_n={adaptive_n})")
+    logger.info(
+        f"GoRA: Pre-computing gradients (max_steps={max_steps}, adaptive_n={adaptive_n}) "
+        f"— ref_rank={ref_rank} min_rank={min_rank} max_rank={max_rank}"
+    )
 
     # --- Phase 1: Gradient Accumulation ---
     hooks = []
@@ -812,15 +810,6 @@ def gora_precompute_gradients(
         modules, named_ranks, ref_rank, scaling_alpha,
         stable_gamma, scale_by_lr, lr, weight_a_init_method, fast_svd_niter,
     )
-
-    # Log average reconstruction error
-    errors = [m._gora_recon_error for m in modules if hasattr(m, '_gora_recon_error')]
-    rel_errors = [m._gora_relative_error for m in modules if hasattr(m, '_gora_relative_error')]
-    if errors:
-        logger.info(
-            f"GoRA: avg recon_error={sum(errors)/len(errors):.6f}  "
-            f"avg relative_error={sum(rel_errors)/len(rel_errors):.6f}"
-        )
 
     # --- Phase 4: Adaptive Gamma (optional) ---
     if adaptive_gamma:
