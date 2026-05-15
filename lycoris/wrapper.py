@@ -1254,7 +1254,23 @@ class LycorisNetwork(torch.nn.Module):
 
         # Mark done so repeated calls are safe
         self._gora_needs_init = False
-        logger.info(f"GoRA: prepare_gora complete. {len(named_ranks)} modules initialized.")
+
+        # --- Summary logging ---
+        ranks = list(named_ranks.values())
+        if ranks:
+            min_r, max_r, avg_r = min(ranks), max(ranks), sum(ranks) / len(ranks)
+            logger.info(
+                f"GoRA: prepare_gora complete — {len(named_ranks)} modules initialized. "
+                f"Ranks: min={min_r}, max={max_r}, avg={avg_r:.1f}"
+            )
+            # Per-module detail: name, allocated rank, forward scale (α/√r)
+            for mod in gora_modules:
+                name = mod.lora_name
+                rank = named_ranks.get(name, mod.lora_dim)
+                scale = getattr(mod, 'scale', float('nan'))
+                logger.info(f"  {name}: rank={rank}, scale={scale:.4f}")
+        else:
+            logger.info(f"GoRA: prepare_gora complete. {len(named_ranks)} modules initialized.")
 
     @torch.no_grad()
     def update_norms(self):
