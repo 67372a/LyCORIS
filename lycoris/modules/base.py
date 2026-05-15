@@ -752,6 +752,77 @@ class LycorisBaseModule(ModuleCustomSD):
         return Vr, Sr, Uhr
 
     @staticmethod
+    def _compute_svd_pissa(org_weight_2d, lora_dim, niter=0, n_oversamples=10):
+        """Compute PiSSA (top-r) SVD decomposition with optional fast randomized SVD.
+
+        Returns the principal components (top-*lora_dim*) of the weight matrix.
+        When *niter* = 0, uses exact SVD via :func:`torch.linalg.svd`.
+        When *niter* > 0, uses fast randomized SVD (Halko et al., 2011) with
+        *niter* power iterations.
+
+        Args:
+            org_weight_2d: Weight matrix of shape ``(out, in)``.
+            lora_dim: Number of principal singular values/vectors to extract.
+            niter: Number of power iterations for randomized SVD (0 = exact).
+            n_oversamples: Extra random samples for randomized SVD stability.
+
+        Returns:
+            ``(Vr, Sr, Uhr)`` tuple where:
+                - *Vr*: ``(out, lora_dim)`` top-r left singular vectors (``U_{[:,:r]}``)
+                - *Sr*: ``(lora_dim,)`` top-r singular values, descending
+                - *Uhr*: ``(lora_dim, in)`` top-r right singular vectors transposed (``V^T_{[:r,:]}``)
+            or ``None`` if the matrix has fewer singular values than *lora_dim*.
+
+            This naming convention matches the existing
+            :meth:`_compute_svd_segment` for consistency within the codebase
+            (where ``V, S, Uh = torch.linalg.svd(...)`` maps ``V`` to ``U``
+            and ``Uh`` to ``V^T``).
+        """
+        m, n = org_weight_2d.shape
+        h = min(m, n)
+        if h < lora_dim:
+            return None
+
+        if niter <= 0:
+            # Exact SVD path
+            V, S, Uh = torch.linalg.svd(org_weight_2d.float(), full_matrices=False)
+            Vr = V[:, :lora_dim]
+            Sr = S[:lora_dim]
+            Uhr = Uh[:lora_dim]
+            return Vr, Sr, Uhr
+
+        # Fast randomized SVD path (Halko et al., 2011)
+        W_float = org_weight_2d.float()
+        r_oversampled = min(lora_dim + n_oversamples, h)
+
+        # Step 1: Random projection
+        Omega = torch.randn((n, r_oversampled), dtype=torch.float32, device=org_weight_2d.device)
+        Y = org_weight_2d @ Omega
+
+        # Step 2: Power iterations to improve accuracy
+        for _ in range(niter):
+            Y = org_weight_2d @ (org_weight_2d.T @ Y)
+
+        # Step 3: QR decomposition of Y
+        Q, _ = torch.linalg.qr(Y)
+
+        # Step 4: Project weight to subspace
+        B_proj = Q.T @ org_weight_2d  # (r_oversampled, n)
+
+        # Step 5: SVD of the small projected matrix
+        Ub, S, Vh = torch.linalg.svd(B_proj, full_matrices=False)
+
+        # Step 6: Transform back
+        V = Q @ Ub  # (m, r_oversampled)
+
+        # Step 7: Take top lora_dim components
+        Vr = V[:, :lora_dim]
+        Sr = S[:lora_dim]
+        Uhr = Vh[:lora_dim, :]  # Vh is already (r_oversampled, n)
+
+        return Vr, Sr, Uhr
+
+    @staticmethod
     def _get_weight_2d(org_module):
         """Return the original module weight reshaped to 2-D ``(out, in)``."""
         w = org_module.weight.data.clone()

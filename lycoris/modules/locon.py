@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .base import LycorisBaseModule
+from .pissa_utils import pissa_svd, convert_pissa_to_lora
 from ..functional.general import rebuild_tucker
 from ..logging import logger
 
@@ -33,6 +34,9 @@ class LoConModule(LycorisBaseModule):
         "lora_mid.weight",
         "alpha",
         "dora_scale",
+        "pissa_A_init",
+        "pissa_B_init",
+        "pissa_converted",
     ]
     weight_list_det = ["lora_up.weight"]
 
@@ -60,6 +64,8 @@ class LoConModule(LycorisBaseModule):
         ggpo_conv_weight_sample_size: int = 100,
         orthogonalize=False,
         orthogonal_init=False,
+        pissa_niter: int = 0,
+        pissa_convert: bool = True,
         **kwargs,
     ):
         """if alpha == 0 or None, alpha is rank (no scaling)."""
@@ -189,19 +195,47 @@ class LoConModule(LycorisBaseModule):
 
         self.init_ggpo()
 
-        # SVD segment initialization (PiSSA-style)
-        svd_segment = kwargs.get("svd_segment", None)
-        if svd_segment is not None:
+        # Store PiSSA-specific config
+        self.pissa_niter = pissa_niter
+        self.pissa_convert = pissa_convert
+        self.is_pissa = False  # True when PiSSA init was used (top SVD + residual base)
+        self.pissa_A_init: Optional[torch.Tensor] = None
+        self.pissa_B_init: Optional[torch.Tensor] = None
+
+        # QPiSSA: iterative quantization-aware SVD
+        qpissa_iter = kwargs.get("qpissa_iter", 0)
+        quant_fn = kwargs.get("quant_fn", None)
+
+        if quant_fn is not None and qpissa_iter > 0:
+            # QPiSSA: iterative quantization-aware initialization
             if self.use_orthogonal_init:
                 logger.warning(
-                    f"svd_segment='{svd_segment}' and orthogonal_init=True are mutually exclusive. "
-                    f"SVD segment init will replace orthogonal initialization for {self.lora_name}."
+                    f"QPiSSA init and orthogonal_init=True are mutually exclusive. "
+                    f"QPiSSA will replace orthogonal initialization for {self.lora_name}."
                 )
-            self._init_svd_segment(svd_segment)
+            self._init_qpissa(quant_fn, niter=qpissa_iter)
+        else:
+            # Standard SVD segment initialization (PiSSA-style)
+            svd_segment = kwargs.get("svd_segment", None)
+            if svd_segment is not None:
+                if self.use_orthogonal_init:
+                    logger.warning(
+                        f"svd_segment='{svd_segment}' and orthogonal_init=True are mutually exclusive. "
+                        f"SVD segment init will replace orthogonal initialization for {self.lora_name}."
+                    )
+                self._init_svd_segment(svd_segment)
 
     @torch.no_grad()
     def _init_svd_segment(self, segment: str):
-        """Initialize LoCon weights from a segment of the SVD spectrum."""
+        """Initialize LoCon weights from a segment of the SVD spectrum.
+
+        Supports PiSSA-style initialization when *segment* is ``"top"``:
+        the principal components become the trainable adapter (A,B) and the
+        residual is stored in the frozen base weight.
+
+        When ``self.pissa_niter > 0``, uses fast randomized SVD instead of
+        exact SVD for PiSSA initialization (only applicable for ``"top"``).
+        """
         if self.tucker:
             logger.warning(
                 f"SVD segment init is not supported for tucker decomposition "
@@ -210,7 +244,19 @@ class LoConModule(LycorisBaseModule):
             return
 
         org_weight_2d = self._get_weight_2d(self.org_module[0])
-        result = self._compute_svd_segment(org_weight_2d, self.lora_dim, segment)
+
+        # Use PiSSA fast SVD when requested and segment is "top"
+        if segment == "top" and self.pissa_niter > 0:
+            result = self._compute_svd_pissa(
+                org_weight_2d, self.lora_dim, niter=self.pissa_niter
+            )
+            logger.info(
+                f"PiSSA fast SVD init (niter={self.pissa_niter}): {self.lora_name}"
+            )
+        else:
+            result = self._compute_svd_segment(org_weight_2d, self.lora_dim, segment)
+            logger.info(f"SVD segment init ({segment}): {self.lora_name}")
+
         if result is None:
             logger.warning(
                 f"Weight {self.lora_name} has fewer singular values than "
@@ -232,11 +278,100 @@ class LoConModule(LycorisBaseModule):
             self.lora_down.weight.data.copy_(lora_down_2d)
         self.lora_up.weight.data.copy_(lora_up_2d.reshape(self.lora_up.weight.shape))
 
+        # For PiSSA (top segment), store initial weights for later conversion
+        if segment == "top":
+            self.is_pissa = True
+            self.pissa_A_init = (
+                lora_up_2d.detach().to(self.org_module[0].weight.dtype).clone()
+            )
+            self.pissa_B_init = (
+                lora_down_2d.detach().to(self.org_module[0].weight.dtype).clone()
+            )
+
         diff = (lora_up_2d @ lora_down_2d).reshape(orig_shape)
-        self.org_module[0].weight.data -= (
-            diff.to(self.org_module[0].weight.dtype) * self.scale
+        # For PiSSA, the singular values already encode scale, so we subtract
+        # the unscaled diff (scale should be 1.0 when alpha == lora_dim).
+        # For other segments, we use the existing scaling.
+        if segment == "top" and self.pissa_niter >= 0:
+            # PiSSA mode: singular values encode scale, use unscaled diff
+            self.org_module[0].weight.data -= diff.to(self.org_module[0].weight.dtype)
+        else:
+            self.org_module[0].weight.data -= (
+                diff.to(self.org_module[0].weight.dtype) * self.scale
+            )
+
+    @torch.no_grad()
+    def _init_qpissa(self, quant_fn, niter: int = 5):
+        """Initialize with QPiSSA: iterative quantization-aware SVD.
+
+        Performs the QPiSSA-T-iters algorithm (Algorithm 1 from the PiSSA paper):
+        1. SVD on the weight matrix
+        2. Extract principal components into A, B
+        3. Compute residual = W - A @ B
+        4. Quantize/dequantize the residual
+        5. Compute error = W - dequantized_residual
+        6. SVD on error → refine A, B
+        7. Repeat for *niter* iterations
+
+        This significantly reduces quantization error compared to QLoRA by
+        quantizing only the residual (which has a narrower distribution)
+        rather than the full weight matrix.
+
+        Args:
+            quant_fn: Callable ``(weight) -> (quantized, dequantized)`` that
+                      quantizes and dequantizes a weight tensor.
+            niter: Number of alternating SVD+quantization iterations (default 5).
+        """
+        if self.tucker:
+            logger.warning(
+                f"QPiSSA init is not supported for tucker decomposition "
+                f"(module {self.lora_name}), skipping."
+            )
+            return
+
+        from .pissa_utils import qpissa_iterative
+
+        org_weight_2d = self._get_weight_2d(self.org_module[0])
+
+        # Run QPiSSA-T-iters
+        quant_res, dequant_res, pissa_A, pissa_B = qpissa_iterative(
+            org_weight_2d,
+            self.lora_dim,
+            niter=niter,
+            quant_fn=quant_fn,
+            fast_niter=self.pissa_niter,
         )
-        logger.info(f"SVD segment init ({segment}): {self.lora_name}")
+
+        # Set adapter weights from PiSSA decomposition
+        orig_shape = self.org_module[0].weight.shape
+        lora_down_2d = pissa_B  # (r, in)
+        lora_up_2d = pissa_A    # (out, r)
+
+        if self.isconv:
+            self.lora_down.weight.data.copy_(
+                lora_down_2d.reshape(self.lora_dim, *orig_shape[1:])
+            )
+        else:
+            self.lora_down.weight.data.copy_(lora_down_2d)
+        self.lora_up.weight.data.copy_(lora_up_2d.reshape(self.lora_up.weight.shape))
+
+        # Set base weight to the quantized residual
+        self.org_module[0].weight.data.copy_(
+            dequant_res.reshape(orig_shape).to(self.org_module[0].weight.dtype)
+        )
+
+        # Mark as PiSSA and store initial weights for later conversion
+        self.is_pissa = True
+        self.pissa_A_init = (
+            lora_up_2d.detach().to(self.org_module[0].weight.dtype).clone()
+        )
+        self.pissa_B_init = (
+            lora_down_2d.detach().to(self.org_module[0].weight.dtype).clone()
+        )
+
+        logger.info(
+            f"QPiSSA init: {self.lora_name} (rank={self.lora_dim}, niter={niter})"
+        )
 
     @classmethod
     def make_module_from_state_dict(
@@ -261,8 +396,10 @@ class LoConModule(LycorisBaseModule):
 
     def load_weight_hook(self, module: nn.Module, incompatible_keys):
         missing_keys = incompatible_keys.missing_keys
-        for key in missing_keys:
-            if "scalar" in key:
+        # Allow missing PiSSA buffers (not present in standard LoRA or converted checkpoints)
+        pissa_keys = {"pissa_A_init", "pissa_B_init", "pissa_converted"}
+        for key in list(missing_keys):
+            if "scalar" in key or any(pk in key for pk in pissa_keys):
                 del missing_keys[missing_keys.index(key)]
         if isinstance(self.scalar, nn.Parameter):
             self.scalar.data.copy_(torch.ones_like(self.scalar))
@@ -272,6 +409,11 @@ class LoConModule(LycorisBaseModule):
             self.register_buffer(
                 "scalar", torch.ones_like(self.scalar), persistent=False
             )
+        # Initialize PiSSA buffers if not loaded from state dict
+        if not hasattr(self, "pissa_A_init") or self.pissa_A_init is None:
+            self.pissa_A_init = None
+        if not hasattr(self, "pissa_B_init") or self.pissa_B_init is None:
+            self.pissa_B_init = None
 
     def make_weight(self, device=None):
         wa = self._orthogonalize(self.lora_up.weight.to(device))
@@ -346,11 +488,98 @@ class LoConModule(LycorisBaseModule):
         if self.wd:
             destination["dora_scale"] = self.dora_scale
         destination["alpha"] = self.alpha
-        destination["lora_up.weight"] = self.lora_up.weight * self.scalar.to(device=self.lora_up.weight.device, non_blocking=True)
-        destination["lora_down.weight"] = self.lora_down.weight
+
+        if self.is_pissa and self.pissa_convert and self.pissa_A_init is not None:
+            # PiSSA→LoRA conversion on save:
+            # ΔW = A'B' - A₀B₀ = [A' | A₀] · [B' | -B₀]^T
+            lora_up_w = self.lora_up.weight * self.scalar.to(
+                device=self.lora_up.weight.device, non_blocking=True
+            )
+            # Concatenate: trained A (up) with initial A₀ (up init)
+            converted_up = torch.cat(
+                [lora_up_w, self.pissa_A_init.to(lora_up_w.device)], dim=1
+            )
+            # Concatenate: trained B (down) with negated initial B₀ (down init)
+            converted_down = torch.cat(
+                [self.lora_down.weight, -self.pissa_B_init.to(self.lora_down.weight.device)], dim=0
+            )
+            destination["lora_up.weight"] = converted_up
+            destination["lora_down.weight"] = converted_down
+            destination["pissa_converted"] = torch.tensor(1.0)
+            logger.info(
+                f"PiSSA→LoRA conversion on save: {self.lora_name} "
+                f"(rank {self.lora_dim} → {2 * self.lora_dim})"
+            )
+        else:
+            destination["lora_up.weight"] = self.lora_up.weight * self.scalar.to(
+                device=self.lora_up.weight.device, non_blocking=True
+            )
+            destination["lora_down.weight"] = self.lora_down.weight
+            # Preserve PiSSA init weights in state dict for round-trip loading
+            if self.is_pissa and self.pissa_A_init is not None:
+                destination["pissa_A_init"] = self.pissa_A_init
+                destination["pissa_B_init"] = self.pissa_B_init
+
         if self.tucker:
             destination["lora_mid.weight"] = self.lora_mid.weight
         return destination
+
+    @torch.no_grad()
+    def convert_pissa_to_lora(self):
+        """Convert trained PiSSA adapter to portable LoRA format.
+
+        Uses the identity:
+            ΔW = A'B' - A₀B₀ = [A' | A₀] · [B' | -B₀]^T
+
+        After conversion, the module behaves as a standard LoRA adapter
+        that can be loaded onto the original (non-decomposed) pretrained model
+        without requiring SVD.
+
+        Returns:
+            ``True`` if conversion was performed, ``False`` if the module
+            was not a PiSSA adapter.
+        """
+        if not self.is_pissa or self.pissa_A_init is None or self.pissa_B_init is None:
+            logger.warning(
+                f"convert_pissa_to_lora: {self.lora_name} is not a PiSSA adapter, skipping."
+            )
+            return False
+
+        # Compute portable LoRA weights
+        lora_up_curr = self.lora_up.weight.data.clone()
+        lora_down_curr = self.lora_down.weight.data.clone()
+        pissa_up_init = self.pissa_A_init.to(lora_up_curr.device)
+        pissa_down_init = self.pissa_B_init.to(lora_down_curr.device)
+
+        # ΔA = [A' | A₀]  → lora_up shape becomes (out, 2*r)
+        delta_up = torch.cat([lora_up_curr, pissa_up_init], dim=1)
+        # ΔB = [B' | -B₀] → lora_down shape becomes (2*r, in)
+        delta_down = torch.cat([lora_down_curr, -pissa_down_init], dim=0)
+
+        # Replace adapter weights
+        self.lora_up.weight.data = delta_up
+        self.lora_down.weight.data = delta_down
+        self.lora_dim = 2 * self.lora_dim
+
+        # Restore original weight: W = W^res + A₀B₀
+        # The base weight currently holds W^res, so we add back A₀B₀
+        orig_shape = self.org_module[0].weight.shape
+        if self.isconv:
+            a0b0 = (pissa_up_init @ pissa_down_init).reshape(orig_shape)
+        else:
+            a0b0 = (pissa_up_init @ pissa_down_init).reshape(orig_shape)
+        self.org_module[0].weight.data.add_(a0b0.to(self.org_module[0].weight.dtype))
+
+        # Clear PiSSA state
+        self.is_pissa = False
+        self.pissa_A_init = None
+        self.pissa_B_init = None
+
+        logger.info(
+            f"PiSSA→LoRA converted: {self.lora_name} "
+            f"(new rank={self.lora_dim})"
+        )
+        return True
 
     @torch.no_grad()
     def apply_max_norm(self, max_norm, device=None):

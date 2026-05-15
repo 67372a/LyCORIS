@@ -139,6 +139,32 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
     train_llm_adapter = str_bool(kwargs.get("train_llm_adapter", False))
 
     svd_segment = kwargs.get("svd_segment", None)
+
+    # PiSSA convenience parameter: init_weights="pissa" → svd_segment="top"
+    # init_weights="pissa_niter_K" → svd_segment="top" + pissa_niter=K
+    init_weights = kwargs.get("init_weights", None)
+    pissa_niter = 0
+    pissa_convert = str_bool(kwargs.get("pissa_convert", True))
+    if init_weights is not None:
+        if init_weights == "pissa":
+            if svd_segment is None:
+                svd_segment = "top"
+                logger.info(f"init_weights='pissa': using svd_segment='top' (PiSSA initialization)")
+        elif init_weights.startswith("pissa_niter_"):
+            if svd_segment is None:
+                svd_segment = "top"
+            pissa_niter = int(init_weights.split("_")[-1])
+            logger.info(
+                f"init_weights='{init_weights}': using svd_segment='top' "
+                f"with fast randomized SVD (niter={pissa_niter})"
+            )
+        elif init_weights == "svd_top":
+            svd_segment = "top"
+        elif init_weights == "svd_middle":
+            svd_segment = "middle"
+        elif init_weights == "svd_bottom":
+            svd_segment = "bottom"
+
     if svd_segment is not None:
         logger.info(f"SVD segment initialization: {svd_segment}")
 
@@ -249,6 +275,9 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
         ggpo_conv_weight_sample_size=ggpo_conv_weight_sample_size,
         orthogonalize=orthogonalize,
         orthogonal_init=orthogonal_init,
+        svd_segment=svd_segment,
+        pissa_niter=pissa_niter,
+        pissa_convert=pissa_convert,
         train_llm_adapter=train_llm_adapter,
         exclude_patterns=exclude_patterns,
         include_patterns=include_patterns,
