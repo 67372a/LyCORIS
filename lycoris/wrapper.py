@@ -132,6 +132,12 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
         if not use_scalar:
             logger.info("Forcing usage of use_scalar as orthogonal_init is enabled")
             use_scalar = True
+    olora = str_bool(kwargs.get("olora", False))
+    olora_lambda = float(kwargs.get("olora_lambda", 0.5))
+    olora_task_id = int(kwargs.get("olora_task_id", 0))
+    if olora:
+        logger.info("O-LoRA continual learning mode is enabled")
+        logger.info(f"  olora_lambda = {olora_lambda}")
     torch_compile = str_bool(kwargs.get("torch_compile", False))
     torch_compile_mode = kwargs.get("torch_compile_mode", "max-autotune")
     torch_compile_dynamic = str_bool(kwargs.get("torch_compile_dynamic", False))
@@ -278,6 +284,9 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
         svd_segment=svd_segment,
         pissa_niter=pissa_niter,
         pissa_convert=pissa_convert,
+        olora=olora,
+        olora_lambda=olora_lambda,
+        olora_task_id=olora_task_id,
         train_llm_adapter=train_llm_adapter,
         exclude_patterns=exclude_patterns,
         include_patterns=include_patterns,
@@ -923,6 +932,38 @@ class LycorisNetwork(torch.nn.Module):
         if unexpected:
             state["unexpected keys"] = unexpected
         return state
+
+    def advance_olora_task(self, new_task_id: int):
+        """Advance to a new task in O-LoRA continual learning.
+
+        Freezes all current LoRA parameters and creates a new trainable
+        LoRA pair for the incoming task. Only affects modules where
+        ``olora=True``.
+
+        Args:
+            new_task_id: Zero-based task index for the new task.
+        """
+        from .modules.locon import LoConModule
+
+        for module in self.modules():
+            if isinstance(module, LoConModule) and module.olora:
+                module.add_task(new_task_id)
+
+    @torch.no_grad()
+    def merge_old_olora_tasks(self):
+        """Merge all frozen O-LoRA task weights into base model weights.
+
+        Calls :meth:`LoConModule.merge_old_tasks_to_base` on every
+        O-LoRA module in the network, then removes the merged modules
+        to reclaim GPU memory.
+
+        Only the current (trainable) task's LoRA parameters remain.
+        """
+        from .modules.locon import LoConModule
+
+        for module in self.modules():
+            if isinstance(module, LoConModule) and module.olora:
+                module.merge_old_tasks_to_base()
 
     def apply_to(self):
         """

@@ -40,6 +40,9 @@ class LoConModule(LycorisBaseModule):
     ]
     weight_list_det = ["lora_up.weight"]
 
+    # O-LoRA: registry of all LoConModule instances for orthogonality loss aggregation.
+    _olora_modules: list = []
+
     def __init__(
         self,
         lora_name,
@@ -66,6 +69,9 @@ class LoConModule(LycorisBaseModule):
         orthogonal_init=False,
         pissa_niter: int = 0,
         pissa_convert: bool = True,
+        olora: bool = False,
+        olora_lambda: float = 0.5,
+        olora_task_id: int = 0,
         **kwargs,
     ):
         """if alpha == 0 or None, alpha is rank (no scaling)."""
@@ -94,6 +100,13 @@ class LoConModule(LycorisBaseModule):
         self.use_orthogonal_init = orthogonal_init
         if self.use_orthogonal_init and not use_scalar:
             use_scalar = True
+
+        # O-LoRA configuration
+        self.olora = olora
+        self.olora_lambda = olora_lambda
+        self.olora_task_id = olora_task_id
+        if self.olora:
+            LoConModule._olora_modules.append(self)
 
         if self.module_type.startswith("conv"):
             self.isconv = True
@@ -127,6 +140,23 @@ class LoConModule(LycorisBaseModule):
             self.lora_up = nn.Linear(lora_dim, out_dim, bias=False)
         else:
             raise NotImplementedError
+
+        # O-LoRA multi-task containers: wrap the freshly created modules.
+        # self.lora_down / self.lora_up are kept as direct references to the
+        # current (trainable) task's modules for backward compatibility with
+        # all existing code paths (init, forward, merge, state_dict, etc.).
+        if self.olora:
+            self.lora_down_modules = nn.ModuleList([self.lora_down])
+            self.lora_up_modules = nn.ModuleList([self.lora_up])
+            self.lora_scalar_list = nn.ParameterList()
+            self.lora_mid_modules = nn.ModuleList()
+            if self.tucker:
+                self.lora_mid_modules.append(self.lora_mid)
+        else:
+            self.lora_down_modules = nn.ModuleList()
+            self.lora_up_modules = nn.ModuleList()
+            self.lora_scalar_list = nn.ParameterList()
+            self.lora_mid_modules = nn.ModuleList()
 
         self.wd = weight_decompose
         self.wd_on_output = wd_on_output
@@ -170,6 +200,8 @@ class LoConModule(LycorisBaseModule):
         if use_scalar:
             init_val = scalar_init_value if scalar_init_value is not None else 0.1
             self.scalar = nn.Parameter(torch.tensor(init_val))
+            if self.olora:
+                self.lora_scalar_list.append(self.scalar)
         else:
             self.register_buffer("scalar", torch.tensor(1.0), persistent=False)
 
@@ -396,10 +428,18 @@ class LoConModule(LycorisBaseModule):
 
     def load_weight_hook(self, module: nn.Module, incompatible_keys):
         missing_keys = incompatible_keys.missing_keys
-        # Allow missing PiSSA buffers (not present in standard LoRA or converted checkpoints)
+        # Allow missing keys that may not be present in all checkpoint variants
         pissa_keys = {"pissa_A_init", "pissa_B_init", "pissa_converted"}
+        olora_keys = {"olora_task_id"}
         for key in list(missing_keys):
-            if "scalar" in key or any(pk in key for pk in pissa_keys):
+            if (
+                "scalar" in key
+                or any(pk in key for pk in pissa_keys)
+                or any(ok in key for ok in olora_keys)
+                or ("lora_down_task" in key)
+                or ("lora_up_task" in key)
+                or ("lora_mid_task" in key)
+            ):
                 del missing_keys[missing_keys.index(key)]
         if isinstance(self.scalar, nn.Parameter):
             self.scalar.data.copy_(torch.ones_like(self.scalar))
@@ -414,8 +454,17 @@ class LoConModule(LycorisBaseModule):
             self.pissa_A_init = None
         if not hasattr(self, "pissa_B_init") or self.pissa_B_init is None:
             self.pissa_B_init = None
+        # Initialize O-LoRA task ID if not loaded from state dict
+        if not hasattr(self, "olora_task_id"):
+            self.olora_task_id = 0
 
     def make_weight(self, device=None):
+        if self.olora:
+            return self._make_weight_multitask(device)
+        return self._make_weight_single(device)
+
+    def _make_weight_single(self, device=None):
+        """Original single-task weight computation (used when olora=False)."""
         wa = self._orthogonalize(self.lora_up.weight.to(device))
         wb = self._orthogonalize(self.lora_down.weight.to(device))
         if self.tucker:
@@ -437,6 +486,180 @@ class LoConModule(LycorisBaseModule):
             weight *= drop
 
         return weight * self.scalar.to(device)
+
+    def _make_weight_multitask(self, device=None):
+        """Multi-task O-LoRA weight: sum of w_a @ w_b across all tasks."""
+        total = None
+        num_tasks = len(self.lora_down_modules)
+        for idx in range(num_tasks):
+            wa = self._orthogonalize(self.lora_up_modules[idx].weight.to(device))
+            wb = self._orthogonalize(self.lora_down_modules[idx].weight.to(device))
+            if self.tucker and len(self.lora_mid_modules) > idx:
+                t = self._orthogonalize(self.lora_mid_modules[idx].weight.to(device))
+                wa = wa.view(wa.size(0), -1).transpose(0, 1)
+                wb = wb.view(wb.size(0), -1)
+                task_weight = rebuild_tucker(t, wa, wb)
+            else:
+                task_weight = wa.view(wa.size(0), -1) @ wb.view(wb.size(0), -1)
+            task_weight = task_weight.view(self.shape)
+            if self.training and self.rank_dropout:
+                drop = (torch.rand(task_weight.size(0), device=device) > self.rank_dropout).to(
+                    task_weight.dtype
+                )
+                drop = drop.view(-1, *[1] * len(task_weight.shape[1:]))
+                if self.rank_dropout_scale:
+                    drop /= drop.mean()
+                task_weight *= drop
+            scalar = self.lora_scalar_list[idx] if idx < len(self.lora_scalar_list) else self.scalar
+            task_weight = task_weight * scalar.to(device)
+            if total is None:
+                total = task_weight
+            else:
+                total = total + task_weight
+        return total
+
+    def _compute_diff_weight_single(self, device, dtype):
+        """Single-task diff_weight for non-bypass forward (tucker or rank_dropout case)."""
+        wa = self._orthogonalize(self.lora_up.weight).to(device=device, dtype=dtype)
+        wb = self._orthogonalize(self.lora_down.weight).to(device=device, dtype=dtype)
+
+        if self.tucker:
+            t = self._orthogonalize(self.lora_mid.weight).to(device=device, dtype=dtype)
+            wa = wa.view(wa.size(0), -1).transpose(0, 1)
+            wb = wb.view(wb.size(0), -1)
+            diff_weight = rebuild_tucker(t, wa, wb)
+        else:
+            diff_weight = wa.view(wa.size(0), -1) @ wb.view(wb.size(0), -1)
+
+        diff_weight = diff_weight.view(self.shape)
+        if self.training and self.rank_dropout:
+            drop = (torch.rand(diff_weight.size(0), device=device) > self.rank_dropout).to(
+                diff_weight.dtype
+            )
+            drop = drop.view(-1, *[1] * len(diff_weight.shape[1:]))
+            if self.rank_dropout_scale:
+                drop /= drop.mean()
+            diff_weight *= drop
+
+        diff_weight = (diff_weight * self.scalar.to(device=device)).to(dtype=dtype) * self.scale
+        return diff_weight
+
+    def _compute_diff_weight_multitask(self, device, dtype):
+        """Multi-task O-LoRA diff_weight summing over all task LoRA pairs."""
+        total = None
+        num_tasks = len(self.lora_down_modules)
+        for idx in range(num_tasks):
+            wa = self._orthogonalize(self.lora_up_modules[idx].weight).to(device=device, dtype=dtype)
+            wb = self._orthogonalize(self.lora_down_modules[idx].weight).to(device=device, dtype=dtype)
+
+            if self.tucker and len(self.lora_mid_modules) > idx:
+                t = self._orthogonalize(self.lora_mid_modules[idx].weight).to(device=device, dtype=dtype)
+                wa = wa.view(wa.size(0), -1).transpose(0, 1)
+                wb = wb.view(wb.size(0), -1)
+                task_weight = rebuild_tucker(t, wa, wb)
+            else:
+                task_weight = wa.view(wa.size(0), -1) @ wb.view(wb.size(0), -1)
+
+            task_weight = task_weight.view(self.shape)
+            if self.training and self.rank_dropout:
+                drop = (torch.rand(task_weight.size(0), device=device) > self.rank_dropout).to(
+                    task_weight.dtype
+                )
+                drop = drop.view(-1, *[1] * len(task_weight.shape[1:]))
+                if self.rank_dropout_scale:
+                    drop /= drop.mean()
+                task_weight *= drop
+
+            scalar = self.lora_scalar_list[idx] if idx < len(self.lora_scalar_list) else self.scalar
+            task_weight = (task_weight * scalar.to(device=device)).to(dtype=dtype) * self.scale
+            if total is None:
+                total = task_weight
+            else:
+                total = total + task_weight
+        return total
+
+    def add_task(self, task_id: int):
+        """Create a new LoRA pair for the incoming task and freeze previous ones.
+
+        This follows the O-LoRA algorithm: previous LoRA parameters are fixed,
+        and only the current task's LoRA is trained. Orthogonality between the
+        new subspace and previous subspaces is enforced via the loss term
+        (see :meth:`get_olora_orthogonality_loss`).
+
+        Args:
+            task_id: Zero-based task index for the new task.
+        """
+        if not self.olora:
+            raise RuntimeError("add_task() called on a non-O-LoRA LoConModule.")
+
+        # 1. Freeze all existing LoRA modules
+        for module in self.lora_down_modules:
+            for p in module.parameters():
+                p.requires_grad = False
+        for module in self.lora_up_modules:
+            for p in module.parameters():
+                p.requires_grad = False
+        for module in self.lora_mid_modules:
+            for p in module.parameters():
+                p.requires_grad = False
+        for scalar in self.lora_scalar_list:
+            scalar.requires_grad = False
+
+        # 2. Create new trainable LoRA pair
+        if self.isconv:
+            in_dim = self.lora_down_modules[0].weight.shape[1]  # in_channels
+            out_dim = self.lora_up_modules[0].weight.shape[0]    # out_channels
+            k_size = self.lora_down.kernel_size
+            stride = self.lora_down.stride
+            padding = self.lora_down.padding
+            new_down = self.module(in_dim, self.lora_dim, k_size, stride, padding, bias=False)
+            new_up = self.module(self.lora_dim, out_dim, 1, bias=False)
+        else:
+            in_dim = self.lora_down_modules[0].weight.shape[1]
+            out_dim = self.lora_up_modules[0].weight.shape[0]
+            new_down = nn.Linear(in_dim, self.lora_dim, bias=False)
+            new_up = nn.Linear(self.lora_dim, out_dim, bias=False)
+
+        # 3. Initialize new weights
+        if self.use_orthogonal_init:
+            nn.init.orthogonal_(new_down.weight)
+            nn.init.orthogonal_(new_up.weight)
+        else:
+            nn.init.kaiming_uniform_(new_down.weight, a=math.sqrt(5))
+            nn.init.zeros_(new_up.weight)
+
+        # 4. Register new modules
+        self.lora_down_modules.append(new_down)
+        self.lora_up_modules.append(new_up)
+
+        # 5. Add new scalar if use_scalar is active
+        if isinstance(self.scalar, nn.Parameter):
+            new_scalar = nn.Parameter(torch.tensor(0.1))
+            self.lora_scalar_list.append(new_scalar)
+
+        # 6. Handle tucker mid module
+        if self.tucker:
+            new_mid = self.module(
+                self.lora_dim, self.lora_dim,
+                self.lora_mid.kernel_size,
+                self.lora_mid.stride,
+                self.lora_mid.padding,
+                bias=False,
+            )
+            if self.use_orthogonal_init:
+                nn.init.orthogonal_(new_mid.weight)
+            else:
+                nn.init.kaiming_uniform_(new_mid.weight, a=math.sqrt(5))
+            self.lora_mid_modules.append(new_mid)
+
+        # 7. Update backward-compatible references to point to the new trainable task
+        self.lora_down = new_down
+        self.lora_up = new_up
+        if self.tucker:
+            self.lora_mid = new_mid
+
+        # 8. Update task ID
+        self.olora_task_id = task_id
 
     def get_diff_weight(self, multiplier=1, shape=None, device=None):
         scale = self.scale * multiplier
@@ -489,6 +712,29 @@ class LoConModule(LycorisBaseModule):
             destination["dora_scale"] = self.dora_scale
         destination["alpha"] = self.alpha
 
+        # O-LoRA multi-task serialization
+        if self.olora:
+            for task_idx in range(len(self.lora_down_modules)):
+                scalar = (
+                    self.lora_scalar_list[task_idx]
+                    if task_idx < len(self.lora_scalar_list)
+                    else self.scalar
+                )
+                destination[f"lora_up_task{task_idx}.weight"] = (
+                    self.lora_up_modules[task_idx].weight
+                    * scalar.to(device=self.lora_up_modules[task_idx].weight.device, non_blocking=True)
+                )
+                destination[f"lora_down_task{task_idx}.weight"] = (
+                    self.lora_down_modules[task_idx].weight
+                )
+                if self.tucker and task_idx < len(self.lora_mid_modules):
+                    destination[f"lora_mid_task{task_idx}.weight"] = (
+                        self.lora_mid_modules[task_idx].weight
+                    )
+            destination["olora_task_id"] = torch.tensor(self.olora_task_id)
+            return destination
+
+        # Non-O-LoRA path (existing logic)
         if self.is_pissa and self.pissa_convert and self.pissa_A_init is not None:
             # PiSSA→LoRA conversion on save:
             # ΔW = A'B' - A₀B₀ = [A' | A₀] · [B' | -B₀]^T
@@ -601,7 +847,119 @@ class LoConModule(LycorisBaseModule):
         unscaled_norm = self.make_weight(device).norm()
         return unscaled_norm
 
+    # ------------------------------------------------------------------
+    # O-LoRA: Orthogonality Loss
+    # ------------------------------------------------------------------
+
+    def get_olora_orthogonality_loss(self) -> torch.Tensor:
+        """Compute L1 orthogonality loss between the current (trainable) and all
+        frozen A matrices.
+
+        Matches the reference O-LoRA implementation (uie_trainer_lora.py:96):
+            L_orth = Σ_{i=1}^{t-1} Σ_{j,k} |(A_i @ A_t^T)[j,k]|
+
+        Returns:
+            Scalar loss tensor (0.0 when O-LoRA is disabled or only one task).
+        """
+        if not self.olora or len(self.lora_down_modules) <= 1:
+            return torch.tensor(0.0, device=self.device)
+
+        current_A = self._get_down_weight_2d(self.lora_down_modules[-1])
+        orth_loss = torch.tensor(0.0, device=current_A.device)
+
+        for i in range(len(self.lora_down_modules) - 1):
+            old_A = self._get_down_weight_2d(self.lora_down_modules[i])
+            cross = old_A @ current_A.T
+            orth_loss = orth_loss + torch.abs(cross).sum()
+
+        return orth_loss
+
+    def _get_down_weight_2d(self, down_module: nn.Module) -> torch.Tensor:
+        """Flatten down-projection weight to (r, in_dim) for orthogonality computation.
+
+        Handles both linear (2D) and convolutional (>2D) weight shapes.
+        """
+        w = down_module.weight  # (r, in_dim) or (r, in_channels, k1, k2, ...)
+        return w.view(w.size(0), -1)
+
+    @staticmethod
+    def get_total_olora_loss() -> torch.Tensor:
+        """Aggregate orthogonality loss across all registered O-LoRA modules.
+
+        Call this from the training loop:
+            total_loss = task_loss + olora_lambda * LoConModule.get_total_olora_loss()
+        """
+        if not LoConModule._olora_modules:
+            return torch.tensor(0.0)
+        total = torch.tensor(0.0)
+        for mod in LoConModule._olora_modules:
+            total = total + mod.get_olora_orthogonality_loss()
+        return total
+
+    @staticmethod
+    def reset_olora_registry():
+        """Clear the O-LoRA module registry (e.g., before starting a fresh run)."""
+        LoConModule._olora_modules.clear()
+
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def merge_old_tasks_to_base(self):
+        """Merge all frozen (non-current) task LoRA weights into the base weight.
+
+        Implements Equation 9 from the O-LoRA paper:
+            W_init := W_init + Σ_{i=1}^{t-1} A_i B_i
+
+        After merging, the frozen task modules are removed from the module lists,
+        freeing GPU memory. The current (trainable) task remains.
+        """
+        if not self.olora or len(self.lora_down_modules) <= 1:
+            return
+
+        # Merge all tasks except the last (current, trainable) one
+        for task_idx in range(len(self.lora_down_modules) - 1):
+            wa = self.lora_up_modules[task_idx].weight.data
+            wb = self.lora_down_modules[task_idx].weight.data
+            delta = (wa.view(wa.size(0), -1) @ wb.view(wb.size(0), -1)).view(self.shape)
+            delta = delta * self.scale
+            scalar = (
+                self.lora_scalar_list[task_idx]
+                if task_idx < len(self.lora_scalar_list)
+                else self.scalar
+            )
+            self.org_module[0].weight.data += (
+                (delta * scalar).to(self.org_module[0].weight.dtype)
+            )
+
+        # Remove merged modules (keep only the last one)
+        keep_idx = len(self.lora_down_modules) - 1
+        self.lora_down = self.lora_down_modules[keep_idx]
+        self.lora_up = self.lora_up_modules[keep_idx]
+        # nn.ModuleList supports __delitem__, but nn.ParameterList does not.
+        # Rebuild containers with only the kept (current) module.
+        keep_down = [self.lora_down_modules[keep_idx]]
+        keep_up = [self.lora_up_modules[keep_idx]]
+        self.lora_down_modules = nn.ModuleList(keep_down)
+        self.lora_up_modules = nn.ModuleList(keep_up)
+        if self.tucker and len(self.lora_mid_modules) > keep_idx:
+            self.lora_mid = self.lora_mid_modules[keep_idx]
+            self.lora_mid_modules = nn.ModuleList([self.lora_mid_modules[keep_idx]])
+        if len(self.lora_scalar_list) > keep_idx:
+            self.scalar = self.lora_scalar_list[keep_idx]
+            self.lora_scalar_list = nn.ParameterList([self.lora_scalar_list[keep_idx]])
+
+        # Reset task ID to 0 (only one task left, which is now "task 0")
+        self.olora_task_id = 0
+
+    # ------------------------------------------------------------------
+
     def bypass_forward_diff(self, x, scale=1):
+        if self.olora:
+            return self._bypass_forward_diff_multitask(x, scale)
+        return self._bypass_forward_diff_single(x, scale)
+
+    def _bypass_forward_diff_single(self, x, scale=1):
+        """Original single-task bypass forward diff (used when olora=False)."""
         # Orthogonalize weights on the fly for this forward pass.
         # This is only active during training if self.use_orthogonal_weights is True.
         wb = self._orthogonalize(self.lora_down.weight).to(x.device, dtype=x.dtype)
@@ -664,6 +1022,69 @@ class LoConModule(LycorisBaseModule):
 
         return self.drop(up * self.scalar * self.scale * scale)
 
+    def _bypass_forward_diff_multitask(self, x, scale=1):
+        """Multi-task O-LoRA bypass forward diff: sum over all task LoRA pairs."""
+        total_up = None
+        num_tasks = len(self.lora_down_modules)
+        for idx in range(num_tasks):
+            down_module = self.lora_down_modules[idx]
+            up_module = self.lora_up_modules[idx]
+            wb = self._orthogonalize(down_module.weight).to(x.device, dtype=x.dtype)
+            wa = self._orthogonalize(up_module.weight).to(x.device, dtype=x.dtype)
+
+            if self.isconv:
+                mid = self.down_op(
+                    x, wb, bias=None,
+                    stride=down_module.stride,
+                    padding=down_module.padding,
+                    dilation=down_module.dilation,
+                    groups=down_module.groups,
+                )
+            else:
+                mid = self.down_op(x, wb)
+
+            if self.tucker and len(self.lora_mid_modules) > idx:
+                wc = self._orthogonalize(self.lora_mid_modules[idx].weight)
+                mid = self.op(
+                    mid, wc, bias=None,
+                    stride=self.lora_mid_modules[idx].stride,
+                    padding=self.lora_mid_modules[idx].padding,
+                    dilation=self.lora_mid_modules[idx].dilation,
+                    groups=self.lora_mid_modules[idx].groups,
+                )
+
+            if self.rank_dropout and self.training:
+                drop = (
+                    torch.rand(self.lora_dim, device=mid.device) > self.rank_dropout
+                ).to(mid.dtype)
+                if self.rank_dropout_scale:
+                    drop /= drop.mean()
+                if (dims := len(x.shape)) == 4:
+                    drop = drop.view(1, -1, 1, 1)
+                else:
+                    drop = drop.view(*[1] * (dims - 1), -1)
+                mid = mid * drop
+
+            if self.isconv:
+                up = self.up_op(
+                    mid, wa, bias=None,
+                    stride=up_module.stride,
+                    padding=up_module.padding,
+                    dilation=up_module.dilation,
+                    groups=up_module.groups,
+                )
+            else:
+                up = self.up_op(mid, wa)
+
+            scalar = self.lora_scalar_list[idx] if idx < len(self.lora_scalar_list) else self.scalar
+            task_up = up * scalar * self.scale
+            if total_up is None:
+                total_up = task_up
+            else:
+                total_up = total_up + task_up
+
+        return self.drop(total_up * scale)
+
     def bypass_forward(self, x, scale=1):
         return self.org_forward(x) + self.bypass_forward_diff(x, scale=scale)
 
@@ -701,31 +1122,10 @@ class LoConModule(LycorisBaseModule):
         
         # Apply lora dropout during weight computation if enabled
         if (not self.wd and (self.tucker or self.rank_dropout)):
-            # Get the lora weights
-            wa = self._orthogonalize(self.lora_up.weight).to(device=x.device,dtype=dtype)
-            wb = self._orthogonalize(self.lora_down.weight).to(device=x.device,dtype=dtype)
-            
-            # Compute the combined weight
-            if self.tucker:
-                t = self._orthogonalize(self.lora_mid.weight).to(device=x.device,dtype=dtype)
-                wa = wa.view(wa.size(0), -1).transpose(0, 1)
-                wb = wb.view(wb.size(0), -1)
-                diff_weight = rebuild_tucker(t, wa, wb)
+            if self.olora:
+                diff_weight = self._compute_diff_weight_multitask(x.device, dtype)
             else:
-                diff_weight = wa.view(wa.size(0), -1) @ wb.view(wb.size(0), -1)
-            
-            # Apply additional processing
-            diff_weight = diff_weight.view(self.shape)
-            if self.training and self.rank_dropout:
-                drop = (torch.rand(diff_weight.size(0), device=x.device) > self.rank_dropout).to(
-                    diff_weight.dtype
-                )
-                drop = drop.view(-1, *[1] * len(diff_weight.shape[1:]))
-                if self.rank_dropout_scale:
-                    drop /= drop.mean()
-                diff_weight *= drop
-            
-            diff_weight = (diff_weight * self.scalar.to(device=x.device)).to(dtype=dtype) * self.scale
+                diff_weight = self._compute_diff_weight_single(x.device, dtype)
         else:
             diff_weight = self.make_weight(x.device).to(dtype) * self.scale
         
