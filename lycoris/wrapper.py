@@ -242,6 +242,28 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
         if gora_adaptive_gamma:
             logger.info("  adaptive_gamma=True")
 
+        # GoRA: alpha should equal dim (paper convention: scale = dim/√r)
+        if linear_alpha != linear_dim:
+            logger.warning(
+                f"GoRA: linear_alpha ({linear_alpha}) != lora_dim ({linear_dim}). "
+                f"Setting linear_alpha = lora_dim per paper convention."
+            )
+            linear_alpha = linear_dim
+        if conv_dim > 0 and conv_alpha != conv_dim:
+            logger.warning(
+                f"GoRA: conv_alpha ({conv_alpha}) != conv_dim ({conv_dim}). "
+                f"Setting conv_alpha = conv_dim per paper convention."
+            )
+            conv_alpha = conv_dim
+
+        if use_scalar:
+            logger.warning(
+                "GoRA: use_scalar=True is not recommended. "
+                "The learnable scalar destabilizes importance convergence. "
+                "use_scalar set to False."
+            )
+            use_scalar = False
+
     preset = kwargs.get("preset", "full")
     if preset not in PRESET:
         preset = read_preset(preset)

@@ -274,6 +274,28 @@ def create_network(
         if gora_adaptive_gamma:
             logger.info("  adaptive_gamma=True")
 
+        # GoRA: alpha should equal dim (paper convention: scale = dim/√r)
+        if network_alpha != network_dim:
+            logger.warning(
+                f"GoRA: network_alpha ({network_alpha}) != network_dim ({network_dim}). "
+                f"Setting network_alpha = network_dim per paper convention."
+            )
+            network_alpha = network_dim
+        if conv_dim > 0 and conv_alpha != conv_dim:
+            logger.warning(
+                f"GoRA: conv_alpha ({conv_alpha}) != conv_dim ({conv_dim}). "
+                f"Setting conv_alpha = conv_dim per paper convention."
+            )
+            conv_alpha = conv_dim
+
+        if use_scalar:
+            logger.warning(
+                "GoRA: use_scalar=True is not recommended. "
+                "The learnable scalar destabilizes importance convergence. "
+                "use_scalar set to False."
+            )
+            use_scalar = False
+
     if torch_compile:
         logger.info(f"Torch compile enabled for network.\n \
                     dynamic={torch_compile_dynamic}\n \

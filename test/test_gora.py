@@ -857,7 +857,8 @@ def test_kohya_create_network_gora_full_flow():
 
     assert network._gora_needs_init is True
     assert network._gora_kwargs.get("gora_gamma") == 0.05
-    assert network._gora_kwargs.get("scaling_alpha") == 16.0
+    # GoRA enforces alpha = dim; scaling_alpha was corrected from 16.0 to 4
+    assert network._gora_kwargs.get("scaling_alpha") == 4
     assert len(network.loras) >= 1
     assert any(isinstance(l, GM) for l in network.loras), "No GoRAModule in Kohya network"
 

@@ -99,7 +99,7 @@ class LokrModule(LycorisBaseModule):
         if orthogonalize and not orthogonal_init:
             orthogonal_init = True
         self.use_orthogonal_init = orthogonal_init
-        if self.use_orthogonal_init and not use_scalar:
+        if self.use_orthogonal_weights and not use_scalar:
             use_scalar = True
 
         if self.module_type.startswith("conv"):

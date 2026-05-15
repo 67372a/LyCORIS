@@ -90,7 +90,7 @@ class GLoRAModule(LycorisBaseModule):
         if orthogonalize and not orthogonal_init:
             orthogonal_init = True
         self.use_orthogonal_init = orthogonal_init
-        if self.use_orthogonal_init and not use_scalar:
+        if self.use_orthogonal_weights and not use_scalar:
             use_scalar = True
 
         if dropout and not bypass_mode:
