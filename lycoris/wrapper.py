@@ -1212,14 +1212,21 @@ class LycorisNetwork(torch.nn.Module):
         if adaptive_gamma is None:
             adaptive_gamma = gk.get('gora_adaptive_gamma', False)
 
+        # Compute paper-optimal defaults: r_min = r_ref/2, r_max = 4*r_ref
+        # Only use defaults when user hasn't explicitly passed the value.
+        # In _gora_kwargs, explicitly-passed keys are present; absent = use default.
+        ref_rank = gk.get('gora_ref_rank', 8)
+        min_rank = gk['gora_min_rank'] if 'gora_min_rank' in gk else max(1, ref_rank // 2)
+        max_rank = gk['gora_max_rank'] if 'gora_max_rank' in gk else (ref_rank * 4)
+
         from .modules.gora_utils import gora_precompute_gradients
         named_ranks = gora_precompute_gradients(
             modules=gora_modules,
             dataloader=dataloader,
             forward_fn=forward_fn,
-            ref_rank=gk.get('gora_ref_rank', 8),
-            min_rank=gk.get('gora_min_rank') or 1,
-            max_rank=gk.get('gora_max_rank') or 32,
+            ref_rank=ref_rank,
+            min_rank=min_rank,
+            max_rank=max_rank,
             importance_type=gk.get('gora_importance_type', 'union_mean'),
             scaling_alpha=gk.get('scaling_alpha', 1.0),
             stable_gamma=gk.get('gora_gamma', 0.05),
