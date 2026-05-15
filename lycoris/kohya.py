@@ -16,7 +16,7 @@ import math
 from .utils import precalculate_safetensors_hashes
 from .wrapper import LycorisNetwork, network_module_dict, deprecated_arg_dict
 from .modules.abba import AbbaModule
-from .modules.locon import LoConModule
+from .modules.locon import LoConModule, GoRAModule
 from .modules.loha import LohaModule
 from .modules.ia3 import IA3Module
 from .modules.lokr import LokrModule
@@ -225,7 +225,9 @@ def create_network(
         logger.info("Full matrix mode for LoKr is enabled")
 
     preset_str = kwargs.get("preset", "full")
-    if preset_str not in PRESET:
+    if isinstance(preset_str, dict):
+        preset = preset_str
+    elif preset_str not in PRESET:
         preset = read_preset(preset_str)
     else:
         preset = PRESET[preset_str]
@@ -248,6 +250,29 @@ def create_network(
 
     if algo == "ia3" and preset_str != "ia3":
         logger.warning("It is recommended to use preset ia3 for IA^3 algorithm")
+
+    # GoRA parameters (Kohya path)
+    gora_ref_rank = int(kwargs.get("gora_ref_rank", network_dim) or network_dim)
+    gora_min_rank = kwargs.get("gora_min_rank", None)
+    gora_max_rank = kwargs.get("gora_max_rank", None)
+    gora_gamma = float(kwargs.get("gora_gamma", 5e-2))
+    gora_importance_type = kwargs.get("gora_importance_type", "union_mean")
+    gora_softmax_importance = str_bool(kwargs.get("gora_softmax_importance", False))
+    gora_temperature = float(kwargs.get("gora_temperature", 0.5))
+    gora_scale_importance = str_bool(kwargs.get("gora_scale_importance", False))
+    gora_features_func = kwargs.get("gora_features_func", None)
+    gora_allocate_strategy = kwargs.get("gora_allocate_strategy", "moderate")
+    gora_adaptive_gamma = str_bool(kwargs.get("gora_adaptive_gamma", False))
+    gora_weight_a_init = kwargs.get("gora_weight_a_init", "kaiming")
+    gora_scale_by_lr = str_bool(kwargs.get("gora_scale_by_lr", False))
+    gora_lr = float(kwargs.get("gora_lr", 1e-3))
+
+    if algo == "gora":
+        logger.info("GoRA: Gradient-driven Adaptive Low Rank Adaptation enabled")
+        logger.info(f"  ref_rank={gora_ref_rank}, min_rank={gora_min_rank}, max_rank={gora_max_rank}")
+        logger.info(f"  gamma={gora_gamma}, importance_type={gora_importance_type}")
+        if gora_adaptive_gamma:
+            logger.info("  adaptive_gamma=True")
 
     if torch_compile:
         logger.info(f"Torch compile enabled for network.\n \
@@ -297,6 +322,21 @@ def create_network(
         include_patterns=include_patterns,
         network_reg_dims=network_reg_dims,
         network_reg_lrs=network_reg_lrs,
+        # GoRA parameters
+        gora_ref_rank=gora_ref_rank,
+        gora_min_rank=gora_min_rank,
+        gora_max_rank=gora_max_rank,
+        gora_gamma=gora_gamma,
+        gora_importance_type=gora_importance_type,
+        gora_softmax_importance=gora_softmax_importance,
+        gora_temperature=gora_temperature,
+        gora_scale_importance=gora_scale_importance,
+        gora_features_func=gora_features_func,
+        gora_allocate_strategy=gora_allocate_strategy,
+        gora_adaptive_gamma=gora_adaptive_gamma,
+        gora_weight_a_init=gora_weight_a_init,
+        gora_scale_by_lr=gora_scale_by_lr,
+        gora_lr=gora_lr,
     )
     if (
         loraplus_lr_ratio is not None
@@ -544,6 +584,25 @@ class LycorisNetworkKohya(LycorisNetwork):
 
         if self.ggpo_conv_weight_sample_size is not None:
             self.ggpo_conv_weight_sample_size = int(self.ggpo_conv_weight_sample_size)
+
+        # GoRA configuration — matches LycorisNetwork pattern
+        self._gora_needs_init = (
+            network_module == "gora"
+        )
+        if self._gora_needs_init:
+            self._gora_kwargs = {
+                k: kwargs[k] for k in (
+                    'gora_ref_rank', 'gora_min_rank', 'gora_max_rank',
+                    'gora_gamma', 'gora_importance_type', 'gora_softmax_importance',
+                    'gora_temperature', 'gora_scale_importance', 'gora_features_func',
+                    'gora_allocate_strategy', 'gora_adaptive_gamma', 'gora_weight_a_init',
+                    'gora_scale_by_lr', 'gora_lr',
+                ) if k in kwargs
+            }
+            self._gora_kwargs.setdefault('gora_ref_rank', lora_dim)
+            self._gora_kwargs['scaling_alpha'] = alpha
+        else:
+            self._gora_kwargs = {}
 
         # 初始化LoRA+相关属性
         self.loraplus_lr_ratio = None

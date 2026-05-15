@@ -137,12 +137,12 @@ celerybeat.pid
 
 # Environments
 .env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+.venv/**
+env/**
+venv/**
+ENV/**
+env.bak/**
+venv.bak/**
 
 # Spyder project settings
 .spyderproject
@@ -171,13 +171,8 @@ cython_debug/
 # PyCharm
 .idea/
 
-# UI template files
-*.ui
-
 runtime_store/
 auto_save_store/
 queue_store/
-logs/
-log/
 wd14_tagger_model
 wandb/

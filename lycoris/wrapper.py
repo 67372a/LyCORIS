@@ -5,7 +5,7 @@ import fnmatch
 import re
 import logging
 
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 
@@ -16,7 +16,7 @@ import math
 
 from .utils import precalculate_safetensors_hashes
 from .modules.abba import AbbaModule
-from .modules.locon import LoConModule
+from .modules.locon import LoConModule, GoRAModule
 from .modules.loha import LohaModule
 from .modules.ia3 import IA3Module
 from .modules.lokr import LokrModule
@@ -66,6 +66,7 @@ network_module_dict = {
     "abba": AbbaModule,
     "lora": LoConModule,
     "locon": LoConModule,
+    "gora": GoRAModule,
     "ia3": IA3Module,
     "loha": LohaModule,
     "lokr": LokrModule,
@@ -218,6 +219,29 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
     if full_matrix:
         logger.info("Full matrix mode for LoKr is enabled")
 
+    # GoRA parameters
+    gora_ref_rank = int(kwargs.get("gora_ref_rank", linear_dim) or linear_dim)
+    gora_min_rank = kwargs.get("gora_min_rank", None)
+    gora_max_rank = kwargs.get("gora_max_rank", None)
+    gora_gamma = float(kwargs.get("gora_gamma", 5e-2))
+    gora_importance_type = kwargs.get("gora_importance_type", "union_mean")
+    gora_softmax_importance = str_bool(kwargs.get("gora_softmax_importance", False))
+    gora_temperature = float(kwargs.get("gora_temperature", 0.5))
+    gora_scale_importance = str_bool(kwargs.get("gora_scale_importance", False))
+    gora_features_func = kwargs.get("gora_features_func", None)
+    gora_allocate_strategy = kwargs.get("gora_allocate_strategy", "moderate")
+    gora_adaptive_gamma = str_bool(kwargs.get("gora_adaptive_gamma", False))
+    gora_weight_a_init = kwargs.get("gora_weight_a_init", "kaiming")
+    gora_scale_by_lr = str_bool(kwargs.get("gora_scale_by_lr", False))
+    gora_lr = float(kwargs.get("gora_lr", 1e-3))
+
+    if algo == "gora":
+        logger.info("GoRA: Gradient-driven Adaptive Low Rank Adaptation enabled")
+        logger.info(f"  ref_rank={gora_ref_rank}, min_rank={gora_min_rank}, max_rank={gora_max_rank}")
+        logger.info(f"  gamma={gora_gamma}, importance_type={gora_importance_type}")
+        if gora_adaptive_gamma:
+            logger.info("  adaptive_gamma=True")
+
     preset = kwargs.get("preset", "full")
     if preset not in PRESET:
         preset = read_preset(preset)
@@ -292,6 +316,21 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
         include_patterns=include_patterns,
         network_reg_dims=network_reg_dims,
         network_reg_lrs=network_reg_lrs,
+        # GoRA parameters
+        gora_ref_rank=gora_ref_rank,
+        gora_min_rank=gora_min_rank,
+        gora_max_rank=gora_max_rank,
+        gora_gamma=gora_gamma,
+        gora_importance_type=gora_importance_type,
+        gora_softmax_importance=gora_softmax_importance,
+        gora_temperature=gora_temperature,
+        gora_scale_importance=gora_scale_importance,
+        gora_features_func=gora_features_func,
+        gora_allocate_strategy=gora_allocate_strategy,
+        gora_adaptive_gamma=gora_adaptive_gamma,
+        gora_weight_a_init=gora_weight_a_init,
+        gora_scale_by_lr=gora_scale_by_lr,
+        gora_lr=gora_lr,
     )
 
     if torch_compile:
@@ -451,6 +490,26 @@ class LycorisNetwork(torch.nn.Module):
 
         if self.ggpo_conv_weight_sample_size is not None:
             self.ggpo_conv_weight_sample_size = int(self.ggpo_conv_weight_sample_size)
+
+        # GoRA configuration (extracted from root_kwargs for prepare_gora)
+        self._gora_needs_init = (
+            network_module == "gora" and not init_only
+        )
+        if self._gora_needs_init:
+            self._gora_kwargs = {
+                k: kwargs[k] for k in (
+                    'gora_ref_rank', 'gora_min_rank', 'gora_max_rank',
+                    'gora_gamma', 'gora_importance_type', 'gora_softmax_importance',
+                    'gora_temperature', 'gora_scale_importance', 'gora_features_func',
+                    'gora_allocate_strategy', 'gora_adaptive_gamma', 'gora_weight_a_init',
+                    'gora_scale_by_lr', 'gora_lr',
+                ) if k in kwargs
+            }
+            # Store ref_rank/lora_dim for prepare_gora defaults
+            self._gora_kwargs.setdefault('gora_ref_rank', lora_dim)
+            self._gora_kwargs['scaling_alpha'] = alpha
+        else:
+            self._gora_kwargs = {}
 
         if init_only:
             self.multiplier = 1
@@ -1079,6 +1138,116 @@ class LycorisNetwork(torch.nn.Module):
             save_file(state_dict, file, metadata)
         else:
             torch.save(state_dict, file)
+
+    # ------------------------------------------------------------------
+    # GoRA: precompute gradients + initialize (new training only)
+    # ------------------------------------------------------------------
+
+    def prepare_gora(
+        self,
+        dataloader,
+        forward_fn: Callable,
+        max_steps: Optional[int] = 64,
+        adaptive_n: bool = True,
+        convergence_threshold: float = 0.01,
+        min_steps: int = 3,
+        adaptive_gamma: Optional[bool] = None,
+        gamma_init: float = 1.0,
+        gamma_decay: float = 0.8,
+        gamma_min: float = 1e-5,
+        world_size: int = 1,
+        global_rank: int = 0,
+        device: Optional[torch.device] = None,
+        save_dir: Optional[str] = None,
+    ):
+        """Run GoRA pre-computation phase for new (non-resumed) GoRA networks.
+
+        This method:
+          - Finds all GoRAModule instances in the network
+          - Accumulates gradients over *max_steps* batches (with optional
+            adaptive early stopping)
+          - Computes layer importance and allocates ranks
+          - Initializes low-rank weights via gradient compression
+          - Optionally auto-tunes γ on the first batch
+
+        For **state resumption** (loading a saved LoRA checkpoint), this
+        method is a no-op because saved GoRA modules are loaded as standard
+        LoConModules (no GoRA-specific initialization needed).
+
+        Call this ONCE after ``apply_to()`` and before the training loop::
+
+            network = create_lycoris(model, algo="gora", ...)
+            network.apply_to()
+            network.prepare_gora(train_dataloader, forward_fn)
+
+        Args:
+            dataloader: Iterable yielding training batches.
+            forward_fn: Callable ``(batch) -> loss`` (or ``(batch) -> (loss, ...)``).
+            max_steps: Maximum gradient accumulation steps.
+            adaptive_n: Enable adaptive N (early stop on convergence).
+            convergence_threshold: Relative change threshold for adaptive N.
+            min_steps: Minimum steps before checking convergence.
+            adaptive_gamma: Enable adaptive γ. If None, uses the value from
+                the first GoRAModule's config.
+            gamma_init, gamma_decay, gamma_min: Grid-search params for γ.
+            world_size, global_rank: Distributed training info.
+            device: Compute device (auto-detected if None).
+            save_dir: If set, writes rank.json and importance.json here.
+        """
+        if not self._gora_needs_init:
+            logger.debug("GoRA: prepare_gora skipped (not a new GoRA network or init_only).")
+            return
+
+        from .modules.locon import GoRAModule
+
+        # Scan self.loras directly (modules aren't yet added via apply_to)
+        gora_modules = [lora for lora in self.loras if isinstance(lora, GoRAModule)]
+        if not gora_modules:
+            logger.warning("GoRA: No GoRAModule instances found. Skipping prepare_gora.")
+            self._gora_needs_init = False
+            return
+
+        # Merge stored kwargs with call-time overrides
+        gk = self._gora_kwargs
+        if adaptive_gamma is None:
+            adaptive_gamma = gk.get('gora_adaptive_gamma', False)
+
+        from .modules.gora_utils import gora_precompute_gradients
+        named_ranks = gora_precompute_gradients(
+            modules=gora_modules,
+            dataloader=dataloader,
+            forward_fn=forward_fn,
+            ref_rank=gk.get('gora_ref_rank', 8),
+            min_rank=gk.get('gora_min_rank') or 1,
+            max_rank=gk.get('gora_max_rank') or 32,
+            importance_type=gk.get('gora_importance_type', 'union_mean'),
+            scaling_alpha=gk.get('scaling_alpha', 1.0),
+            stable_gamma=gk.get('gora_gamma', 0.05),
+            max_steps=max_steps,
+            adaptive_n=adaptive_n,
+            convergence_threshold=convergence_threshold,
+            min_steps=min_steps,
+            adaptive_gamma=adaptive_gamma,
+            gamma_init=gamma_init,
+            gamma_decay=gamma_decay,
+            gamma_min=gamma_min,
+            softmax_importance=gk.get('gora_softmax_importance', False),
+            temperature=gk.get('gora_temperature', 0.5),
+            scale_importance=gk.get('gora_scale_importance', False),
+            features_func=gk.get('gora_features_func'),
+            allocate_strategy=gk.get('gora_allocate_strategy', 'moderate'),
+            weight_a_init_method=gk.get('gora_weight_a_init', 'kaiming'),
+            scale_by_lr=gk.get('gora_scale_by_lr', False),
+            lr=gk.get('gora_lr', 1e-3),
+            world_size=world_size,
+            global_rank=global_rank,
+            device=device,
+            save_dir=save_dir,
+        )
+
+        # Mark done so repeated calls are safe
+        self._gora_needs_init = False
+        logger.info(f"GoRA: prepare_gora complete. {len(named_ranks)} modules initialized.")
 
     @torch.no_grad()
     def update_norms(self):

@@ -10,7 +10,7 @@ from .pissa_utils import pissa_svd, convert_pissa_to_lora
 from ..functional.general import rebuild_tucker
 from ..logging import logger
 
-from typing import Optional
+from typing import Optional, Callable, Dict
 
 @cache
 def log_wd():
@@ -1186,3 +1186,316 @@ class LoConModule(LycorisBaseModule):
             return self.op(x, perturbation, None, **self.kw_dict)
         else:
             return None
+
+
+class GoRAModule(LoConModule):
+    """GoRA: Gradient-driven Adaptive Low Rank Adaptation.
+
+    Extends LoConModule with gradient-based rank allocation and initialization.
+    The saved checkpoint is identical to a standard LoConModule — only initialization
+    and training-time dynamics differ.
+
+    Key properties:
+      - Always uses rsLoRA scaling (α / √r) for forward computation.
+      - Accumulates pre-trained weight gradients on CPU via backward hooks.
+      - Before training, computes layer importance from accumulated gradients
+        and allocates ranks adaptively.
+      - Initializes B (lora_up) as the pseudo-inverse compressed gradient:
+        B₀ = G @ A₀ᵀ @ (A₀ @ A₀ᵀ)⁻¹
+
+    Reference: https://arxiv.org/abs/2502.12171
+
+    Args:
+        gora_ref_rank: Reference rank r^ref for parameter budget calculation.
+        gora_min_rank: Minimum allowed rank per adapter (None = no min).
+        gora_max_rank: Maximum allowed rank per adapter (None = no max).
+        gora_gamma: Scaling factor γ for initialization magnitude.
+        gora_importance_type: Importance metric (default: "union_mean" = avg(|W⊙G|)).
+        gora_softmax_importance: Use softmax for importance normalization.
+        gora_temperature: Temperature for softmax normalization.
+        gora_scale_importance: Apply sqrt to raw importance scores.
+        gora_features_func: Feature adjustment ("sqrt", "log1p", or None).
+        gora_allocate_strategy: Rounding — "radical", "moderate", "conserved".
+        gora_adaptive_gamma: Auto-tune γ on first batch.
+        gora_weight_a_init: How to initialize A₀ ("kaiming", "weight_svd", "grad_svd").
+        gora_scale_by_lr: Use learning rate in the scaling formula.
+        gora_lr: Learning rate for lr-based scaling.
+    """
+
+    name = "gora"
+    support_module = {"linear", "conv1d", "conv2d", "conv3d"}
+    weight_list = [
+        "lora_up.weight",
+        "lora_down.weight",
+        "lora_mid.weight",
+        "alpha",
+        "dora_scale",
+        "pissa_A_init",
+        "pissa_B_init",
+        "pissa_converted",
+    ]
+    weight_list_det = ["lora_up.weight"]
+
+    # Registry of all GoRAModule instances for cross-module rank allocation.
+    _gora_modules: list = []
+
+    def __init__(
+        self,
+        lora_name,
+        org_module: nn.Module,
+        multiplier=1.0,
+        lora_dim=4,
+        alpha=1,
+        dropout=0.0,
+        rank_dropout=0.0,
+        module_dropout=0.0,
+        use_tucker=False,
+        use_scalar=False,
+        scalar_init_value=None,
+        rank_dropout_scale=False,
+        weight_decompose=False,
+        wd_on_output=True,
+        bypass_mode=None,
+        rs_lora=None,                    # GoRA always forces rs_lora
+        ggpo_beta: Optional[float] = None,
+        ggpo_sigma: Optional[float] = None,
+        ggpo_conv: bool = False,
+        ggpo_conv_weight_sample_size: int = 100,
+        orthogonalize=False,
+        orthogonal_init=False,
+        pissa_niter: int = 0,
+        pissa_convert: bool = True,
+        olora: bool = False,
+        olora_lambda: float = 0.5,
+        olora_task_id: int = 0,
+        # --- GoRA-specific parameters ---
+        gora_ref_rank: Optional[int] = None,
+        gora_min_rank: Optional[int] = None,
+        gora_max_rank: Optional[int] = None,
+        gora_gamma: float = 5e-2,
+        gora_importance_type: str = "union_mean",
+        gora_softmax_importance: bool = False,
+        gora_temperature: float = 0.5,
+        gora_scale_importance: bool = False,
+        gora_features_func: Optional[str] = None,
+        gora_allocate_strategy: str = "moderate",
+        gora_adaptive_gamma: bool = False,
+        gora_weight_a_init: str = "kaiming",
+        gora_scale_by_lr: bool = False,
+        gora_lr: float = 1e-3,
+        **kwargs,
+    ):
+        self.scaling_alpha = alpha  # Save before super().__init__ modifies it
+
+        # GoRA always uses rsLoRA scaling (α / √r) as per the paper
+        # (Section 3.3, Eq. 10)
+        rs_lora = True
+
+        super().__init__(
+            lora_name=lora_name,
+            org_module=org_module,
+            multiplier=multiplier,
+            lora_dim=lora_dim,
+            alpha=alpha,
+            dropout=dropout,
+            rank_dropout=rank_dropout,
+            module_dropout=module_dropout,
+            use_tucker=use_tucker,
+            use_scalar=use_scalar,
+            scalar_init_value=scalar_init_value,
+            rank_dropout_scale=rank_dropout_scale,
+            weight_decompose=weight_decompose,
+            wd_on_output=wd_on_output,
+            bypass_mode=bypass_mode,
+            rs_lora=True,
+            ggpo_beta=ggpo_beta,
+            ggpo_sigma=ggpo_sigma,
+            ggpo_conv=ggpo_conv,
+            ggpo_conv_weight_sample_size=ggpo_conv_weight_sample_size,
+            orthogonalize=orthogonalize,
+            orthogonal_init=orthogonal_init,
+            pissa_niter=pissa_niter,
+            pissa_convert=pissa_convert,
+            olora=olora,
+            olora_lambda=olora_lambda,
+            olora_task_id=olora_task_id,
+            **kwargs,
+        )
+
+        # Store GoRA configuration
+        self.gora_ref_rank = gora_ref_rank if gora_ref_rank is not None else lora_dim
+        self.gora_min_rank = gora_min_rank
+        self.gora_max_rank = gora_max_rank
+        self.gora_gamma = gora_gamma
+        self.gora_importance_type = gora_importance_type
+        self.gora_softmax_importance = gora_softmax_importance
+        self.gora_temperature = gora_temperature
+        self.gora_scale_importance = gora_scale_importance
+        self.gora_features_func = gora_features_func
+        self.gora_allocate_strategy = gora_allocate_strategy
+        self.gora_adaptive_gamma = gora_adaptive_gamma
+        self.gora_weight_a_init = gora_weight_a_init
+        self.gora_scale_by_lr = gora_scale_by_lr
+        self.gora_lr = gora_lr
+
+        # Reconstruction error metrics (set during gora_dynamic_init)
+        self._gora_recon_error: float = 0.0
+        self._gora_relative_error: float = 0.0
+
+        # Register in global GoRA module list
+        GoRAModule._gora_modules.append(self)
+
+    @property
+    def in_features(self) -> int:
+        """Input feature dimension of the weight matrix."""
+        return self.shape[1]
+
+    @property
+    def out_features(self) -> int:
+        """Output feature dimension of the weight matrix."""
+        return self.shape[0]
+
+    # ------------------------------------------------------------------
+    # Custom state_dict — identical to LoConModule
+    # ------------------------------------------------------------------
+    def custom_state_dict(self):
+        """GoRA saved checkpoint is identical to standard LoCon.
+
+        GoRA-specific parameters (gamma, min_rank, etc.) are training-time only
+        and do not need to be serialized. The adapter weights (lora_up, lora_down)
+        are all that is needed at inference time.
+        """
+        # Delegate to parent — GoRA is just LoRA at inference time
+        return super().custom_state_dict()
+
+    # ------------------------------------------------------------------
+    # Class-level utility: get all registered GoRA modules
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def get_gora_modules(cls, model: Optional[nn.Module] = None) -> list:
+        """Get all GoRAModule instances.
+        
+        If model is provided, filters to modules within that model.
+        """
+        if model is not None:
+            return [
+                m for m in cls._gora_modules
+                if any(m is mod for mod in model.modules())
+            ]
+        return list(cls._gora_modules)
+
+    @classmethod
+    def reset_gora_registry(cls):
+        """Clear the GoRA module registry (e.g., before starting a fresh run)."""
+        cls._gora_modules.clear()
+
+    # ------------------------------------------------------------------
+    # Convenience: one-shot precompute + init from class level
+    # ------------------------------------------------------------------
+
+    @classmethod
+    @torch.no_grad()
+    def precompute_and_init(
+        cls,
+        model: nn.Module,
+        dataloader,
+        forward_fn: Callable,
+        ref_rank: Optional[int] = None,
+        min_rank: Optional[int] = None,
+        max_rank: Optional[int] = None,
+        importance_type: Optional[str] = None,
+        scaling_alpha: Optional[float] = None,
+        stable_gamma: Optional[float] = None,
+        max_steps: int = 64,
+        adaptive_n: bool = True,
+        convergence_threshold: float = 0.01,
+        min_steps: int = 3,
+        adaptive_gamma: bool = False,
+        gamma_init: float = 1.0,
+        gamma_decay: float = 0.8,
+        gamma_min: float = 1e-5,
+        world_size: int = 1,
+        global_rank: int = 0,
+        device: Optional[torch.device] = None,
+        save_dir: Optional[str] = None,
+        **kwargs,
+    ) -> Dict[str, int]:
+        """Class-level entry point for GoRA pre-computation.
+
+        Finds all GoRAModule instances in *model*, reads their individual
+        config, and delegates to :func:`gora_utils.gora_precompute_gradients`.
+
+        Args:
+            model: The model containing GoRAModule instances.
+            dataloader: Training dataloader.
+            forward_fn: Forward function (model, batch) -> loss.
+            ref_rank: Override reference rank (uses module config if None).
+            min_rank: Override min rank.
+            max_rank: Override max rank.
+            importance_type: Override importance metric.
+            scaling_alpha: Override α.
+            stable_gamma: Override γ.
+            max_steps: Max gradient accumulation steps.
+            adaptive_n: Enable adaptive N.
+            convergence_threshold: Threshold for adaptive N.
+            min_steps: Min steps before convergence check.
+            adaptive_gamma: Enable adaptive γ.
+            gamma_init, gamma_decay, gamma_min: γ search params.
+            world_size, global_rank: Distributed info.
+            device: Compute device.
+            save_dir: Directory to save rank.json/importance.json.
+
+        Returns:
+            {lora_name: allocated_rank} dict.
+        """
+        from .gora_utils import gora_precompute_gradients
+
+        modules = cls.get_gora_modules(model)
+        if not modules:
+            raise RuntimeError(
+                "GoRA: No GoRAModule instances found in model. "
+                "Make sure to create the LyCORIS network with algo='gora'."
+            )
+
+        # Use first module's config as defaults, allow overrides
+        first = modules[0]
+        ref_rank = ref_rank if ref_rank is not None else first.gora_ref_rank
+        min_rank = min_rank if min_rank is not None else (first.gora_min_rank or 1)
+        max_rank = max_rank if max_rank is not None else (first.gora_max_rank or 32)
+        importance_type = importance_type if importance_type is not None else first.gora_importance_type
+        scaling_alpha = scaling_alpha if scaling_alpha is not None else first.scaling_alpha
+        stable_gamma = stable_gamma if stable_gamma is not None else first.gora_gamma
+        adaptive_gamma = adaptive_gamma or first.gora_adaptive_gamma
+
+        return gora_precompute_gradients(
+            modules=modules,
+            dataloader=dataloader,
+            forward_fn=forward_fn,
+            ref_rank=ref_rank,
+            min_rank=min_rank,
+            max_rank=max_rank,
+            importance_type=importance_type,
+            scaling_alpha=scaling_alpha,
+            stable_gamma=stable_gamma,
+            max_steps=max_steps,
+            adaptive_n=adaptive_n,
+            convergence_threshold=convergence_threshold,
+            min_steps=min_steps,
+            adaptive_gamma=adaptive_gamma,
+            gamma_init=gamma_init,
+            gamma_decay=gamma_decay,
+            gamma_min=gamma_min,
+            softmax_importance=first.gora_softmax_importance,
+            temperature=first.gora_temperature,
+            scale_importance=first.gora_scale_importance,
+            features_func=first.gora_features_func,
+            allocate_strategy=first.gora_allocate_strategy,
+            weight_a_init_method=first.gora_weight_a_init,
+            scale_by_lr=first.gora_scale_by_lr,
+            lr=first.gora_lr,
+            world_size=world_size,
+            global_rank=global_rank,
+            device=device,
+            save_dir=save_dir,
+        )
