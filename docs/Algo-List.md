@@ -112,6 +112,25 @@ However, newer methods may only be available in the latest release / the dev bra
 * Residual subtraction ensures zero-shot preservation (LoRA contributes nothing at initialization).
 * Ref: [T-LoRA: Timestep-aware LoRA for Diffusion Models](https://github.com/rosinality/T-LoRA)
 
+### GoRA
+
+* Triggered by `algo=gora`
+* **GoRA: Gradient-driven Adaptive Low Rank Adaptation** — simultaneously adapts both the rank and initialization within a unified framework.
+* Uses gradient information from a brief precomputation phase to:
+  - **Allocate ranks adaptively** per layer based on importance $I(W) = \text{avg}(|W \odot G|)$
+  - **Initialize B₀** (lora_down) via left pseudo-inverse: $B_0 = -(A_0^{\top}A_0)^{-1}A_0^{\top}G$ (Eq. 9)
+* Always uses rsLoRA scaling ($\alpha / \sqrt{r}$).
+* Does **NOT** manipulate pre-trained weights — checkpoint is identical to standard LoRA after initialization.
+* The saved checkpoint is fully compatible with LoRA/LoCon (no special loading required after training).
+* Recommended settings:
+  * ref_rank: 8 (reference rank for parameter budget)
+  * alpha: 16 (scaling factor)
+  * gora_gamma: 0.05-0.08 (initialization magnitude)
+  * gora_min_rank: 4, gora_max_rank: 32
+  * gora_importance_type: "union_mean" (avg(|W⊙G|), paper default)
+* Requires a precomputation phase via `LycorisNetwork.prepare_gora()` before training.
+* Ref: [GoRA: Gradient-driven Adaptive Low Rank Adaptation](https://arxiv.org/abs/2502.12171) (2025)
+
 ### RaLoRA / RaLoRA-Pro
 
 * Triggered by `algo=ralora`

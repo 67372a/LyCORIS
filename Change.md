@@ -1,5 +1,70 @@
 # Change Log
 
+## 2026/05/16 (dev branch)
+
+#### New Features
+
+* **RaLoRA / RaLoRA-Pro**: Rank-Aligned LoRA with [Gradient Intrinsic Dimensionality Alignment](https://openreview.net/forum?id=kObvnQ6pUx) (ICLR 2026). Adaptively aligns LoRA adapter capacity with per-layer gradient intrinsic dimensionality using block-diagonal decomposition. RaLoRA-Pro adds inter-layer rank reallocation guided by loss sensitivity. Triggered by `algo=ralora`.
+  * See [docs/Algo-List.md](docs/Algo-List.md) and [docs/Algo-Details.md](docs/Algo-Details.md) for details.
+  * Requires a precomputation phase via `RaLoRAModule.precompute_and_init()` before training.
+
+#### Bug fixes
+
+* Fix orthogonal weights test
+
+## 2026/05/15 (dev branch)
+
+#### New Features
+
+* **GoRA: Gradient-driven Adaptive Low Rank Adaptation**: Adaptively allocates ranks and initializes LoRA weights using gradient information from a brief precomputation phase. The saved checkpoint is identical to standard LoRA/LoCon. Triggered by `algo=gora`.
+  * See [docs/Algo-List.md](docs/Algo-List.md) and [docs/Algo-Details.md](docs/Algo-Details.md) for details.
+  * Requires a precomputation phase via `LycorisNetwork.prepare_gora()` before training.
+  * Ref: [GoRA: Gradient-driven Adaptive Low Rank Adaptation](https://arxiv.org/abs/2502.12171)
+* **O-LoRA: Orthogonal Low-Rank Adaptation**: Multi-task LoRA with orthogonality loss between task subspaces. Supports adding tasks dynamically and merging frozen tasks into base weights. Triggered via `olora=True` on LoCon modules.
+
+#### Improvements
+
+* Better logging for GoRA modules
+* GoRA config enforcement (alpha = dim, rsLoRA always on)
+* Proper recommended defaults for GoRA hyperparameters
+
+#### Bug fixes
+
+* Fix GoRA `org_weight_gpu` reference in forward pass
+* Fix logging for non-keyword argument cases
+* `use_scalar` enforced only with `use_orthogonal_weights`
+
+## 2026/05/14 (dev branch)
+
+#### New Features
+
+* **PiSSA for LoCon**: Principal Singular Values and Singular Vectors Adaptation initialization. Uses SVD of pre-trained weights to initialize LoRA adapters. Supports fast randomized SVD and conversion to portable LoRA format on save.
+* **SVD Segment Initialization**: Flexible SVD-based init supporting "top", "last", or "middle" singular vector segments for LoCon modules.
+* **Orthogonal init/weights split**: `use_orthogonal_init` separated from `use_orthogonal_weights`, allowing orthogonal initialization without runtime orthogonalization overhead.
+
+#### Improvements
+
+* Adjust scalar default value from 1.0 to 0.1
+* Migrate build system to pyproject.toml and uv
+* Align regularization dims and learning rates
+
+## 2026/03/15-18 (3.2.0 series)
+
+#### New Features
+
+* Support for module-level dimension and learning rate assignment
+* LoRA-plus learning rate scaling for T-LoRA
+
+#### Improvements
+
+* Default `conv_lora_dim` to zero
+* Rename presets for clarity
+
+#### Bug fixes
+
+* Revert incompatible lora-plus on T-LoRA p_layer
+
+
 ## 2025/04/23 update to 3.2.0
 
 #### New Features

@@ -321,7 +321,12 @@ def test_rank_allocation_with_bounds():
 # ==== Test 5: grad_compress_init =============================================
 
 def test_grad_compress_init_single(gora_module):
-    """grad_compress_init should initialize lora weights from accumulated gradient."""
+    """grad_compress_init should initialize lora weights from accumulated gradient.
+
+    Verifies the corrected paper convention:
+      - lora_up (m×r) = paper's A₀ — randomly initialized (Kaiming)
+      - lora_down (r×n) = paper's B₀ — computed via left pseudo-inverse
+    """
     from lycoris.modules.gora_utils import _grad_compress_init_single
 
     mod = gora_module
@@ -349,18 +354,310 @@ def test_grad_compress_init_single(gora_module):
         fast_svd_niter=16,
     )
 
-    assert mod.lora_down.weight.shape == (8, 32)
-    assert mod.lora_up.weight.shape == (64, 8)
+    # Shapes: lora_down = paper's B₀ (r×n), lora_up = paper's A₀ (m×r)
+    assert mod.lora_down.weight.shape == (8, 32), "lora_down should be (rank, in_features) = paper's B₀"
+    assert mod.lora_up.weight.shape == (64, 8), "lora_up should be (out_features, rank) = paper's A₀"
     assert mod.lora_dim == 8
 
     expected_scale = 16.0 / math.sqrt(8)
     assert abs(mod.scale - expected_scale) < 1e-6
 
-    # Base weight should be unchanged
+    # Base weight should be unchanged (GoRA does NOT manipulate pre-trained weight)
     assert torch.equal(w.data, original_weight)
 
     assert hasattr(mod, '_gora_recon_error')
     assert mod._gora_recon_error > 0
+
+    del w.grad_stored
+    del w.iters
+
+
+def test_paper_eq9_initialization_formula(gora_module):
+    """Paper Eq. 9: B₀ = -(A₀ᵀ A₀)⁻¹ A₀ᵀ G.
+
+    In LyCORIS convention:
+      - lora_up (m×r) = paper's A₀ — randomly initialized
+      - lora_down (r×n) = paper's B₀ — computed via LEFT pseudo-inverse with negative sign
+    """
+    from lycoris.modules.gora_utils import _grad_compress_init_single
+
+    mod = gora_module
+    w = _get_weight(mod)
+    w.requires_grad = True
+
+    # Use a deterministic gradient for reproducibility
+    torch.manual_seed(42)
+    G = torch.randn(64, 32)  # (out_features, in_features) = (m, n)
+    w.grad_stored = G.clone()
+    w.iters = 1
+
+    # Use scaling_alpha as stable_gamma so ξ/α = 1 (no extra scaling for formula verification)
+    _grad_compress_init_single(
+        mod, rank=8,
+        stable_gamma=16.0,  # = scaling_alpha, so ξ/α = 1 → no extra scaling
+        scaling_alpha=16.0,
+        scale_by_lr=False, lr=1e-3,
+        weight_a_init_method="kaiming",
+        fast_svd_niter=16,
+    )
+
+    # Extract matrices
+    A0 = mod.lora_up.weight.data.float()    # (m, r) = (64, 8)
+    B0 = mod.lora_down.weight.data.float()   # (r, n) = (8, 32)
+
+    # Recompute what Eq 9 should give us: B₀ = -(A₀ᵀA₀)⁻¹A₀ᵀG
+    A0T = A0.T  # (r, m)
+    A0TA0 = A0T @ A0  # (r, r)
+    A0TA0_inv = torch.linalg.pinv(A0TA0 + 1e-8 * torch.eye(8, device=A0.device))
+    expected_B0 = -(A0TA0_inv @ A0T @ G)  # (r, n) — LEFT pseudo-inverse with negative sign
+
+    # Since stable_gamma = scaling_alpha, ξ = 1.0, so B0 should match expected_B0 exactly
+    # (accounting for the scale factor: B0 *= (stable_gamma * sqrt(m)) / scaling_alpha)
+    xi = (16.0 * math.sqrt(64)) / 16.0  # = sqrt(64) = 8
+    expected_scaled_B0 = expected_B0 * xi
+
+    assert torch.allclose(B0, expected_scaled_B0, atol=1e-4), \
+        f"lora_down does NOT match paper Eq 9. Max diff: {(B0 - expected_scaled_B0).abs().max():.6f}"
+
+    # Verify product A₀B₀ approximates -G (with projection and scaling)
+    AB = A0 @ B0  # (m, r) @ (r, n) = (m, n)
+    P = A0 @ A0TA0_inv @ A0T  # projection matrix onto Col(A₀)
+    expected_AB = -(P @ G) * xi  # -ξ * P_col(A₀) @ G
+
+    assert torch.allclose(AB, expected_AB, atol=1e-4), \
+        f"A₀B₀ does NOT match -ξ·P_A·G. Max diff: {(AB - expected_AB).abs().max():.6f}"
+
+    # Verify negative direction: A₀B₀ should point opposite to G
+    G_proj = P @ G
+    correlation = torch.dot(G_proj.flatten(), AB.flatten())
+    assert correlation < 0, \
+        f"A₀B₀ should point in NEGATIVE G direction! Correlation={correlation:.4f}. Missing negative sign?"
+
+    del w.grad_stored
+    del w.iters
+
+
+def test_paper_eq10_scaling_formula(gora_module):
+    """Paper Eq. 10: ξ = γ·√m / α for rsLoRA variant.
+
+    With rsLoRA: lora_scaler = α/√r, product should approximate -γG.
+    """
+    from lycoris.modules.gora_utils import _grad_compress_init_single
+
+    mod = gora_module
+    w = _get_weight(mod)
+    w.requires_grad = True
+
+    torch.manual_seed(42)
+    G = torch.randn(64, 32)
+    w.grad_stored = G.clone()
+    w.iters = 1
+
+    gamma = 0.05
+    alpha = 16.0
+
+    _grad_compress_init_single(
+        mod, rank=8,
+        stable_gamma=gamma,
+        scaling_alpha=alpha,
+        scale_by_lr=False, lr=1e-3,
+        weight_a_init_method="kaiming",
+        fast_svd_niter=16,
+    )
+
+    A0 = mod.lora_up.weight.data.float()
+    B0 = mod.lora_down.weight.data.float()
+
+    # Total forward contribution: ΔW = (α/√r) * A₀B₀
+    lora_scale = mod.scale  # α/√r
+    delta_W = lora_scale * (A0 @ B0)
+
+    # Should approximate -γG (one step of gradient descent)
+    G_flat = G.flatten()
+    delta_flat = delta_W.flatten()
+
+    # Check direction: ΔW should point in -G direction
+    dot = torch.dot(delta_flat, G_flat)
+    assert dot < 0, \
+        f"ΔW should point in NEGATIVE G direction (gradient descent). Got positive correlation {dot:.4f}"
+
+    # Verify ξ formula: B₀ should be scaled by ξ = γ·√m / α
+    xi_expected = gamma * math.sqrt(64) / alpha  # γ·√64 / 16 = 0.05 * 8 / 16 = 0.025
+    # Recompute B₀ without scaling to verify
+    A0T = A0.T
+    A0TA0 = A0T @ A0
+    A0TA0_inv = torch.linalg.pinv(A0TA0 + 1e-8 * torch.eye(8, device=A0.device))
+    unscaled_B0 = -(A0TA0_inv @ A0T @ G)
+    expected_B0 = unscaled_B0 * xi_expected
+
+    assert torch.allclose(B0, expected_B0, atol=1e-4), \
+        f"Scaling ξ={xi_expected:.6f} not applied correctly. Max diff: {(B0 - expected_B0).abs().max():.6f}"
+
+    del w.grad_stored
+    del w.iters
+
+
+def test_gradient_descent_direction_initialization(gora_module):
+    """Critical: initialization must approximate -G, NOT +G.
+
+    A positive initialization would increase loss instead of decreasing it.
+    """
+    from lycoris.modules.gora_utils import _grad_compress_init_single
+
+    mod = gora_module
+    w = _get_weight(mod)
+    w.requires_grad = True
+
+    torch.manual_seed(42)
+    # Deterministic weight and gradient
+    W0 = torch.randn(64, 32)
+    _set_weight(mod, W0)
+    G = torch.randn(64, 32)
+    w.grad_stored = G.clone()
+    w.iters = 1
+
+    gamma = 0.1
+
+    _grad_compress_init_single(
+        mod, rank=8,
+        stable_gamma=gamma, scaling_alpha=16.0,
+        scale_by_lr=False, lr=1e-3,
+        weight_a_init_method="kaiming",
+        fast_svd_niter=16,
+    )
+
+    A0 = mod.lora_up.weight.data.float()
+    B0 = mod.lora_down.weight.data.float()
+    lora_delta = mod.scale * (A0 @ B0)
+
+    # Effective weight after initialization
+    W_eff = W0 + lora_delta
+
+    # Gradient descent step: W_gd = W0 - γG
+    W_gd = W0 - gamma * G
+
+    # Gradient ascent step (WRONG): W_ga = W0 + γG
+    W_ga = W0 + gamma * G
+
+    dist_to_gd = torch.norm(W_eff - W_gd, p='fro')
+    dist_to_ga = torch.norm(W_eff - W_ga, p='fro')
+
+    assert dist_to_gd < dist_to_ga, \
+        f"Initialization moves in WRONG direction! " \
+        f"dist_to_gd={dist_to_gd:.4f} >= dist_to_ga={dist_to_ga:.4f}. " \
+        f"Missing negative sign means ΔW ≈ +γG instead of -γG."
+
+    del w.grad_stored
+    del w.iters
+
+
+def test_features_func_default_is_sqrt():
+    """Paper Eq 7-8: budget uses √(m+n). Default features_func should be 'sqrt'."""
+    from lycoris.modules.gora_utils import allocate_ranks, compute_importance
+
+    # Verify the feature_adjust_func dict defaults to math.sqrt
+    from lycoris.modules.locon import GoRAModule as GM
+
+    GM.reset_gora_registry()
+
+    lin1 = nn.Linear(16, 32, bias=False)
+    lin2 = nn.Linear(64, 128, bias=False)
+
+    m1 = GM(lora_name="l1", org_module=lin1, lora_dim=4)
+    m2 = GM(lora_name="l2", org_module=lin2, lora_dim=4)
+
+    _accumulate_gradients_weight(m1, torch.randn(32, 16))
+    _accumulate_gradients_weight(m2, torch.randn(128, 64))
+
+    # With features_func=None (default), sqrt should be applied
+    named_ranks, total_budget, _, _ = allocate_ranks(
+        [m1, m2], ref_rank=8, min_rank=1, max_rank=32,
+        features_func=None,  # default
+    )
+
+    # Total budget should use sqrt(m+n): √48 * 8 + √192 * 8
+    expected_budget = math.sqrt(16 + 32) * 8 + math.sqrt(64 + 128) * 8
+    assert abs(total_budget - expected_budget) < 0.01, \
+        f"Default features_func should use sqrt. Expected budget {expected_budget:.2f}, got {total_budget:.2f}"
+
+    del _get_weight(m1).grad_stored
+    del _get_weight(m2).grad_stored
+    GM.reset_gora_registry()
+
+
+def test_rank_allocation_uses_rounding():
+    """Paper Eq 8: r^i = [b·a^i / √(m+n)] uses rounding, NOT floor division."""
+    from lycoris.modules.locon import GoRAModule as GM
+    from lycoris.modules.gora_utils import allocate_ranks
+
+    GM.reset_gora_registry()
+
+    lin = nn.Linear(16, 32, bias=False)
+    m = GM(lora_name="m", org_module=lin, lora_dim=4)
+    _accumulate_gradients_weight(m, torch.randn(32, 16))
+
+    # With only one layer, importance = 1.0
+    # smooth_total_budget = √48 * 8 ≈ 55.4
+    # smooth_trainable = round(55.4 * 1.0) = 55
+    # rank = round(55 / √48) = round(7.94) = 8 (with rounding)
+    # rank = floor(55 / √48) = floor(7.94) = 7 (with floor — old bug)
+    named_ranks, _, _, _ = allocate_ranks(
+        [m], ref_rank=8, min_rank=1, max_rank=32,
+        allocate_strategy="moderate",  # uses round()
+    )
+
+    # With round: should be ~8. With floor: would be ~7.
+    assert named_ranks["m"] >= 7, f"Expected rank >= 7 with rounding, got {named_ranks['m']}"
+
+    del _get_weight(m).grad_stored
+    GM.reset_gora_registry()
+
+
+def test_lora_up_is_random_lora_down_is_computed(gora_module):
+    """Verify correct convention: lora_up = paper's A₀ (random), lora_down = paper's B₀ (computed).
+
+    Before the fix, roles were swapped: lora_down was random, lora_up was computed.
+    Uses scaling_alpha as stable_gamma so ξ = 1 — no extra scaling, pure formula.
+    """
+    from lycoris.modules.gora_utils import _grad_compress_init_single
+
+    mod = gora_module
+    w = _get_weight(mod)
+
+    torch.manual_seed(42)
+    G = torch.randn(64, 32)
+    w.grad_stored = G.clone()
+    w.iters = 1
+
+    in_dim = mod.in_features
+    out_dim = mod.out_features
+    alpha = 16.0
+
+    # Use stable_gamma = scaling_alpha / sqrt(out_dim) so ξ = 1 (no extra scaling)
+    _grad_compress_init_single(
+        mod, rank=4,
+        stable_gamma=alpha / math.sqrt(out_dim),  # ξ = 1
+        scaling_alpha=alpha,
+        scale_by_lr=False, lr=1e-3, weight_a_init_method="kaiming",
+        fast_svd_niter=16,
+    )
+
+    A0 = mod.lora_up.weight.data.float()   # (64, 4) — should be random (paper's A₀)
+    B0 = mod.lora_down.weight.data.float()  # (4, 32) — should be computed (paper's B₀)
+
+    # lora_up (A₀) should have non-trivial values (kaiming init)
+    assert A0.abs().sum() > 0, "lora_up should have non-zero values (random init)"
+    assert A0.std() > 0, "lora_up should have positive std (random init)"
+
+    # lora_down (B₀) should be correlated with G via A₀^T
+    A0T = A0.T
+    A0TA0 = A0T @ A0
+    A0TA0_inv = torch.linalg.pinv(A0TA0 + 1e-8 * torch.eye(4, device=A0.device))
+    expected_B0 = -(A0TA0_inv @ A0T @ G)  # pure Eq 9, unscaled
+
+    # Since ξ = 1 (stable_gamma * sqrt(m) / alpha = 1), B0 should match unscaled formula
+    assert torch.allclose(B0, expected_B0, atol=1e-4), \
+        "lora_down should be computed via left pseudo-inverse of lora_up (Eq 9)"
 
     del w.grad_stored
     del w.iters

@@ -249,11 +249,13 @@ def allocate_ranks(
         'conserved': math.floor,
     }.get(allocate_strategy, round)
 
+    # Paper Eq 7: b^i = √(m+n) × r_ref  — default to sqrt per paper
     feature_adjust_func: Callable = {
         'sqrt': math.sqrt,
         'log1p': math.log1p,
-        None: lambda x: x,
-    }.get(features_func, lambda x: x)
+        'identity': lambda x: x,
+        None: math.sqrt,
+    }.get(features_func, math.sqrt)
 
     named_importances: OrderedDict[str, float] = OrderedDict()
     named_ranks: Dict[str, int] = {}
@@ -288,8 +290,10 @@ def allocate_ranks(
         adjusted_features = feature_adjust_func(features)
         named_smooth_features[name] = adjusted_features
         named_features[name] = features
-        smooth_total_budget += adjusted_features * ref_rank
-        total_budget += features * ref_rank
+        # Paper Eq 7: b^i = √(m+n) × r_ref — use adjusted features for budget
+        layer_budget = adjusted_features * ref_rank
+        smooth_total_budget += layer_budget
+        total_budget += layer_budget
 
         # Clean up GPU
         del grad_stored
@@ -310,7 +314,8 @@ def allocate_ranks(
 
     for name, norm_imp in zip(named_importances.keys(), normalized):
         smooth_trainable = allocate_func(smooth_total_budget * norm_imp.item())
-        rank = smooth_trainable // named_smooth_features[name]
+        # Paper Eq 8: r^i = [b * a^i / sqrt(m+n)] — use rounding, not floor division
+        rank = allocate_func(smooth_trainable / named_smooth_features[name])
         rank = max(1, int(rank))  # ensure at least rank 1
         if min_rank is not None and max_rank is not None:
             rank = min(max(allocate_func(rank), min_rank), max_rank)
@@ -408,12 +413,12 @@ def adaptive_gamma_selection(
     best_gamma = 0.0
 
     for gamma in candidates:
-        # Scale all lora_up weights by gamma
+        # Scale lora_down (paper's B₀) by γ — the scaling ξ is applied to B₀
         for mod in modules:
             m = mod.out_features
             alpha = mod.scaling_alpha if hasattr(mod, 'scaling_alpha') else 1.0
             scale = (gamma * math.sqrt(m)) / alpha
-            mod.lora_up.weight.data *= scale
+            mod.lora_down.weight.data *= scale
 
         current_loss = forward_fn()
         if hasattr(current_loss, 'item'):
@@ -424,7 +429,7 @@ def adaptive_gamma_selection(
             m = mod.out_features
             alpha = mod.scaling_alpha if hasattr(mod, 'scaling_alpha') else 1.0
             scale = (gamma * math.sqrt(m)) / alpha
-            mod.lora_up.weight.data /= scale
+            mod.lora_down.weight.data /= scale
 
         logger.debug(f"GoRA γ={gamma:.6f}  loss={current_loss:.6f}")
 
@@ -456,10 +461,10 @@ def gora_dynamic_init(
 
     For each module:
       1. Set lora_dim to allocated rank
-      2. Initialize A₀ (lora_down) via Kaiming uniform or SVD
-      3. Compute B₀ = G @ A₀ᵀ @ (A₀ @ A₀ᵀ)⁻¹ (pseudo-inverse projection)
-      4. Scale B₀ by ξ = (stable_gamma * √m) / α
-      5. Set lora_up = scaled B₀, lora_down = A₀
+      2. Initialize A₀ (lora_up) via Kaiming uniform or SVD
+      3. Compute B₀ = -(A₀ᵀ A₀)⁻¹ A₀ᵀ G  per paper Eq. 9
+      4. Scale B₀ by ξ = (γ * √m) / α  (paper Eq. 10, rsLoRA variant)
+      5. Set lora_up = A₀, lora_down = scaled B₀
       6. Clean up grad_stored
 
     Args:
@@ -513,17 +518,13 @@ def _grad_compress_init_single(
 ) -> None:
     """Initialize a single GoRAModule's lora weights via gradient compression.
 
-    Formula (matching GoRA paper Eq. 9):
-      A₀ ~ Kaiming uniform (or SVD)
-      B₀ = G @ A₀ᵀ @ (A₀ @ A₀ᵀ + εI)⁻¹
-      B₀ *= (stable_gamma / scaling_alpha)   [or lr-based variant]
+    GoRA Paper Eq. 9:  B₀ = -(A₀ᵀ A₀)⁻¹ A₀ᵀ G
+    where A₀ ∈ R^{m×r} (paper's A = lora_up) and B₀ ∈ R^{r×n} (paper's B = lora_down).
 
-    Note: LyCORIS convention is lora_up (A) and lora_down (B), where
-          ΔW = lora_up @ lora_down.
-          In GoRA paper: A ∈ R^{m×r} (up), B ∈ R^{r×n} (down).
-          Here we initialize:
-            lora_down (A₀): Kaiming uniform  (r × in_features)
-            lora_up   (B₀): G @ A₀ᵀ @ (A₀A₀ᵀ)⁻¹  scaled  (out_features × r)
+    Steps:
+      1. Initialize A₀ (lora_up) via Kaiming uniform (or SVD)
+      2. Compute B₀ (lora_down) = -(A₀ᵀ A₀)⁻¹ A₀ᵀ G  (left pseudo-inverse)
+      3. Scale B₀ by ξ = γ·√m / α  (paper Eq. 10, rsLoRA variant)
     """
     dtype = module.lora_down.weight.dtype
     device = module.lora_down.weight.device
@@ -533,15 +534,13 @@ def _grad_compress_init_single(
     n = in_features   # paper notation
 
     # Resize lora_down/lora_up if allocated rank differs from initial
-    if module.lora_down.out_features != rank:
-        old_down_weight = module.lora_down.weight.data
-        module.lora_down = type(module.lora_down)(
-            in_features, rank, bias=False,
-        ).to(device=device, dtype=dtype)
-        # Don't copy — will be overwritten below
     if module.lora_up.in_features != rank:
         module.lora_up = type(module.lora_up)(
             rank, out_features, bias=False,
+        ).to(device=device, dtype=dtype)
+    if module.lora_down.out_features != rank:
+        module.lora_down = type(module.lora_down)(
+            in_features, rank, bias=False,
         ).to(device=device, dtype=dtype)
 
     # Get accumulated gradient as float32 on correct device
@@ -549,77 +548,70 @@ def _grad_compress_init_single(
     grad_stored = org_w.grad_stored.to(dtype=torch.float32, device=device)
     grad_stored = grad_stored / org_w.iters  # average over accumulation steps
 
-    # --- Initialize A₀ (lora_down: r × in_features) ---
-    lora_down_2d = torch.empty((rank, n), dtype=torch.float32, device=device)
+    # --- Initialize A₀ (lora_up: out_features × rank = m × r) ---
+    # Paper: "We maintain LoRA's initialization for A" — A is (m, r), randomly initialized
+    lora_up_2d = torch.empty((m, rank), dtype=torch.float32, device=device)
 
     if weight_a_init_method == 'weight_svd':
-        # Use SVD of pre-trained weight for A₀
         try:
-            _, Sr, Ur = torch.svd_lowrank(
+            Vr, Sr, Ur = torch.svd_lowrank(
                 org_w.data.float(), rank, niter=fast_svd_niter,
             )
-            Uhr = Ur.t()  # (rank, in_features)
-            lora_down_2d = torch.diag(Sr) @ Uhr
+            # Vr = U (m, r), Sr = S (r,), Ur = V (n, r)
+            lora_up_2d = Vr @ torch.diag(Sr.sqrt())
         except Exception:
-            torch.nn.init.kaiming_uniform_(lora_down_2d, a=math.sqrt(5))
+            torch.nn.init.kaiming_uniform_(lora_up_2d, a=math.sqrt(5))
     elif weight_a_init_method == 'grad_svd':
-        # Use SVD of gradient for A₀
         try:
-            _, Sr, Ur = torch.svd_lowrank(grad_stored, rank, niter=fast_svd_niter)
-            Uhr = Ur.t()
-            lora_down_2d = torch.diag(Sr) @ Uhr
+            Vr, Sr, Ur = torch.svd_lowrank(grad_stored, rank, niter=fast_svd_niter)
+            lora_up_2d = Vr @ torch.diag(Sr.sqrt())
         except Exception:
-            torch.nn.init.kaiming_uniform_(lora_down_2d, a=math.sqrt(5))
+            torch.nn.init.kaiming_uniform_(lora_up_2d, a=math.sqrt(5))
     else:
         # Default: Kaiming uniform (paper's standard init for A₀)
-        torch.nn.init.kaiming_uniform_(lora_down_2d, a=math.sqrt(5))
+        torch.nn.init.kaiming_uniform_(lora_up_2d, a=math.sqrt(5))
 
-    # --- Compute B₀ = G @ A₀ᵀ @ (A₀ @ A₀ᵀ + εI)⁻¹ ---
-    # A₀ shape: (r, in_features) = (r, n)
-    # A₀ᵀ shape: (n, r)
-    # A₀ @ A₀ᵀ shape: (r, r)
-    # G shape: (out_features, in_features) = (m, n)
-    # B₀ = G @ A₀ᵀ @ (A₀A₀ᵀ)⁻¹  → shape (m, r)
+    # --- Compute B₀ = -(A₀ᵀ A₀)⁻¹ A₀ᵀ G (Paper Eq. 9) ---
+    # A₀ shape: (m, rank) = (out_features, rank)
+    # A₀ᵀ shape: (rank, m)
+    # A₀ᵀ A₀ shape: (rank, rank)
+    # G shape: (m, n) = (out_features, in_features)
+    # B₀ = -(A₀ᵀ A₀)⁻¹ A₀ᵀ G → shape (rank, n) = (rank, in_features)
 
-    A0 = lora_down_2d  # (r, n)
-    A0T = A0.T          # (n, r)
-    A0A0T = A0 @ A0T    # (r, r)
+    A0 = lora_up_2d  # (m, r) — paper's A₀
+    A0T = A0.T        # (r, m)
+    A0TA0 = A0T @ A0  # (r, m) @ (m, r) = (r, r)
     epsilon = 1e-8 * torch.eye(rank, device=device, dtype=torch.float32)
     try:
-        A0A0T_inv = torch.linalg.pinv(A0A0T + epsilon)
+        A0TA0_inv = torch.linalg.pinv(A0TA0 + epsilon)
     except Exception:
-        # Fallback: use solve on regularized matrix
-        A0A0T_reg = A0A0T + epsilon
-        A0A0T_inv = torch.linalg.inv(A0A0T_reg)
-    A0A0T_inv_A0T = A0T @ A0A0T_inv  # (n, r)
-    lora_up_2d = grad_stored @ A0A0T_inv_A0T  # (m, r)
+        A0TA0_reg = A0TA0 + epsilon
+        A0TA0_inv = torch.linalg.inv(A0TA0_reg)
+    A0TA0_inv_A0T = A0TA0_inv @ A0T  # (r, r) @ (r, m) = (r, m)
 
-    # --- Scaling ---
-    if scale_by_lr:
-        # ξ = (lr / √(r/n)) * scale_rank  [from MyTransformers codebase]
-        stable_gamma_effective = (lr / math.sqrt(rank / n)) * scaling_alpha
-    else:
-        stable_gamma_effective = stable_gamma
+    # Paper Eq 9: B₀ = -(A₀ᵀA₀)⁻¹A₀ᵀG — negative sign!
+    lora_down_2d = -A0TA0_inv_A0T @ grad_stored  # (r, m) @ (m, n) = (r, n)
 
-    # Paper Eq. 10: ξ = (γ · √m) / α  when using rsLoRA (α/√r forward)
-    # With rsLoRA, scale = (α / √r), and ξ = (γ · √m) / α
-    # So: B₀ *= (stable_gamma_effective * √m) / scaling_alpha
-    lora_up_2d *= (stable_gamma_effective * math.sqrt(m)) / scaling_alpha
+    # --- Scaling: Paper Eq. 10 — ξ = γ·√m / α for rsLoRA variant ---
+    gamma = lr if scale_by_lr else stable_gamma
+    xi = (gamma * math.sqrt(m)) / scaling_alpha  # paper's ξ
+
+    lora_down_2d *= xi
 
     # --- Compute reconstruction error ---
-    # A₀B₀ should approximate -γ·G (one SGD step)
-    reconstruction = lora_up_2d @ A0  # (m, r) @ (r, n) = (m, n)
-    target = -stable_gamma_effective * grad_stored
+    # A₀(ξ·B₀) should approximate -γ·G (one SGD step)
+    reconstruction = lora_up_2d @ lora_down_2d  # (m, r) @ (r, n) = (m, n)
+    target = -gamma * grad_stored
     recon_error = torch.norm(target - reconstruction, p='fro').item()
     relative_error = recon_error / (torch.norm(grad_stored, p='fro').item() + 1e-8)
     module._gora_recon_error = recon_error
     module._gora_relative_error = relative_error
 
     # --- Overwrite module parameters ---
-    # lora_down = A₀  (r, in_features) — already computed
-    module.lora_down.weight.data.copy_(lora_down_2d.to(dtype))
-    # lora_up = B₀  (out_features, r)
+    # lora_up = A₀ (out_features, rank) — paper's A
     module.lora_up.weight.data.copy_(lora_up_2d.to(dtype))
+    # lora_down = B₀ (rank, in_features) — paper's B (computed)
+    module.lora_down.weight.data.copy_(lora_down_2d.to(dtype))
 
     # Update lora_dim to allocated rank
     module.lora_dim = rank
@@ -825,12 +817,12 @@ def gora_precompute_gradients(
         best_gamma = adaptive_gamma_selection(
             modules, eval_loss, gamma_init, gamma_decay, gamma_min, scaling_alpha,
         )
-        # Apply best gamma scaling
+        # Apply best gamma scaling to lora_down (paper's B₀)
         for module in modules:
             m = module.out_features
             alpha = scaling_alpha
             best_scale = (best_gamma * math.sqrt(m)) / alpha
-            module.lora_up.weight.data *= best_scale
+            module.lora_down.weight.data *= best_scale
 
     # --- Save rank/importance metadata ---
     if save_dir is not None and global_rank == 0:

@@ -169,3 +169,42 @@ These arguments control the RaLoRA/RaLoRA-Pro algorithm behavior. They are valid
 - In kohya scripts, the precomputation must be triggered manually after network creation
 - Tucker decomposition (`use_tucker=True`) falls back to n_split=1 for RaLoRA
 - For best results, set `alpha` equal to `network_dim` (paper convention)
+
+### GoRA-Specific Arguments
+
+These arguments control the GoRA algorithm behavior. They are valid only when `algo=gora`.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `gora_ref_rank` | int | lora_dim | Reference rank r^ref for parameter budget calculation (Eq. 7). Allocates similar total params as LoRA with this rank. |
+| `gora_min_rank` | int | 1 | Minimum rank per adapter. Paper default: r_ref/2. |
+| `gora_max_rank` | int | 32 | Maximum rank per adapter. Paper default: 4×r_ref. |
+| `gora_gamma` | float | 0.05 | Scaling factor γ for initialization magnitude. Higher = stronger initialization. Paper: 0.05-0.08. |
+| `gora_importance_type` | str | "union_mean" | Importance metric. Default `avg(\|W⊙G\|)` (Eq. 5). Also supports: "union_frobenius_norm", "grad_nuc_norm", "grad_entropy", dual metrics like "union_mean_grad_nuc_norm", etc. |
+| `gora_softmax_importance` | bool | False | Use softmax with temperature for importance normalization instead of linear sum. |
+| `gora_temperature` | float | 0.5 | Temperature for softmax importance normalization. |
+| `gora_scale_importance` | bool | False | Apply sqrt to raw importance scores before normalization. |
+| `gora_features_func` | str | "sqrt" | Feature adjustment for budget: "sqrt" (√(m+n), paper default), "log1p", "identity" (m+n). |
+| `gora_allocate_strategy` | str | "moderate" | Rounding strategy: "radical" (ceil), "moderate" (round), "conserved" (floor). |
+| `gora_adaptive_n` | bool | True | Enable adaptive N: auto-stop gradient accumulation when importance scores converge. |
+| `gora_convergence_threshold` | float | 0.01 | Relative change threshold for adaptive N convergence. |
+| `gora_min_steps` | int | 3 | Minimum gradient accumulation steps before checking convergence. |
+| `gora_adaptive_gamma` | bool | False | Enable adaptive γ: auto-tune scaling factor on first batch to minimize loss. |
+| `gora_scale_by_lr` | bool | False | Use learning rate in scaling formula (alternative to gora_gamma). |
+| `gora_lr` | float | 1e-3 | Learning rate for lr-based scaling (when gora_scale_by_lr=True). |
+
+**Recommended Configuration (from paper):**
+- `algo=gora` with `network_dim=8`, `network_alpha=16`
+- `gora_ref_rank=8`, `gora_min_rank=4`, `gora_max_rank=32`
+- `gora_gamma=0.05` (for code) or `0.08` (for math)
+- `gora_importance_type="union_mean"`
+- `gora_adaptive_n=True` (auto-determines N, eliminates manual tuning)
+
+**Notes:**
+- GoRA requires a precomputation phase via `LycorisNetwork.prepare_gora()` before training
+- After precomputation, the saved state dict is identical to standard LoRA/LoCon
+- GoRA always uses rsLoRA scaling (α/√r)
+- Does NOT manipulate pre-trained weights — no training-inference gap
+- GoRA is compatible with weight_decompose (DoRA), use_scalar, orthogonalize, and QLoRA/bnb layers
+- For inference, the checkpoint can be loaded as standard LoRA without special handling
+- For adaptively changing γ, set `gora_adaptive_gamma=True` (adds one pre-training forward pass)

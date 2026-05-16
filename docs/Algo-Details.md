@@ -305,3 +305,110 @@ RaLoRAModule.precompute_and_init(
 
 - Ref: [Gradient Intrinsic Dimensionality Alignment](https://openreview.net/forum?id=kObvnQ6pUx) (ICLR 2026)
 - Code: `lycoris/modules/locon.py` (`RaLoRAModule`), `lycoris/modules/ralora_utils.py`
+
+## GoRA
+
+### Motivation
+
+Standard LoRA uses a fixed rank and random initialization for all layers. Two critical factors influence LoRA's performance:
+
+1. **Rank selection**: Higher ranks improve performance but increase memory. Some layers benefit more from extra capacity than others.
+2. **Weight initialization**: Zero initialization for B ensures stability but provides no gradient information. Non-zero initialization methods (PiSSA, LoRA-GA) exist but require manipulating pre-trained weights, creating a training-inference gap.
+
+GoRA addresses both factors simultaneously within a unified framework, using pre-computed gradients to:
+
+- Adaptively allocate ranks to each layer based on gradient importance
+- Initialize B₀ to compress the pre-computed gradient, setting a strong foundation for optimization
+- Avoid manipulating pre-trained weights (no training-inference gap)
+
+### Mathematical Formulation
+
+#### Rank Allocation (Section 3.2)
+
+For each weight matrix $W \in \mathbb{R}^{m \times n}$, compute importance from the accumulated gradient $G$:
+
+$$I(W) = \text{avg}(|W \odot G|) \qquad \text{(Eq. 5, sensitivity-based importance)}$$
+
+Normalize to advantages and allocate a parameter budget:
+
+$$a^i = \frac{I(W^i)}{\sum I(W^i)} \qquad \text{(Eq. 6)}$$
+
+$$b^i = \sqrt{m+n} \times r^{\text{ref}} \qquad \text{(Eq. 7, per-layer budget)}$$
+
+Allocate rank with rounding $[\cdot]$:
+
+$$r^i = \left[\frac{b \cdot a^i}{\sqrt{m+n}}\right], \quad r^{\min} \le r^i \le r^{\max} \qquad \text{(Eq. 8)}$$
+
+#### Initialization (Section 3.3)
+
+**Convention**: ΔW = A₀B₀ where A₀ (lora_up) ∈ R^{m×r} is randomly initialized (Kaiming), and B₀ (lora_down) ∈ R^{r×n} is computed.
+
+$$B_0 = -(A_0^{\top}A_0)^{-1}A_0^{\top}G \qquad \text{(Eq. 9, left pseudo-inverse of A₀)}$$
+
+This ensures $A_0B_0$ provides the **optimal rank-r approximation of G** in the column space of A₀ (proved in Appendix B.1).
+
+#### Scaling (Section 3.3, Eq. 10)
+
+GoRA uses rsLoRA forward computation:
+
+$$W_t = W_0 + \frac{\alpha}{\sqrt{r}} A_t B_t$$
+
+A scaling factor $\xi$ is applied to B₀ so the initial adapter approximates one step of SGD:
+
+$$\xi = \frac{\gamma \cdot \sqrt{m}}{\alpha} \qquad \text{(rsLoRA variant)}$$
+
+$$\frac{\alpha}{\sqrt{r}} A_0 (\xi B_0) \approx -\gamma G$$
+
+### Adaptive Hyperparameters
+
+GoRA introduces two tunable hyperparameters with auto-tuning strategies:
+
+1. **Adaptive N (gradient accumulation steps)**: Monitor importance scores each step. Stop when change between consecutive steps falls below threshold (default 0.01). Removes need to manually specify N.
+
+2. **Adaptive γ (scaling factor)**: Search candidate γ values on first training batch. Pick γ that minimizes loss without backpropagation. Removes need to manually tune γ.
+
+### Usage
+
+```python
+from lycoris import create_lycoris, LycorisNetwork
+from lycoris.modules.locon import GoRAModule
+
+# Create GoRA network
+lycoris_net = create_lycoris(
+    model, 1.0,
+    linear_dim=8,
+    linear_alpha=16.0,
+    algo="gora",
+    gora_ref_rank=8,
+    gora_min_rank=4,
+    gora_max_rank=32,
+    gora_gamma=0.05,
+    gora_importance_type="union_mean",
+)
+lycoris_net.apply_to()
+
+# Precomputation phase (ONCE, before training)
+lycoris_net.prepare_gora(
+    dataloader=train_dataloader,
+    forward_fn=lambda batch: (model(**batch)[0],),
+    max_steps=64,
+    adaptive_n=True,
+    adaptive_gamma=False,
+)
+
+# Start normal training — model weights are already initialized
+# Checkpoint is identical to standard LoRA after initialization
+```
+
+### Key Properties
+
+- **No training-inference gap**: Unlike PiSSA/LoRA-GA, GoRA does NOT manipulate pre-trained weights. The forward pass is $W_0 x + (\alpha/\sqrt{r}) A_t B_t x$ with unchanged $W_0$.
+- **Standard LoRA checkpoint**: After initialization, the saved state dict matches standard LoRA keys. No special loading required.
+- **Compatible with QLoRA**: GoRA works with quantized pre-trained weights (Appendix D.2).
+- **Parameter count**: Similar to LoRA with the same reference rank (within ~10%).
+
+### See Also
+
+- Ref: [GoRA: Gradient-driven Adaptive Low Rank Adaptation](https://arxiv.org/abs/2502.12171) (2025)
+- Code: `lycoris/modules/locon.py` (`GoRAModule`), `lycoris/modules/gora_utils.py`
+- Tests: `test/test_gora.py` (32 tests including paper formula verification)

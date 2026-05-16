@@ -1969,8 +1969,14 @@ class GoRAModule(LoConModule):
       - Accumulates pre-trained weight gradients on CPU via backward hooks.
       - Before training, computes layer importance from accumulated gradients
         and allocates ranks adaptively.
-      - Initializes B (lora_up) as the pseudo-inverse compressed gradient:
-        B₀ = G @ A₀ᵀ @ (A₀ @ A₀ᵀ)⁻¹
+      - Initializes A₀ (lora_up) via Kaiming, then computes B₀ (lora_down)
+        using the left pseudo-inverse per paper Eq. 9:
+        B₀ = -(A₀ᵀ A₀)⁻¹ A₀ᵀ G
+
+    Convention:
+        ΔW = lora_up @ lora_down
+        lora_up ∈ R^{m×r} = paper's A (randomly initialized)
+        lora_down ∈ R^{r×n} = paper's B (computed from gradient)
 
     Reference: https://arxiv.org/abs/2502.12171
 

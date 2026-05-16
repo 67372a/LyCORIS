@@ -268,13 +268,31 @@ See [docs/Conversion-scripts.md](docs/Conversion-scripts.md) for more informatio
 
 For full log, please see [Change.md](Change.md)
 
-### 2025/06 (dev branch)
+### 2026/05/14-16 (dev branch)
 
 #### New Features
 
+* **GoRA: Gradient-driven Adaptive Low Rank Adaptation**: Uses pre-computed gradients to adaptively allocate ranks and initialize LoRA weights. The saved checkpoint is identical to standard LoRA/LoCon after initialization. Triggered by `algo=gora`. [arXiv:2502.12171](https://arxiv.org/abs/2502.12171)
+  * Rank allocation based on gradient importance: $I(W) = \text{avg}(|W \odot G|)$
+  * B₀ initialized via left pseudo-inverse: $B_0 = -(A_0^{\top}A_0)^{-1}A_0^{\top}G$ (paper Eq. 9)
+  * Requires `LycorisNetwork.prepare_gora()` before training
 * **RaLoRA / RaLoRA-Pro**: Rank-Aligned LoRA with [Gradient Intrinsic Dimensionality Alignment](https://openreview.net/forum?id=kObvnQ6pUx) (ICLR 2026). Adaptively aligns LoRA adapter capacity with per-layer gradient intrinsic dimensionality using block-diagonal decomposition. RaLoRA-Pro adds inter-layer rank reallocation guided by loss sensitivity. Triggered by `algo=ralora`.
   * See [docs/Algo-List.md](docs/Algo-List.md) and [docs/Algo-Details.md](docs/Algo-Details.md) for details.
   * Requires a precomputation phase via `RaLoRAModule.precompute_and_init()` before training.
+* **O-LoRA**: Multi-task LoRA with orthogonal subspaces. Supports adding tasks dynamically and merging frozen tasks into base weights.
+* **PiSSA for LoCon**: Principal Singular Values and Singular Vectors Adaptation with SVD initialization.
+
+#### Improvements
+
+* Split `use_orthogonal_init` from `use_orthogonal_weights` to allow orthogonal init without runtime overhead
+* Migrate build system to `pyproject.toml` and `uv`
+* Better logging for GoRA modules
+
+#### Bug fixes
+
+* Critical GoRA paper-formula fixes: negative sign, left pseudo-inverse, `√(m+n)` budget, `√m` scaling
+* Fix orthogonal weights test
+* Fix GoRA `org_weight_gpu` reference
 
 ### 2025/04/23 update to 3.2.0
 
