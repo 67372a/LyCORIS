@@ -3,6 +3,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Testing artifacts
+/coverage/
+coverage_report/
+
 # C extensions
 *.so
 

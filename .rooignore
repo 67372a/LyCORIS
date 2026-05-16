@@ -10,6 +10,7 @@ node_modules/
 
 # Testing artifacts
 /coverage/
+coverage_report/
 
 # Environment variables
 .env
