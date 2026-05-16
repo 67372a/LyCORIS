@@ -42,7 +42,7 @@ def precalculate_safetensors_hashes(state_dict):
 
 
 def str_bool(val):
-    return val is not None and str(val).lower() != "false"
+    return val is not None and str(val).strip().lower() == "true"
 
 
 def default(val, d):
