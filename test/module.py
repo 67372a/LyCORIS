@@ -188,8 +188,8 @@ class LycorisModuleTests(unittest.TestCase):
     # --- Orthogonal init / runtime orthogonalization tests ---
     _orthogonal_modules = [LoConModule, LokrModule, GLoRAModule, LohaModule]
 
-    def test_orthogonal_init_forces_scalar(self):
-        """orthogonal_init=True should force use_scalar=True."""
+    def test_orthogonal_forces_scalar(self):
+        """orthogonal=True should force use_scalar=True."""
         base = nn.Linear(16, 16)
         for module_cls in self._orthogonal_modules:
             net = module_cls(
@@ -198,13 +198,13 @@ class LycorisModuleTests(unittest.TestCase):
                 multiplier=1,
                 lora_dim=4,
                 alpha=1,
-                orthogonal_init=True,
+                orthogonal=True,
                 use_scalar=False,
             )
             self.assertIsInstance(
                 net.scalar,
                 nn.Parameter,
-                f"{module_cls.__name__}: orthogonal_init should force scalar to be nn.Parameter",
+                f"{module_cls.__name__}: orthogonal should force scalar to be nn.Parameter",
             )
             net.restore()
 
