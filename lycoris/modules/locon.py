@@ -1188,6 +1188,775 @@ class LoConModule(LycorisBaseModule):
             return None
 
 
+class RaLoRAModule(LoConModule):
+    """RaLoRA: Rank-Aligned LoRA with Gradient Intrinsic Dimensionality.
+
+    Extends LoConModule with block-diagonal decomposition where the number
+    of blocks (n_split) is adaptively determined by the entropy-based
+    gradient intrinsic dimensionality (GID) estimator.
+
+    The adapter uses block-diagonal structure:
+        ΔW = diag(B₁A₁, B₂A₂, ..., B_nA_n)
+    where A_i ∈ R^(r × d_in/n) and B_i ∈ R^(d_out/n × r).
+
+    Equivalent rank = n_split × r, with same parameter count as vanilla LoRA.
+
+    Two modes:
+      - RaLoRA (ralora_pro=False): Same rank r for all layers, n_split varies
+        per layer based on GID.
+      - RaLoRA-Pro (ralora_pro=True): Both rank r_l and n_split vary per layer
+        guided by loss sensitivity + GID (dual alignment).
+
+    Reference: "Gradient Intrinsic Dimensionality Alignment" (ICLR 2026)
+    """
+
+    name = "ralora"
+    support_module = {"linear", "conv1d", "conv2d", "conv3d"}
+    weight_list = [
+        "lora_up.weight",
+        "lora_down.weight",
+        "lora_mid.weight",
+        "alpha",
+        "dora_scale",
+        "pissa_A_init",
+        "pissa_B_init",
+        "pissa_converted",
+        "n_split",
+        # Block-diagonal weight keys (up to 64 blocks)
+        *[f"lora_up_block{i}.weight" for i in range(64)],
+        *[f"lora_down_block{i}.weight" for i in range(64)],
+    ]
+    weight_list_det = ["lora_up.weight", "lora_up_block0.weight"]
+
+    # Registry of all RaLoRAModule instances for cross-module rank/GID allocation.
+    _ralora_modules: list = []
+
+    def __init__(
+        self,
+        lora_name,
+        org_module: nn.Module,
+        multiplier=1.0,
+        lora_dim=4,
+        alpha=1,
+        dropout=0.0,
+        rank_dropout=0.0,
+        module_dropout=0.0,
+        use_tucker=False,
+        use_scalar=False,
+        scalar_init_value=None,
+        rank_dropout_scale=False,
+        weight_decompose=False,
+        wd_on_output=True,
+        bypass_mode=None,
+        rs_lora=False,
+        ggpo_beta: Optional[float] = None,
+        ggpo_sigma: Optional[float] = None,
+        ggpo_conv: bool = False,
+        ggpo_conv_weight_sample_size: int = 100,
+        orthogonalize=False,
+        orthogonal_init=False,
+        pissa_niter: int = 0,
+        pissa_convert: bool = True,
+        olora: bool = False,
+        olora_lambda: float = 0.5,
+        olora_task_id: int = 0,
+        # --- RaLoRA-specific parameters ---
+        ralora_n_max: int = 32,
+        ralora_pro: bool = False,
+        ralora_ref_rank: Optional[int] = None,
+        ralora_min_rank: Optional[int] = None,
+        ralora_max_rank: Optional[int] = None,
+        ralora_dynamic_scaling: bool = False,
+        ralora_rank_stabilize: bool = False,
+        ralora_erank_method: str = "entropy",
+        ralora_svd_threshold: float = 0.0,
+        ralora_cumulative_variance: float = 0.0,
+        ralora_forward_method: str = "concat",
+        **kwargs,
+    ):
+        # Capture alpha before super().__init__ modifies it
+        self.scaling_alpha = alpha
+
+        super().__init__(
+            lora_name=lora_name,
+            org_module=org_module,
+            multiplier=multiplier,
+            lora_dim=lora_dim,
+            alpha=alpha,
+            dropout=dropout,
+            rank_dropout=rank_dropout,
+            module_dropout=module_dropout,
+            use_tucker=use_tucker,
+            use_scalar=use_scalar,
+            scalar_init_value=scalar_init_value,
+            rank_dropout_scale=rank_dropout_scale,
+            weight_decompose=weight_decompose,
+            wd_on_output=wd_on_output,
+            bypass_mode=bypass_mode,
+            rs_lora=rs_lora,
+            ggpo_beta=ggpo_beta,
+            ggpo_sigma=ggpo_sigma,
+            ggpo_conv=ggpo_conv,
+            ggpo_conv_weight_sample_size=ggpo_conv_weight_sample_size,
+            orthogonalize=orthogonalize,
+            orthogonal_init=orthogonal_init,
+            pissa_niter=pissa_niter,
+            pissa_convert=pissa_convert,
+            olora=olora,
+            olora_lambda=olora_lambda,
+            olora_task_id=olora_task_id,
+            **kwargs,
+        )
+
+        # RaLoRA configuration
+        self.ralora_n_max = ralora_n_max
+        self.ralora_pro = ralora_pro
+        self.ralora_ref_rank = ralora_ref_rank if ralora_ref_rank is not None else lora_dim
+        self.ralora_min_rank = ralora_min_rank
+        self.ralora_max_rank = ralora_max_rank
+        self.ralora_dynamic_scaling = ralora_dynamic_scaling
+        self.ralora_rank_stabilize = ralora_rank_stabilize
+        self.ralora_erank_method = ralora_erank_method
+        self.ralora_svd_threshold = ralora_svd_threshold
+        self.ralora_cumulative_variance = ralora_cumulative_variance
+        self.ralora_forward_method = ralora_forward_method
+
+        # Block-diagonal state (n_split=1 means vanilla LoRA)
+        self.n_split = 1
+        self.mini_lora_rank = lora_dim
+        self.mini_in_features = self.shape[1] if len(self.shape) >= 2 else self.shape[0]
+        self.mini_out_features = self.shape[0] if len(self.shape) >= 2 else 0
+        self._mini_lora_A = nn.ParameterList()
+        self._mini_lora_B = nn.ParameterList()
+
+        # Register in global RaLoRA module list
+        RaLoRAModule._ralora_modules.append(self)
+
+    # ------------------------------------------------------------------
+    # Class-level utilities
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def get_ralora_modules(cls, model: Optional[nn.Module] = None) -> list:
+        """Get all RaLoRAModule instances, optionally filtered by model."""
+        if model is not None:
+            return [
+                m for m in cls._ralora_modules
+                if any(m is mod for mod in model.modules())
+            ]
+        return list(cls._ralora_modules)
+
+    @classmethod
+    def reset_ralora_registry(cls):
+        """Clear the RaLoRA module registry."""
+        cls._ralora_modules.clear()
+
+    @classmethod
+    @torch.no_grad()
+    def precompute_and_init(
+        cls,
+        model: nn.Module,
+        dataloader,
+        forward_fn: Callable,
+        ref_rank: Optional[int] = None,
+        min_rank: Optional[int] = None,
+        max_rank: Optional[int] = None,
+        n_max: Optional[int] = None,
+        pro_mode: Optional[bool] = None,
+        erank_method: Optional[str] = None,
+        svd_threshold: Optional[float] = None,
+        cumulative_variance: Optional[float] = None,
+        max_steps: int = 64,
+        world_size: int = 1,
+        global_rank: int = 0,
+        device: Optional[torch.device] = None,
+        save_dir: Optional[str] = None,
+        **kwargs,
+    ) -> Dict[str, int]:
+        """Class-level entry point for RaLoRA pre-computation.
+
+        Finds all RaLoRAModule instances in *model*, reads their individual
+        config, and delegates to :func:`ralora_utils.ralora_precompute_gradients`.
+
+        Args:
+            model: The model containing RaLoRAModule instances.
+            dataloader: Training dataloader.
+            forward_fn: Forward function (model, batch) -> loss.
+            ref_rank: Override reference rank.
+            min_rank: Override min rank.
+            max_rank: Override max rank.
+            n_max: Override max expansion factor.
+            pro_mode: Override RaLoRA-Pro mode.
+            erank_method: Override GID estimation method.
+            svd_threshold: Threshold for threshold-based erank.
+            cumulative_variance: Threshold for cumulative-variance erank.
+            max_steps: Max gradient accumulation steps.
+            world_size, global_rank: Distributed info.
+            device: Compute device.
+            save_dir: Directory to save rank.json / n_splits.json.
+
+        Returns:
+            {lora_name: allocated_rank} dict.
+        """
+        from .ralora_utils import ralora_precompute_gradients
+
+        modules = cls.get_ralora_modules(model)
+        if not modules:
+            raise RuntimeError(
+                "RaLoRA: No RaLoRAModule instances found in model. "
+                "Make sure to create the LyCORIS network with algo='ralora'."
+            )
+
+        # Use first module's config as defaults, allow overrides
+        first = modules[0]
+        ref_rank = ref_rank if ref_rank is not None else first.ralora_ref_rank
+        min_rank = min_rank if min_rank is not None else (first.ralora_min_rank or 1)
+        max_rank = max_rank if max_rank is not None else (first.ralora_max_rank or first.lora_dim * 4)
+        n_max = n_max if n_max is not None else first.ralora_n_max
+        pro_mode = pro_mode if pro_mode is not None else first.ralora_pro
+        erank_method = erank_method if erank_method is not None else first.ralora_erank_method
+        svd_threshold = svd_threshold if svd_threshold is not None else first.ralora_svd_threshold
+        cumulative_variance = cumulative_variance if cumulative_variance is not None else first.ralora_cumulative_variance
+
+        return ralora_precompute_gradients(
+            modules=modules,
+            dataloader=dataloader,
+            forward_fn=forward_fn,
+            model=model,
+            ref_rank=ref_rank,
+            min_rank=min_rank,
+            max_rank=max_rank,
+            n_max=n_max,
+            pro_mode=pro_mode,
+            erank_method=erank_method,
+            svd_threshold=svd_threshold,
+            cumulative_variance=cumulative_variance,
+            max_steps=max_steps,
+            world_size=world_size,
+            global_rank=global_rank,
+            device=device,
+            save_dir=save_dir,
+        )
+
+    # ------------------------------------------------------------------
+    # Dynamic initialization
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def dynamic_init(self, avg_rank: int, rank: int, n_split: int = 1):
+        """Rebuild adapter weights for block-diagonal LoRA after precomputation.
+
+        Args:
+            avg_rank: Reference/average rank (for scaling factor).
+            rank: Per-layer LoRA rank r_l.
+            n_split: Number of diagonal blocks n_l (must be a power of 2).
+        """
+        if n_split < 1:
+            raise ValueError(f"n_split must be >= 1, got {n_split}")
+
+        self.n_split = n_split
+        self.lora_dim = rank if n_split == 1 else rank * n_split
+
+        if n_split == 1:
+            # Vanilla LoRA path — use existing lora_down/lora_up
+            self.mini_lora_rank = rank
+            self.mini_in_features = self.shape[1] if len(self.shape) >= 2 else self.shape[0]
+            self.mini_out_features = self.shape[0] if len(self.shape) >= 2 else 0
+            self._mini_lora_A = nn.ParameterList()
+            self._mini_lora_B = nn.ParameterList()
+
+            # Resize lora_down/lora_up if allocated rank differs from initial
+            if rank != self.lora_down.out_features:
+                in_dim = self.shape[1] if len(self.shape) >= 2 else self.shape[0]
+                out_dim = self.shape[0] if len(self.shape) >= 2 else 0
+                dtype = self.lora_down.weight.dtype
+                device = self.lora_down.weight.device
+                if self.isconv:
+                    self.lora_down = self.module(
+                        in_dim, rank, *self.shape[2:],
+                        stride=self.lora_down.stride,
+                        padding=self.lora_down.padding,
+                        bias=False,
+                    ).to(device=device, dtype=dtype)
+                else:
+                    self.lora_down = nn.Linear(in_dim, rank, bias=False).to(device=device, dtype=dtype)
+                self.lora_up = nn.Linear(rank, out_dim, bias=False).to(device=device, dtype=dtype)
+                # Re-initialize
+                if self.use_orthogonal_init:
+                    nn.init.orthogonal_(self.lora_down.weight)
+                else:
+                    nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
+                nn.init.zeros_(self.lora_up.weight)
+
+            self._update_scaling(avg_rank, rank)
+            return
+
+        # Tucker decomposition is not supported with block-diagonal structure
+        if self.tucker:
+            logger.warning(
+                f"RaLoRA: Tucker decomposition is not supported with n_split > 1 "
+                f"(module {self.lora_name}). Falling back to n_split=1."
+            )
+            self.n_split = 1
+            self.lora_dim = rank
+            self._update_scaling(avg_rank, rank)
+            return
+
+        # Check exact division
+        in_features = self.shape[1] if len(self.shape) >= 2 else self.shape[0]
+        out_features = self.shape[0] if len(self.shape) >= 2 else 0
+        if in_features % n_split != 0:
+            raise ValueError(
+                f"in_features ({in_features}) must be divisible by n_split ({n_split})"
+            )
+        if out_features % n_split != 0:
+            raise ValueError(
+                f"out_features ({out_features}) must be divisible by n_split ({n_split})"
+            )
+
+        self.mini_lora_rank = rank
+        self.mini_in_features = in_features // n_split
+        self.mini_out_features = out_features // n_split
+
+        # Create mini LoRA weights
+        self._mini_lora_A = nn.ParameterList()
+        self._mini_lora_B = nn.ParameterList()
+        for _ in range(n_split):
+            if self.isconv:
+                # Conv: mini-A has kernel, mini-B is 1x1
+                mini_a = nn.Parameter(
+                    torch.empty((rank, self.mini_in_features, *self.shape[2:])),
+                    requires_grad=True,
+                )
+                mini_b = nn.Parameter(
+                    torch.zeros((self.mini_out_features, rank, *([1] * (len(self.shape) - 2)))),
+                    requires_grad=True,
+                )
+            else:
+                mini_a = nn.Parameter(
+                    torch.empty((rank, self.mini_in_features)),
+                    requires_grad=True,
+                )
+                mini_b = nn.Parameter(
+                    torch.zeros((self.mini_out_features, rank)),
+                    requires_grad=True,
+                )
+            self._mini_lora_A.append(mini_a)
+            self._mini_lora_B.append(mini_b)
+
+        # Initialize mini-A with kaiming
+        for mini_a in self._mini_lora_A:
+            if self.use_orthogonal_init:
+                nn.init.orthogonal_(mini_a)
+            else:
+                nn.init.kaiming_uniform_(mini_a, a=math.sqrt(5))
+
+        # Mini-B stays zero-initialized (standard LoRA convention)
+
+        self._update_scaling(avg_rank, rank)
+
+    def _update_scaling(self, avg_rank: int, rank: int):
+        """Update the scaling factor based on rank configuration."""
+        if self.ralora_dynamic_scaling:
+            scale_rank = rank
+        else:
+            scale_rank = avg_rank
+
+        if self.ralora_rank_stabilize:
+            scale_rank = math.sqrt(scale_rank)
+
+        r_factor = scale_rank
+        self.scale = self.scaling_alpha / r_factor
+        self.register_buffer("alpha", torch.tensor(self.scaling_alpha * (scale_rank / r_factor)))
+
+        if self.rs_lora:
+            self.scale = self.scaling_alpha / math.sqrt(scale_rank)
+
+    # ------------------------------------------------------------------
+    # Weight computation (override for block-diagonal)
+    # ------------------------------------------------------------------
+
+    def _make_weight_single(self, device=None):
+        """Weight computation with block-diagonal support."""
+        if self.n_split <= 1:
+            return super()._make_weight_single(device)
+
+        # Block-diagonal: assemble via torch.block_diag for linear,
+        # manual placement for conv.
+        wa_list = [
+            self._orthogonalize(a.to(device)) for a in self._mini_lora_A
+        ]
+        wb_list = [
+            self._orthogonalize(b.to(device)) for b in self._mini_lora_B
+        ]
+
+        if self.isconv:
+            # Conv: assemble block-diagonal weight manually.
+            # Each mini-A: (r, in_c/n, k1, k2), mini-B: (out_c/n, r, 1, 1)
+            # Produced block: (out_c/n, in_c/n, k1, k2)
+            weight = torch.zeros(self.shape, device=device)
+            for i in range(self.n_split):
+                wa = wa_list[i]  # (r, in_c/n, *kernel)
+                wb = wb_list[i]  # (out_c/n, r, 1, ...)
+                wa_2d = wa.view(wa.size(0), -1)   # (r, in_c/n * k_size)
+                wb_2d = wb.view(wb.size(0), -1)   # (out_c/n, r)
+                block_2d = wb_2d @ wa_2d           # (out_c/n, in_c/n * k_size)
+                block = block_2d.view(self.mini_out_features, self.mini_in_features, *self.shape[2:])
+                out_s = i * self.mini_out_features
+                in_s = i * self.mini_in_features
+                weight[out_s:out_s + self.mini_out_features,
+                       in_s:in_s + self.mini_in_features] = block
+        else:
+            wa_big = torch.block_diag(*wa_list)
+            wb_big = torch.block_diag(*wb_list)
+            weight = wb_big @ wa_big
+            weight = weight.view(self.shape)
+
+        if self.training and self.rank_dropout:
+            drop = (torch.rand(weight.size(0), device=device) > self.rank_dropout).to(
+                weight.dtype
+            )
+            drop = drop.view(-1, *[1] * len(weight.shape[1:]))
+            if self.rank_dropout_scale:
+                drop /= drop.mean()
+            weight *= drop
+
+        return weight * self.scalar.to(device)
+
+    def _compute_diff_weight_single(self, device, dtype):
+        """Diff weight computation with block-diagonal support."""
+        if self.n_split <= 1:
+            return super()._compute_diff_weight_single(device, dtype)
+
+        wa_list = [
+            self._orthogonalize(a).to(device=device, dtype=dtype) for a in self._mini_lora_A
+        ]
+        wb_list = [
+            self._orthogonalize(b).to(device=device, dtype=dtype) for b in self._mini_lora_B
+        ]
+
+        if self.isconv:
+            diff_weight = torch.zeros(self.shape, device=device, dtype=dtype)
+            for i in range(self.n_split):
+                wa = wa_list[i]
+                wb = wb_list[i]
+                wa_2d = wa.view(wa.size(0), -1)
+                wb_2d = wb.view(wb.size(0), -1)
+                block_2d = wb_2d @ wa_2d
+                block = block_2d.view(self.mini_out_features, self.mini_in_features, *self.shape[2:])
+                out_s = i * self.mini_out_features
+                in_s = i * self.mini_in_features
+                diff_weight[out_s:out_s + self.mini_out_features,
+                             in_s:in_s + self.mini_in_features] = block
+        else:
+            wa_big = torch.block_diag(*wa_list)
+            wb_big = torch.block_diag(*wb_list)
+            diff_weight = wb_big @ wa_big
+            diff_weight = diff_weight.view(self.shape)
+
+        if self.training and self.rank_dropout:
+            drop = (torch.rand(diff_weight.size(0), device=device) > self.rank_dropout).to(
+                diff_weight.dtype
+            )
+            drop = drop.view(-1, *[1] * len(diff_weight.shape[1:]))
+            if self.rank_dropout_scale:
+                drop /= drop.mean()
+            diff_weight *= drop
+
+        diff_weight = (diff_weight * self.scalar.to(device=device)).to(dtype=dtype) * self.scale
+        return diff_weight
+
+    # ------------------------------------------------------------------
+    # Bypass forward (override for block-diagonal)
+    # ------------------------------------------------------------------
+
+    def _bypass_forward_diff_single(self, x, scale=1):
+        """Bypass forward with block-diagonal support."""
+        if self.n_split <= 1:
+            return super()._bypass_forward_diff_single(x, scale)
+
+        device = x.device
+        dtype = x.dtype
+
+        if self.isconv:
+            # Conv: for-loop over blocks, slice input channels, concat output channels
+            up_parts = []
+            for i in range(self.n_split):
+                mini_x = x[:, i * self.mini_in_features:(i + 1) * self.mini_in_features, ...]
+                wa = self._orthogonalize(self._mini_lora_A[i]).to(device=device, dtype=dtype)
+                wb = self._orthogonalize(self._mini_lora_B[i]).to(device=device, dtype=dtype)
+                mid = self.down_op(
+                    mini_x, wa,
+                    bias=None,
+                    stride=self.lora_down.stride,
+                    padding=self.lora_down.padding,
+                    dilation=self.lora_down.dilation,
+                    groups=self.lora_down.groups,
+                )
+                if self.rank_dropout and self.training:
+                    drop = (
+                        torch.rand(self.mini_lora_rank, device=device) > self.rank_dropout
+                    ).to(dtype)
+                    if self.rank_dropout_scale:
+                        drop /= drop.mean()
+                    drop = drop.view(1, -1, *([1] * (mid.dim() - 2)))
+                    mid = mid * drop
+                up_i = self.up_op(
+                    mid, wb,
+                    bias=None,
+                    stride=self.lora_up.stride,
+                    padding=self.lora_up.padding,
+                    dilation=self.lora_up.dilation,
+                    groups=self.lora_up.groups,
+                )
+                up_parts.append(up_i)
+            up = torch.cat(up_parts, dim=1)  # concat along channel dim
+        else:
+            # Linear: assemble block-diag then forward as two matmuls
+            wa_list = [
+                self._orthogonalize(a).to(device=device, dtype=dtype) for a in self._mini_lora_A
+            ]
+            wb_list = [
+                self._orthogonalize(b).to(device=device, dtype=dtype) for b in self._mini_lora_B
+            ]
+            wa_big = torch.block_diag(*wa_list)  # (n*r, d_in)
+            wb_big = torch.block_diag(*wb_list)  # (d_out, n*r)
+            mid = F.linear(x, wa_big)
+
+            if self.rank_dropout and self.training:
+                drop = (
+                    torch.rand(self.lora_dim, device=device) > self.rank_dropout
+                ).to(dtype)
+                if self.rank_dropout_scale:
+                    drop /= drop.mean()
+                if (dims := len(x.shape)) == 4:
+                    drop = drop.view(1, -1, 1, 1)
+                else:
+                    drop = drop.view(*[1] * (dims - 1), -1)
+                mid = mid * drop
+
+            up = F.linear(mid, wb_big)
+
+        return self.drop(up * self.scalar.to(device) * self.scale * scale)
+
+    # ------------------------------------------------------------------
+    # Norm utilities (override for block-diagonal)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def apply_max_norm(self, max_norm, device=None):
+        if self.n_split <= 1:
+            return super().apply_max_norm(max_norm, device)
+
+        orig_norm = self.make_weight(device).norm() * self.scale
+        norm = torch.clamp(orig_norm, max_norm / 2)
+        desired = torch.clamp(norm, max=max_norm)
+        ratio = desired.cpu() / norm.cpu()
+
+        scaled = norm != desired
+        if scaled:
+            self.scalar *= ratio
+            return scaled, orig_norm * ratio
+        else:
+            return 0, orig_norm
+
+    @torch.no_grad()
+    def get_norm(self, device=None):
+        if self.n_split <= 1:
+            return super().get_norm(device)
+        return self.make_weight(device).norm()
+
+    # ------------------------------------------------------------------
+    # Serialization (override for block-diagonal)
+    # ------------------------------------------------------------------
+
+    def custom_state_dict(self):
+        """Serialization with block-diagonal weight support."""
+        if self.n_split <= 1:
+            return super().custom_state_dict()
+
+        destination = {}
+        if self.wd:
+            destination["dora_scale"] = self.dora_scale
+        destination["alpha"] = self.alpha
+        destination["n_split"] = torch.tensor(self.n_split)
+
+        for i in range(self.n_split):
+            scalar_val = self.scalar.to(
+                device=self._mini_lora_B[i].device, non_blocking=True
+            )
+            destination[f"lora_up_block{i}.weight"] = (
+                self._mini_lora_B[i] * scalar_val
+            )
+            destination[f"lora_down_block{i}.weight"] = self._mini_lora_A[i]
+
+        if self.tucker:
+            destination["lora_mid.weight"] = self.lora_mid.weight
+
+        return destination
+
+    def load_weight_prehook(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Pre-hook: intercept block-diagonal state dict keys before loading."""
+        # Check for block-diagonal checkpoint
+        n_split_key = f"{prefix}n_split"
+        block_keys_present = (
+            f"{prefix}lora_up_block0.weight" in state_dict
+            or f"{prefix}lora_down_block0.weight" in state_dict
+        )
+
+        if not block_keys_present:
+            return  # Not a block-diagonal checkpoint, let parent handle
+
+        # Extract n_split
+        n_split = 1
+        if n_split_key in state_dict:
+            n_split = int(state_dict.pop(n_split_key).item())
+
+        # Extract block weights and build mini-A/B
+        mini_a_list = []
+        mini_b_list = []
+        for i in range(n_split):
+            a_key = f"{prefix}lora_down_block{i}.weight"
+            b_key = f"{prefix}lora_up_block{i}.weight"
+            if a_key in state_dict and b_key in state_dict:
+                mini_a_list.append(state_dict.pop(a_key))
+                # lora_up was saved with scalar baked in; we store scalar separately
+                mini_b_list.append(state_dict.pop(b_key))
+            else:
+                break
+
+        if len(mini_a_list) == n_split and len(mini_b_list) == n_split:
+            # Restore block-diagonal structure
+            self.n_split = n_split
+            r = mini_a_list[0].size(0) if mini_a_list[0].dim() >= 2 else 0
+            in_features = self.shape[1] if len(self.shape) >= 2 else self.shape[0]
+            out_features = self.shape[0] if len(self.shape) >= 2 else 0
+            self.mini_lora_rank = r
+            self.mini_in_features = in_features // n_split
+            self.mini_out_features = out_features // n_split
+            self.lora_dim = r * n_split
+
+            self._mini_lora_A = nn.ParameterList()
+            self._mini_lora_B = nn.ParameterList()
+            for i in range(n_split):
+                self._mini_lora_A.append(
+                    nn.Parameter(mini_a_list[i], requires_grad=True)
+                )
+                self._mini_lora_B.append(
+                    nn.Parameter(mini_b_list[i], requires_grad=True)
+                )
+            # Reset scalar to 1 since it was baked into lora_up during save
+            if isinstance(self.scalar, nn.Parameter):
+                self.scalar.data.fill_(1.0)
+            elif hasattr(self, "scalar"):
+                self.scalar.fill_(1.0)
+
+            # Remove block keys from unexpected (they were popped from state_dict)
+            for i in range(n_split):
+                a_key = f"{prefix}lora_down_block{i}.weight"
+                b_key = f"{prefix}lora_up_block{i}.weight"
+                if a_key in unexpected_keys:
+                    unexpected_keys.remove(a_key)
+                if b_key in unexpected_keys:
+                    unexpected_keys.remove(b_key)
+            if n_split_key in unexpected_keys:
+                unexpected_keys.remove(n_split_key)
+
+    def load_weight_hook(self, module: nn.Module, incompatible_keys):
+        """Handle block-diagonal weight loading (post-hook)."""
+        missing_keys = incompatible_keys.missing_keys
+
+        # Allow missing keys that are safe to be absent
+        pissa_keys = {"pissa_A_init", "pissa_B_init", "pissa_converted"}
+        olora_keys = {"olora_task_id"}
+        block_keys = {"n_split"}
+        for key in list(missing_keys):
+            if (
+                "scalar" in key
+                or any(pk in key for pk in pissa_keys)
+                or any(ok in key for ok in olora_keys)
+                or any(bk in key for bk in block_keys)
+                or ("lora_down_block" in key)
+                or ("lora_up_block" in key)
+                or ("lora_down_task" in key)
+                or ("lora_up_task" in key)
+                or ("lora_mid_task" in key)
+            ):
+                del missing_keys[missing_keys.index(key)]
+
+        # Handle scalar
+        if isinstance(self.scalar, nn.Parameter):
+            self.scalar.data.copy_(torch.ones_like(self.scalar))
+        elif getattr(self, "scalar", None) is not None:
+            self.scalar.copy_(torch.ones_like(self.scalar))
+        else:
+            self.register_buffer(
+                "scalar", torch.ones_like(self.scalar), persistent=False
+            )
+
+        # Initialize PiSSA buffers if not loaded
+        if not hasattr(self, "pissa_A_init") or self.pissa_A_init is None:
+            self.pissa_A_init = None
+        if not hasattr(self, "pissa_B_init") or self.pissa_B_init is None:
+            self.pissa_B_init = None
+
+        # Initialize O-LoRA task ID
+        if not hasattr(self, "olora_task_id"):
+            self.olora_task_id = 0
+
+    @classmethod
+    def make_module_from_state_dict(
+        cls, lora_name, orig_module, up, down, mid, alpha, dora_scale, n_split=None
+    ):
+        """Create module from state dict, handling block-diagonal checkpoints."""
+        # If n_split is provided, it's a block-diagonal checkpoint
+        if n_split is not None and n_split > 1:
+            # Block-diagonal case handled by custom loading path
+            # For now, delegate to parent with fallback
+            pass
+
+        module = cls(
+            lora_name,
+            orig_module,
+            1.0,
+            down.size(0) if down.dim() >= 2 else 0,
+            float(alpha),
+            use_tucker=mid is not None,
+            weight_decompose=dora_scale is not None,
+        )
+        if hasattr(module, "n_split") and module.n_split <= 1:
+            module.lora_up.weight.data.copy_(up)
+            module.lora_down.weight.data.copy_(down)
+        if mid is not None:
+            module.lora_mid.weight.data.copy_(mid)
+        if dora_scale is not None:
+            module.dora_scale.copy_(dora_scale)
+        return module
+
+    # ------------------------------------------------------------------
+    # Convenience properties
+    # ------------------------------------------------------------------
+
+    @property
+    def in_features(self) -> int:
+        """Input feature dimension."""
+        return self.shape[1] if len(self.shape) >= 2 else self.shape[0]
+
+    @property
+    def out_features(self) -> int:
+        """Output feature dimension."""
+        return self.shape[0] if len(self.shape) >= 2 else 0
+
+
 class GoRAModule(LoConModule):
     """GoRA: Gradient-driven Adaptive Low Rank Adaptation.
 

@@ -3,7 +3,7 @@ import torch.nn as nn
 
 from .base import LycorisBaseModule
 from .abba import AbbaModule
-from .locon import LoConModule, GoRAModule
+from .locon import LoConModule, GoRAModule, RaLoRAModule
 from .loha import LohaModule
 from .lokr import LokrModule
 from .full import FullModule
@@ -22,6 +22,7 @@ MODULE_LIST = [
     AbbaModule,
     LoConModule,
     GoRAModule,
+    RaLoRAModule,
     LohaModule,
     IA3Module,
     LokrModule,

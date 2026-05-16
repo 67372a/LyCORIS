@@ -16,7 +16,7 @@ import math
 
 from .utils import precalculate_safetensors_hashes
 from .modules.abba import AbbaModule
-from .modules.locon import LoConModule, GoRAModule
+from .modules.locon import LoConModule, GoRAModule, RaLoRAModule
 from .modules.loha import LohaModule
 from .modules.ia3 import IA3Module
 from .modules.lokr import LokrModule
@@ -67,6 +67,7 @@ network_module_dict = {
     "lora": LoConModule,
     "locon": LoConModule,
     "gora": GoRAModule,
+    "ralora": RaLoRAModule,
     "ia3": IA3Module,
     "loha": LohaModule,
     "lokr": LokrModule,
@@ -264,6 +265,55 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
             )
             use_scalar = False
 
+    # RaLoRA parameters
+    ralora_n_max = int(kwargs.get("ralora_n_max", 32))
+    ralora_pro = str_bool(kwargs.get("ralora_pro", False))
+    ralora_ref_rank = int(kwargs.get("ralora_ref_rank", linear_dim) or linear_dim)
+    # Paper recommended defaults for RaLoRA-Pro: r_min = r_ref/2, r_max = 2*r_ref
+    ralora_min_rank = kwargs.get("ralora_min_rank", None)
+    ralora_max_rank = kwargs.get("ralora_max_rank", None)
+    if ralora_pro:
+        if ralora_min_rank is None:
+            ralora_min_rank = max(1, linear_dim // 2)
+        if ralora_max_rank is None:
+            ralora_max_rank = linear_dim * 2
+    ralora_dynamic_scaling = str_bool(kwargs.get("ralora_dynamic_scaling", False))
+    ralora_rank_stabilize = str_bool(kwargs.get("ralora_rank_stabilize", False))
+    ralora_erank_method = kwargs.get("ralora_erank_method", "entropy")
+    ralora_svd_threshold = float(kwargs.get("ralora_svd_threshold", 0.0))
+    ralora_cumulative_variance = float(kwargs.get("ralora_cumulative_variance", 0.0))
+    ralora_forward_method = kwargs.get("ralora_forward_method", "concat")
+
+    if algo == "ralora":
+        logger.info("RaLoRA: Rank-Aligned LoRA with Gradient Intrinsic Dimensionality")
+        logger.info(f"  ref_rank={ralora_ref_rank}, n_max={ralora_n_max}")
+        logger.info(f"  pro_mode={ralora_pro}, erank_method={ralora_erank_method}")
+        if ralora_pro:
+            logger.info(f"  min_rank={ralora_min_rank}, max_rank={ralora_max_rank}")
+            logger.info("  RaLoRA-Pro: Dual alignment (intra-layer GID + inter-layer importance)")
+
+        # RaLora: alpha should equal dim (paper convention: scale = dim/√r)
+        if linear_alpha != linear_dim:
+            logger.warning(
+                f"RaLoRA: linear_alpha ({linear_alpha}) != lora_dim ({linear_dim}). "
+                f"Setting linear_alpha = lora_dim per paper convention."
+            )
+            linear_alpha = linear_dim
+        if conv_dim > 0 and conv_alpha != conv_dim:
+            logger.warning(
+                f"RaLoRA: conv_alpha ({conv_alpha}) != conv_dim ({conv_dim}). "
+                f"Setting conv_alpha = conv_dim per paper convention."
+            )
+            conv_alpha = conv_dim
+
+        if use_scalar:
+            logger.warning(
+                "RaLoRA: use_scalar=True is not recommended. "
+                "The learnable scalar destabilizes importance convergence. "
+                "use_scalar set to False."
+            )
+            use_scalar = False
+
     preset = kwargs.get("preset", "full")
     if preset not in PRESET:
         preset = read_preset(preset)
@@ -353,6 +403,18 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
         gora_weight_a_init=gora_weight_a_init,
         gora_scale_by_lr=gora_scale_by_lr,
         gora_lr=gora_lr,
+        # RaLoRA parameters
+        ralora_n_max=ralora_n_max,
+        ralora_pro=ralora_pro,
+        ralora_ref_rank=ralora_ref_rank,
+        ralora_min_rank=ralora_min_rank,
+        ralora_max_rank=ralora_max_rank,
+        ralora_dynamic_scaling=ralora_dynamic_scaling,
+        ralora_rank_stabilize=ralora_rank_stabilize,
+        ralora_erank_method=ralora_erank_method,
+        ralora_svd_threshold=ralora_svd_threshold,
+        ralora_cumulative_variance=ralora_cumulative_variance,
+        ralora_forward_method=ralora_forward_method,
     )
 
     if torch_compile:
@@ -532,6 +594,28 @@ class LycorisNetwork(torch.nn.Module):
             self._gora_kwargs['scaling_alpha'] = alpha
         else:
             self._gora_kwargs = {}
+
+        # RaLoRA configuration (extracted from root_kwargs for prepare_ralora)
+        self._ralora_needs_init = (
+            network_module == "ralora" and not init_only
+        )
+        if self._ralora_needs_init:
+            self._ralora_kwargs = {
+                k: kwargs[k] for k in (
+                    'ralora_n_max', 'ralora_pro', 'ralora_ref_rank',
+                    'ralora_min_rank', 'ralora_max_rank',
+                    'ralora_dynamic_scaling', 'ralora_rank_stabilize',
+                    'ralora_erank_method', 'ralora_svd_threshold',
+                    'ralora_cumulative_variance', 'ralora_forward_method',
+                ) if k in kwargs and kwargs[k] is not None
+            }
+            self._ralora_kwargs.setdefault('ralora_ref_rank', lora_dim)
+            self._ralora_kwargs.setdefault('ralora_n_max', 32)
+            self._ralora_kwargs.setdefault('ralora_pro', False)
+            self._ralora_kwargs['lora_dim'] = lora_dim
+            self._ralora_kwargs['alpha'] = alpha
+        else:
+            self._ralora_kwargs = {}
 
         if init_only:
             self.multiplier = 1

@@ -21,8 +21,7 @@ This project originated from LoCon (see archive branch).
 
 ## Algorithm Overview
 
-LyCORIS currently contains LoRA (LoCon), LoHa, LoKr, (IA)^3, DyLoRA, Native fine-tuning (aka dreambooth).
-GLoRA and GLoKr are coming soon.
+LyCORIS currently contains LoRA (LoCon), LoHa, LoKr, (IA)^3, DyLoRA, GLoRA, GLoKr, T-LoRA, GoRA, RaLoRA/RaLoRA-Pro, and Native fine-tuning (aka dreambooth).
 Please check [List of Implemented Algorithms](docs/Algo-List.md) and [Guidelines](docs/Guidelines.md) for more details.
 
 A simple comparison of some of these methods are provided below (to be taken with a grain of salt)
@@ -83,14 +82,14 @@ In any case, please install this package in the corresponding virtual environmen
   ```bash
   uv add lycoris-lora
   # or with kohya support
-  uv add "lycoris-lora[kohya]"
+  uv add "lycoris-lora"
   ```
 - with pip
 
   ```bash
   pip install lycoris-lora
   # or with kohya support
-  pip install "lycoris-lora[kohya]"
+  pip install "lycoris-lora"
   ```
 - from source
 
@@ -98,8 +97,6 @@ In any case, please install this package in the corresponding virtual environmen
   git clone https://github.com/KohakuBlueleaf/LyCORIS
   cd LyCORIS
   uv sync
-  # or with kohya support
-  uv sync --extra kohya
   ```
 
 A detailed description of the network arguments is provided in [docs/Network-Args.md](docs/Network-Args.md).
@@ -117,6 +114,7 @@ You can use this package's kohya module to run kohya's training script to train 
     --network_args "conv_dim=DIM_FOR_CONV" "conv_alpha=ALPHA_FOR_CONV" \
     "dropout=DROPOUT_RATE" "algo=locon" \
   ```
+
 - with `toml` files
 
   ```bash
@@ -269,6 +267,14 @@ See [docs/Conversion-scripts.md](docs/Conversion-scripts.md) for more informatio
 ## Change Log
 
 For full log, please see [Change.md](Change.md)
+
+### 2025/06 (dev branch)
+
+#### New Features
+
+* **RaLoRA / RaLoRA-Pro**: Rank-Aligned LoRA with [Gradient Intrinsic Dimensionality Alignment](https://openreview.net/forum?id=kObvnQ6pUx) (ICLR 2026). Adaptively aligns LoRA adapter capacity with per-layer gradient intrinsic dimensionality using block-diagonal decomposition. RaLoRA-Pro adds inter-layer rank reallocation guided by loss sensitivity. Triggered by `algo=ralora`.
+  * See [docs/Algo-List.md](docs/Algo-List.md) and [docs/Algo-Details.md](docs/Algo-Details.md) for details.
+  * Requires a precomputation phase via `RaLoRAModule.precompute_and_init()` before training.
 
 ### 2025/04/23 update to 3.2.0
 

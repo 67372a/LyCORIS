@@ -111,3 +111,19 @@ However, newer methods may only be available in the latest release / the dev bra
 * Training frameworks must call `set_timestep_mask()` before each forward pass.
 * Residual subtraction ensures zero-shot preservation (LoRA contributes nothing at initialization).
 * Ref: [T-LoRA: Timestep-aware LoRA for Diffusion Models](https://github.com/rosinality/T-LoRA)
+
+### RaLoRA / RaLoRA-Pro
+
+* Triggered by `algo=ralora`
+* Rank-Aligned LoRA: adaptively aligns LoRA adapter capacity with the gradient intrinsic dimensionality (GID) of each layer.
+* Uses block-diagonal decomposition to expand equivalent rank without increasing parameter count.
+* **RaLoRA** (default): All layers share the same rank `r`, but the number of diagonal blocks `n_l` varies per layer based on GID.
+* **RaLoRA-Pro** (`ralora_pro=True`): Both rank `r_l` and blocks `n_l` vary per layer — dual intra/inter-layer alignment guided by GID + loss sensitivity.
+* Requires a precomputation phase before training (via `RaLoRAModule.precompute_and_init()`).
+* Recommended settings:
+  * dim: 8 (reference rank)
+  * alpha: equal to dim (paper convention)
+  * ralora_n_max: 16-64 (max block expansion factor)
+  * ralora_erank_method: "entropy" (default), "threshold", or "cumulative_variance"
+* Note: Tucker decomposition (`use_tucker=True`) is not supported with block-diagonal structure.
+* Ref: [Gradient Intrinsic Dimensionality Alignment](https://openreview.net/forum?id=kObvnQ6pUx) (ICLR 2026)

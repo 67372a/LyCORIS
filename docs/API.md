@@ -33,6 +33,8 @@
 * `LoConModule`
 * `LohaModule`
 * `LokrModule`
+* `GoRAModule`
+* `RaLoRAModule`
 * `DyLoraModule`
 * `GLoRAModule`
 * `NormModule`

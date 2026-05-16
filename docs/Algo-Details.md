@@ -228,3 +228,80 @@ Input → Q (orthogonal projection) → scale by λ*mask → P (orthogonal proje
 </p>
 
 With residual subtraction from base state to ensure zero contribution at initialization.
+
+## RaLoRA / RaLoRA-Pro
+
+### Motivation
+
+Standard LoRA uses a fixed low rank (typically r=8) for all layers. However, the *gradient intrinsic dimensionality* (GID) — the number of effective update directions in full fine-tuning gradients — can be 30-100× larger. This mismatch between LoRA's low-rank subspace and the true gradient space limits expressiveness, especially on complex tasks.
+
+RaLoRA addresses this by **structurally aligning** each adapter's capacity with the per-layer GID, without increasing total parameter count.
+
+### RaLoRA: Gradient Intrinsic Dimensionality Alignment
+
+RaLoRA generalizes LoRA using **block-diagonal decomposition**. The LoRA matrices A and B are split into n_l mini-blocks:
+
+```
+ΔW = diag(B₁A₁, B₂A₂, ..., B_nA_n)
+```
+
+where A_i ∈ R^(r × d_in/n_l) and B_i ∈ R^(d_out/n_l × r).
+
+The number of blocks n_l is determined adaptively per layer:
+
+```
+e_l = ⌊log₂(erank(G_l) / r)⌋
+n_l = 2^clip(e_l, 0, log₂(n_max))
+```
+
+**Equivalent rank = n_l × r**, with the same parameter count as vanilla LoRA: r(d_in + d_out).
+
+When GID is low, n_l=1 (identical to vanilla LoRA, focusing on dominant directions). When GID is high, n_l increases, trading per-direction precision for broader expressivity.
+
+### RaLoRA-Pro: Dual Alignment
+
+RaLoRA-Pro extends RaLoRA by also reallocating the rank budget across layers guided by **loss sensitivity**:
+
+```
+I(W_l) = avg(|W_l ⊙ G_l|)
+α_l = I_l / Σ_k I_k
+r_l = clip(round(P_total × α_l / √(d_in^l + d_out^l)), r_min, r_max)
+```
+
+This provides **dual alignment**: intra-layer (GID → n_l) and inter-layer (importance → r_l).
+
+### Precomputation Phase
+
+RaLoRA requires a one-time precomputation phase before training to:
+
+1. Collect gradients on frozen pretrained weights over N mini-batches
+2. Compute per-layer GID via entropy-based effective rank (or alternative methods)
+3. (RaLoRA-Pro) Compute importance scores and allocate per-layer ranks
+4. Compute n_l per layer and initialize block-diagonal weights
+
+### Usage
+
+```python
+from lycoris.modules.locon import RaLoRAModule
+
+# Create RaLoRA network
+lycoris_net = create_lycoris(model, 1.0, linear_dim=8, linear_alpha=8, algo="ralora",
+                             ralora_n_max=32, ralora_pro=True)
+lycoris_net.apply_to()
+
+# Run precomputation (ONCE before training)
+RaLoRAModule.precompute_and_init(
+    model=model,
+    dataloader=train_dataloader,
+    forward_fn=lambda model, batch: model(**batch)[0],
+    max_steps=64,
+    save_dir="./ralora_metadata"
+)
+
+# Now start normal training loop
+```
+
+### See Also
+
+- Ref: [Gradient Intrinsic Dimensionality Alignment](https://openreview.net/forum?id=kObvnQ6pUx) (ICLR 2026)
+- Code: `lycoris/modules/locon.py` (`RaLoRAModule`), `lycoris/modules/ralora_utils.py`

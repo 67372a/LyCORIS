@@ -139,3 +139,33 @@ Arguments to put in `network_args` for kohya sd scripts
 - Valid for T-LoRA
 - Default: 0
 - For multi-network scenarios, allows different networks to use different timestep masks
+
+### RaLoRA-Specific Arguments
+
+These arguments control the RaLoRA/RaLoRA-Pro algorithm behavior. They are valid only when `algo=ralora`.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `ralora_n_max` | int | 32 | Maximum block expansion factor (n_max in paper). Controls the max number of diagonal blocks. Recommended to search over {16, 32, 64} for best results. |
+| `ralora_pro` | bool | False | Enable RaLoRA-Pro mode: dual alignment with both intra-layer GID and inter-layer importance. |
+| `ralora_ref_rank` | int | lora_dim | Reference rank for RaLoRA-Pro parameter budget calculation. |
+| `ralora_min_rank` | int | dim//2 (pro) | Minimum rank per layer (RaLoRA-Pro only). Paper default: r_ref/2. |
+| `ralora_max_rank` | int | dim×2 (pro) | Maximum rank per layer (RaLoRA-Pro only). Paper default: 2×r_ref. |
+| `ralora_dynamic_scaling` | bool | False | Use per-layer rank (vs. average rank) for the scaling factor α/r. |
+| `ralora_rank_stabilize` | bool | False | Apply √r scaling stabilization (rsLoRA-like). |
+| `ralora_erank_method` | str | "entropy" | GID estimation method: "entropy" (entropy-based effective rank, recommended), "threshold" (count σ > ε), or "cumulative_variance". |
+| `ralora_svd_threshold` | float | 0.0 | Threshold ε for the "threshold" erank method (>0 enables this method). |
+| `ralora_cumulative_variance` | float | 0.0 | Variance fraction threshold for "cumulative_variance" method (>0 enables). |
+| `ralora_forward_method` | str | "concat" | Block-diagonal forward strategy: "concat" (block_diag assembly) or "einsum" (reshape + batched einsum). |
+
+**Recommended Configuration (from paper):**
+- `algo=ralora` with `network_dim=8`, `network_alpha=8` (alpha = dim)
+- For RaLoRA: `ralora_n_max=32` (default, search 16-64 for best)
+- For RaLoRA-Pro: add `ralora_pro=True` (min/max rank set automatically to dim/2 and dim×2)
+- `ralora_erank_method="entropy"` (default, most robust)
+
+**Notes:**
+- RaLoRA requires a precomputation phase before training via `RaLoRAModule.precompute_and_init()`
+- In kohya scripts, the precomputation must be triggered manually after network creation
+- Tucker decomposition (`use_tucker=True`) falls back to n_split=1 for RaLoRA
+- For best results, set `alpha` equal to `network_dim` (paper convention)
