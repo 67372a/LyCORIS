@@ -212,6 +212,21 @@ PRESET = {
         "text_encoder_target_name": [],
         "exclude_name": [r".*(_modulation|_embedder|final_layer).*"],
     },
+    "anima-qwen": {
+        "enable_conv": False,
+        "unet_target_module": [
+            "Block"
+        ],
+        "unet_target_name": [],
+        "text_encoder_target_module": [
+            "Qwen3Attention",
+            "Qwen3MLP",
+            "Qwen3SdpaAttention",
+            "Qwen3FlashAttention2"
+            ],
+        "text_encoder_target_name": [],
+        "exclude_name": [r".*(_modulation|_embedder|final_layer).*"],
+    },
     "anima-inpaint": {
         "enable_conv": False,
         "unet_target_module": [
