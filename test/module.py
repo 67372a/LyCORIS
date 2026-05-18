@@ -198,13 +198,13 @@ class LycorisModuleTests(unittest.TestCase):
                 multiplier=1,
                 lora_dim=4,
                 alpha=1,
-                orthogonal=True,
+                orthogonalize=True,
                 use_scalar=False,
             )
             self.assertIsInstance(
                 net.scalar,
                 nn.Parameter,
-                f"{module_cls.__name__}: orthogonal should force scalar to be nn.Parameter",
+                f"{module_cls.__name__}: orthogonalize should force scalar to be nn.Parameter",
             )
             net.restore()
 
