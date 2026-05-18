@@ -119,7 +119,7 @@ class LoConModule(LycorisBaseModule):
             use_tucker = use_tucker and any(i != 1 for i in k_size)
             self.down_op = self.op
             self.up_op = self.op
-            if use_tucker and any(i != 1 for i in k_size):
+            if use_tucker:
                 self.lora_down = self.module(in_dim, lora_dim, 1, bias=False)
                 self.lora_mid = self.module(
                     lora_dim, lora_dim, k_size, stride, padding, bias=False
@@ -161,7 +161,10 @@ class LoConModule(LycorisBaseModule):
         self.wd = weight_decompose
         self.wd_on_output = wd_on_output
         if self.wd:
-            org_weight = org_module.weight.cpu().clone().float()
+            # Compute norm on the original device to avoid CPU↔GPU transfer.
+            # torch.norm is read-only so no clone needed; .float() creates a
+            # new tensor for numerical precision.
+            org_weight = org_module.weight.data.float()
             self.dora_norm_dims = org_weight.dim() - 1
             if self.wd_on_output:
                 self.dora_scale = nn.Parameter(
@@ -185,8 +188,8 @@ class LoConModule(LycorisBaseModule):
         if dropout and self.wd:
             log_wd()
 
-        if type(alpha) == torch.Tensor:
-            alpha = alpha.detach().float().numpy()  # without casting, bf16 causes error
+        if isinstance(alpha,torch.Tensor):
+            alpha = alpha.detach().float().item()  # without casting, bf16 causes error
         alpha = lora_dim if alpha is None or alpha == 0 else alpha
 
         r_factor = lora_dim
@@ -426,21 +429,23 @@ class LoConModule(LycorisBaseModule):
             module.dora_scale.copy_(dora_scale)
         return module
 
+    @staticmethod
+    def _should_skip_missing_key(key: str) -> bool:
+        """Check if a missing key is expected to be absent (e.g., optional features)."""
+        if "scalar" in key:
+            return True
+        # O(n) substring checks — fast for short key strings
+        for tag in ("pissa_A_init", "pissa_B_init", "pissa_converted",
+                     "olora_task_id",
+                     "lora_down_task", "lora_up_task", "lora_mid_task"):
+            if tag in key:
+                return True
+        return False
+
     def load_weight_hook(self, module: nn.Module, incompatible_keys):
         missing_keys = incompatible_keys.missing_keys
-        # Allow missing keys that may not be present in all checkpoint variants
-        pissa_keys = {"pissa_A_init", "pissa_B_init", "pissa_converted"}
-        olora_keys = {"olora_task_id"}
-        for key in list(missing_keys):
-            if (
-                "scalar" in key
-                or any(pk in key for pk in pissa_keys)
-                or any(ok in key for ok in olora_keys)
-                or ("lora_down_task" in key)
-                or ("lora_up_task" in key)
-                or ("lora_mid_task" in key)
-            ):
-                del missing_keys[missing_keys.index(key)]
+        # Filter expected missing keys in O(n) instead of O(n²)
+        missing_keys[:] = [k for k in missing_keys if not self._should_skip_missing_key(k)]
         if isinstance(self.scalar, nn.Parameter):
             self.scalar.data.copy_(torch.ones_like(self.scalar))
         elif getattr(self, "scalar", None) is not None:
@@ -458,6 +463,40 @@ class LoConModule(LycorisBaseModule):
         if not hasattr(self, "olora_task_id"):
             self.olora_task_id = 0
 
+    def _apply_rank_dropout(self, weight, device):
+        """Apply rank dropout to a weight tensor.
+
+        Extracted from inline code to eliminate duplication across
+        _make_weight_single, _make_weight_multitask,
+        _compute_diff_weight_single, _compute_diff_weight_multitask.
+
+        Args:
+            weight: Tensor whose first dimension is the rank/dropout dimension.
+            device: Target device for the dropout mask.
+
+        Returns:
+            Weight with dropout applied, or the original weight unchanged.
+        """
+        if not (self.training and self.rank_dropout):
+            return weight
+        drop = (torch.rand(weight.size(0), device=device) > self.rank_dropout).to(
+            weight.dtype
+        )
+        drop = drop.view(-1, *[1] * len(weight.shape[1:]))
+        if self.rank_dropout_scale:
+            drop /= drop.mean()
+        return weight * drop
+
+    def _maybe_orthogonalize(self, weight):
+        """Orthogonalize only if use_orthogonal_weights is active.
+
+        Avoids the function-call + branch overhead of _orthogonalize() in the
+        common case where orthogonalization is disabled (the fast path).
+        """
+        if self.use_orthogonal_weights and self.training:
+            return self._orthogonalize(weight)
+        return weight
+
     def make_weight(self, device=None):
         if self.olora:
             return self._make_weight_multitask(device)
@@ -465,10 +504,10 @@ class LoConModule(LycorisBaseModule):
 
     def _make_weight_single(self, device=None):
         """Original single-task weight computation (used when olora=False)."""
-        wa = self._orthogonalize(self.lora_up.weight.to(device))
-        wb = self._orthogonalize(self.lora_down.weight.to(device))
+        wa = self._maybe_orthogonalize(self.lora_up.weight.to(device))
+        wb = self._maybe_orthogonalize(self.lora_down.weight.to(device))
         if self.tucker:
-            t = self._orthogonalize(self.lora_mid.weight.to(device))
+            t = self._maybe_orthogonalize(self.lora_mid.weight.to(device))
             wa = wa.view(wa.size(0), -1).transpose(0, 1)
             wb = wb.view(wb.size(0), -1)
             weight = rebuild_tucker(t, wa, wb)
@@ -476,14 +515,7 @@ class LoConModule(LycorisBaseModule):
             weight = wa.view(wa.size(0), -1) @ wb.view(wb.size(0), -1)
 
         weight = weight.view(self.shape)
-        if self.training and self.rank_dropout:
-            drop = (torch.rand(weight.size(0), device=device) > self.rank_dropout).to(
-                weight.dtype
-            )
-            drop = drop.view(-1, *[1] * len(weight.shape[1:]))
-            if self.rank_dropout_scale:
-                drop /= drop.mean()
-            weight *= drop
+        weight = self._apply_rank_dropout(weight, device)
 
         return weight * self.scalar.to(device)
 
@@ -492,24 +524,17 @@ class LoConModule(LycorisBaseModule):
         total = None
         num_tasks = len(self.lora_down_modules)
         for idx in range(num_tasks):
-            wa = self._orthogonalize(self.lora_up_modules[idx].weight.to(device))
-            wb = self._orthogonalize(self.lora_down_modules[idx].weight.to(device))
+            wa = self._maybe_orthogonalize(self.lora_up_modules[idx].weight.to(device))
+            wb = self._maybe_orthogonalize(self.lora_down_modules[idx].weight.to(device))
             if self.tucker and len(self.lora_mid_modules) > idx:
-                t = self._orthogonalize(self.lora_mid_modules[idx].weight.to(device))
+                t = self._maybe_orthogonalize(self.lora_mid_modules[idx].weight.to(device))
                 wa = wa.view(wa.size(0), -1).transpose(0, 1)
                 wb = wb.view(wb.size(0), -1)
                 task_weight = rebuild_tucker(t, wa, wb)
             else:
                 task_weight = wa.view(wa.size(0), -1) @ wb.view(wb.size(0), -1)
             task_weight = task_weight.view(self.shape)
-            if self.training and self.rank_dropout:
-                drop = (torch.rand(task_weight.size(0), device=device) > self.rank_dropout).to(
-                    task_weight.dtype
-                )
-                drop = drop.view(-1, *[1] * len(task_weight.shape[1:]))
-                if self.rank_dropout_scale:
-                    drop /= drop.mean()
-                task_weight *= drop
+            task_weight = self._apply_rank_dropout(task_weight, device)
             scalar = self.lora_scalar_list[idx] if idx < len(self.lora_scalar_list) else self.scalar
             task_weight = task_weight * scalar.to(device)
             if total is None:
@@ -520,11 +545,11 @@ class LoConModule(LycorisBaseModule):
 
     def _compute_diff_weight_single(self, device, dtype):
         """Single-task diff_weight for non-bypass forward (tucker or rank_dropout case)."""
-        wa = self._orthogonalize(self.lora_up.weight).to(device=device, dtype=dtype)
-        wb = self._orthogonalize(self.lora_down.weight).to(device=device, dtype=dtype)
+        wa = self._maybe_orthogonalize(self.lora_up.weight).to(device=device, dtype=dtype)
+        wb = self._maybe_orthogonalize(self.lora_down.weight).to(device=device, dtype=dtype)
 
         if self.tucker:
-            t = self._orthogonalize(self.lora_mid.weight).to(device=device, dtype=dtype)
+            t = self._maybe_orthogonalize(self.lora_mid.weight).to(device=device, dtype=dtype)
             wa = wa.view(wa.size(0), -1).transpose(0, 1)
             wb = wb.view(wb.size(0), -1)
             diff_weight = rebuild_tucker(t, wa, wb)
@@ -532,14 +557,7 @@ class LoConModule(LycorisBaseModule):
             diff_weight = wa.view(wa.size(0), -1) @ wb.view(wb.size(0), -1)
 
         diff_weight = diff_weight.view(self.shape)
-        if self.training and self.rank_dropout:
-            drop = (torch.rand(diff_weight.size(0), device=device) > self.rank_dropout).to(
-                diff_weight.dtype
-            )
-            drop = drop.view(-1, *[1] * len(diff_weight.shape[1:]))
-            if self.rank_dropout_scale:
-                drop /= drop.mean()
-            diff_weight *= drop
+        diff_weight = self._apply_rank_dropout(diff_weight, device)
 
         diff_weight = (diff_weight * self.scalar.to(device=device)).to(dtype=dtype) * self.scale
         return diff_weight
@@ -549,11 +567,11 @@ class LoConModule(LycorisBaseModule):
         total = None
         num_tasks = len(self.lora_down_modules)
         for idx in range(num_tasks):
-            wa = self._orthogonalize(self.lora_up_modules[idx].weight).to(device=device, dtype=dtype)
-            wb = self._orthogonalize(self.lora_down_modules[idx].weight).to(device=device, dtype=dtype)
+            wa = self._maybe_orthogonalize(self.lora_up_modules[idx].weight).to(device=device, dtype=dtype)
+            wb = self._maybe_orthogonalize(self.lora_down_modules[idx].weight).to(device=device, dtype=dtype)
 
             if self.tucker and len(self.lora_mid_modules) > idx:
-                t = self._orthogonalize(self.lora_mid_modules[idx].weight).to(device=device, dtype=dtype)
+                t = self._maybe_orthogonalize(self.lora_mid_modules[idx].weight).to(device=device, dtype=dtype)
                 wa = wa.view(wa.size(0), -1).transpose(0, 1)
                 wb = wb.view(wb.size(0), -1)
                 task_weight = rebuild_tucker(t, wa, wb)
@@ -561,14 +579,7 @@ class LoConModule(LycorisBaseModule):
                 task_weight = wa.view(wa.size(0), -1) @ wb.view(wb.size(0), -1)
 
             task_weight = task_weight.view(self.shape)
-            if self.training and self.rank_dropout:
-                drop = (torch.rand(task_weight.size(0), device=device) > self.rank_dropout).to(
-                    task_weight.dtype
-                )
-                drop = drop.view(-1, *[1] * len(task_weight.shape[1:]))
-                if self.rank_dropout_scale:
-                    drop /= drop.mean()
-                task_weight *= drop
+            task_weight = self._apply_rank_dropout(task_weight, device)
 
             scalar = self.lora_scalar_list[idx] if idx < len(self.lora_scalar_list) else self.scalar
             task_weight = (task_weight * scalar.to(device=device)).to(dtype=dtype) * self.scale
@@ -810,10 +821,7 @@ class LoConModule(LycorisBaseModule):
         # Restore original weight: W = W^res + A₀B₀
         # The base weight currently holds W^res, so we add back A₀B₀
         orig_shape = self.org_module[0].weight.shape
-        if self.isconv:
-            a0b0 = (pissa_up_init @ pissa_down_init).reshape(orig_shape)
-        else:
-            a0b0 = (pissa_up_init @ pissa_down_init).reshape(orig_shape)
+        a0b0 = (pissa_up_init @ pissa_down_init).reshape(orig_shape)
         self.org_module[0].weight.data.add_(a0b0.to(self.org_module[0].weight.dtype))
 
         # Clear PiSSA state
@@ -891,7 +899,10 @@ class LoConModule(LycorisBaseModule):
         """
         if not LoConModule._olora_modules:
             return torch.tensor(0.0)
-        total = torch.tensor(0.0)
+        # Create initial tensor on the first module's device to avoid
+        # repeated CPU→GPU implicit transfers in the accumulation loop.
+        first_device = LoConModule._olora_modules[0].device
+        total = torch.tensor(0.0, device=first_device)
         for mod in LoConModule._olora_modules:
             total = total + mod.get_olora_orthogonality_loss()
         return total
@@ -960,10 +971,10 @@ class LoConModule(LycorisBaseModule):
 
     def _bypass_forward_diff_single(self, x, scale=1):
         """Original single-task bypass forward diff (used when olora=False)."""
-        # Orthogonalize weights on the fly for this forward pass.
-        # This is only active during training if self.use_orthogonal_weights is True.
-        wb = self._orthogonalize(self.lora_down.weight).to(x.device, dtype=x.dtype)
-        wa = self._orthogonalize(self.lora_up.weight).to(x.device, dtype=x.dtype)
+        # Use _maybe_orthogonalize to skip the function call overhead
+        # when orthogonalization is disabled (the common case).
+        wb = self._maybe_orthogonalize(self.lora_down.weight).to(x.device, dtype=x.dtype)
+        wa = self._maybe_orthogonalize(self.lora_up.weight).to(x.device, dtype=x.dtype)
 
         # Manually apply the down network using the orthogonalized weight
         if self.isconv:
@@ -981,8 +992,7 @@ class LoConModule(LycorisBaseModule):
             mid = self.down_op(x, wb)
 
         if self.tucker:
-            # CHANGE 3: Apply lora_mid operation manually with orthogonalized weight
-            wc = self._orthogonalize(self.lora_mid.weight)
+            wc = self._maybe_orthogonalize(self.lora_mid.weight)
             mid = self.op(
                 mid,
                 wc,
@@ -1029,8 +1039,8 @@ class LoConModule(LycorisBaseModule):
         for idx in range(num_tasks):
             down_module = self.lora_down_modules[idx]
             up_module = self.lora_up_modules[idx]
-            wb = self._orthogonalize(down_module.weight).to(x.device, dtype=x.dtype)
-            wa = self._orthogonalize(up_module.weight).to(x.device, dtype=x.dtype)
+            wb = self._maybe_orthogonalize(down_module.weight).to(x.device, dtype=x.dtype)
+            wa = self._maybe_orthogonalize(up_module.weight).to(x.device, dtype=x.dtype)
 
             if self.isconv:
                 mid = self.down_op(
@@ -1044,7 +1054,7 @@ class LoConModule(LycorisBaseModule):
                 mid = self.down_op(x, wb)
 
             if self.tucker and len(self.lora_mid_modules) > idx:
-                wc = self._orthogonalize(self.lora_mid_modules[idx].weight)
+                wc = self._maybe_orthogonalize(self.lora_mid_modules[idx].weight)
                 mid = self.op(
                     mid, wc, bias=None,
                     stride=self.lora_mid_modules[idx].stride,
@@ -1607,19 +1617,20 @@ class RaLoRAModule(LoConModule):
                 weight[out_s:out_s + self.mini_out_features,
                        in_s:in_s + self.mini_in_features] = block
         else:
-            wa_big = torch.block_diag(*wa_list)
-            wb_big = torch.block_diag(*wb_list)
-            weight = wb_big @ wa_big
-            weight = weight.view(self.shape)
+            # Block-wise placement for linear — avoids materializing full
+            # block-diagonal matrices (torch.block_diag) and the subsequent
+            # dense matmul on the full (d_out, d_in) result.
+            weight = torch.zeros(self.shape, device=device)
+            for i in range(self.n_split):
+                wa = wa_list[i]  # (r, mini_in)
+                wb = wb_list[i]  # (mini_out, r)
+                block = wb @ wa  # (mini_out, mini_in)
+                out_s = i * self.mini_out_features
+                in_s = i * self.mini_in_features
+                weight[out_s:out_s + self.mini_out_features,
+                       in_s:in_s + self.mini_in_features] = block
 
-        if self.training and self.rank_dropout:
-            drop = (torch.rand(weight.size(0), device=device) > self.rank_dropout).to(
-                weight.dtype
-            )
-            drop = drop.view(-1, *[1] * len(weight.shape[1:]))
-            if self.rank_dropout_scale:
-                drop /= drop.mean()
-            weight *= drop
+        weight = self._apply_rank_dropout(weight, device)
 
         return weight * self.scalar.to(device)
 
@@ -1629,39 +1640,28 @@ class RaLoRAModule(LoConModule):
             return super()._compute_diff_weight_single(device, dtype)
 
         wa_list = [
-            self._orthogonalize(a).to(device=device, dtype=dtype) for a in self._mini_lora_A
+            self._maybe_orthogonalize(a).to(device=device, dtype=dtype) for a in self._mini_lora_A
         ]
         wb_list = [
-            self._orthogonalize(b).to(device=device, dtype=dtype) for b in self._mini_lora_B
+            self._maybe_orthogonalize(b).to(device=device, dtype=dtype) for b in self._mini_lora_B
         ]
 
-        if self.isconv:
-            diff_weight = torch.zeros(self.shape, device=device, dtype=dtype)
-            for i in range(self.n_split):
-                wa = wa_list[i]
-                wb = wb_list[i]
-                wa_2d = wa.view(wa.size(0), -1)
-                wb_2d = wb.view(wb.size(0), -1)
-                block_2d = wb_2d @ wa_2d
-                block = block_2d.view(self.mini_out_features, self.mini_in_features, *self.shape[2:])
-                out_s = i * self.mini_out_features
-                in_s = i * self.mini_in_features
-                diff_weight[out_s:out_s + self.mini_out_features,
-                             in_s:in_s + self.mini_in_features] = block
-        else:
-            wa_big = torch.block_diag(*wa_list)
-            wb_big = torch.block_diag(*wb_list)
-            diff_weight = wb_big @ wa_big
-            diff_weight = diff_weight.view(self.shape)
+        # Block-wise placement for both conv and linear — avoids materializing
+        # full block-diagonal matrices and the dense (d_out, d_in) matmul.
+        diff_weight = torch.zeros(self.shape, device=device, dtype=dtype)
+        for i in range(self.n_split):
+            wa = wa_list[i]  # (r, mini_in) or (r, mini_in, *kernel)
+            wb = wb_list[i]  # (mini_out, r) or (mini_out, r, 1, ...)
+            wa_2d = wa.view(wa.size(0), -1)   # (r, flat_in)
+            wb_2d = wb.view(wb.size(0), -1)   # (mini_out, r)
+            block_2d = wb_2d @ wa_2d           # (mini_out, flat_in)
+            block = block_2d.view(self.mini_out_features, self.mini_in_features, *self.shape[2:])
+            out_s = i * self.mini_out_features
+            in_s = i * self.mini_in_features
+            diff_weight[out_s:out_s + self.mini_out_features,
+                         in_s:in_s + self.mini_in_features] = block
 
-        if self.training and self.rank_dropout:
-            drop = (torch.rand(diff_weight.size(0), device=device) > self.rank_dropout).to(
-                diff_weight.dtype
-            )
-            drop = drop.view(-1, *[1] * len(diff_weight.shape[1:]))
-            if self.rank_dropout_scale:
-                drop /= drop.mean()
-            diff_weight *= drop
+        diff_weight = self._apply_rank_dropout(diff_weight, device)
 
         diff_weight = (diff_weight * self.scalar.to(device=device)).to(dtype=dtype) * self.scale
         return diff_weight
@@ -1683,8 +1683,8 @@ class RaLoRAModule(LoConModule):
             up_parts = []
             for i in range(self.n_split):
                 mini_x = x[:, i * self.mini_in_features:(i + 1) * self.mini_in_features, ...]
-                wa = self._orthogonalize(self._mini_lora_A[i]).to(device=device, dtype=dtype)
-                wb = self._orthogonalize(self._mini_lora_B[i]).to(device=device, dtype=dtype)
+                wa = self._maybe_orthogonalize(self._mini_lora_A[i]).to(device=device, dtype=dtype)
+                wb = self._maybe_orthogonalize(self._mini_lora_B[i]).to(device=device, dtype=dtype)
                 mid = self.down_op(
                     mini_x, wa,
                     bias=None,
@@ -1712,30 +1712,32 @@ class RaLoRAModule(LoConModule):
                 up_parts.append(up_i)
             up = torch.cat(up_parts, dim=1)  # concat along channel dim
         else:
-            # Linear: assemble block-diag then forward as two matmuls
-            wa_list = [
-                self._orthogonalize(a).to(device=device, dtype=dtype) for a in self._mini_lora_A
-            ]
-            wb_list = [
-                self._orthogonalize(b).to(device=device, dtype=dtype) for b in self._mini_lora_B
-            ]
-            wa_big = torch.block_diag(*wa_list)  # (n*r, d_in)
-            wb_big = torch.block_diag(*wb_list)  # (d_out, n*r)
-            mid = F.linear(x, wa_big)
+            # Linear: block-wise forward without materializing full block-diag.
+            # Slice input into blocks, apply per-block matmul, concat outputs.
+            up_parts = []
+            for i in range(self.n_split):
+                in_s = i * self.mini_in_features
+                mini_x = x[..., in_s:in_s + self.mini_in_features]
+                wa = self._maybe_orthogonalize(self._mini_lora_A[i]).to(device=device, dtype=dtype)
+                wb = self._maybe_orthogonalize(self._mini_lora_B[i]).to(device=device, dtype=dtype)
+                mid = F.linear(x[..., in_s:in_s + self.mini_in_features], wa)
 
-            if self.rank_dropout and self.training:
-                drop = (
-                    torch.rand(self.lora_dim, device=device) > self.rank_dropout
-                ).to(dtype)
-                if self.rank_dropout_scale:
-                    drop /= drop.mean()
-                if (dims := len(x.shape)) == 4:
-                    drop = drop.view(1, -1, 1, 1)
-                else:
-                    drop = drop.view(*[1] * (dims - 1), -1)
-                mid = mid * drop
+                if self.rank_dropout and self.training:
+                    drop = (
+                        torch.rand(self.mini_lora_rank, device=device) > self.rank_dropout
+                    ).to(dtype)
+                    if self.rank_dropout_scale:
+                        drop /= drop.mean()
+                    if (dims := len(mid.shape)) == 4:
+                        drop = drop.view(1, -1, 1, 1)
+                    else:
+                        drop = drop.view(*[1] * (dims - 1), -1)
+                    mid = mid * drop
 
-            up = F.linear(mid, wb_big)
+                up_i = F.linear(mid, wb)
+                up_parts.append(up_i)
+            # Concat along the output (last) dimension
+            up = torch.cat(up_parts, dim=-1)
 
         return self.drop(up * self.scalar.to(device) * self.scale * scale)
 
@@ -1871,27 +1873,25 @@ class RaLoRAModule(LoConModule):
             if n_split_key in unexpected_keys:
                 unexpected_keys.remove(n_split_key)
 
+    @staticmethod
+    def _should_skip_missing_key_ralora(key: str) -> bool:
+        """Check if a missing key is expected to be absent in RaLoRA checkpoints."""
+        if "scalar" in key:
+            return True
+        for tag in ("pissa_A_init", "pissa_B_init", "pissa_converted",
+                     "olora_task_id", "n_split",
+                     "lora_down_block", "lora_up_block",
+                     "lora_down_task", "lora_up_task", "lora_mid_task"):
+            if tag in key:
+                return True
+        return False
+
     def load_weight_hook(self, module: nn.Module, incompatible_keys):
         """Handle block-diagonal weight loading (post-hook)."""
         missing_keys = incompatible_keys.missing_keys
 
-        # Allow missing keys that are safe to be absent
-        pissa_keys = {"pissa_A_init", "pissa_B_init", "pissa_converted"}
-        olora_keys = {"olora_task_id"}
-        block_keys = {"n_split"}
-        for key in list(missing_keys):
-            if (
-                "scalar" in key
-                or any(pk in key for pk in pissa_keys)
-                or any(ok in key for ok in olora_keys)
-                or any(bk in key for bk in block_keys)
-                or ("lora_down_block" in key)
-                or ("lora_up_block" in key)
-                or ("lora_down_task" in key)
-                or ("lora_up_task" in key)
-                or ("lora_mid_task" in key)
-            ):
-                del missing_keys[missing_keys.index(key)]
+        # Filter expected missing keys in O(n) instead of O(n²)
+        missing_keys[:] = [k for k in missing_keys if not self._should_skip_missing_key_ralora(k)]
 
         # Handle scalar
         if isinstance(self.scalar, nn.Parameter):
