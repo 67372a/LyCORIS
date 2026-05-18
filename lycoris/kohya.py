@@ -173,6 +173,9 @@ def create_network(
     network_reg_dims_str = kwargs.get("network_reg_dims", None)
     network_reg_dims = _parse_kv_pairs(network_reg_dims_str, is_int=True) if network_reg_dims_str is not None else None
 
+    network_reg_loraplus_ratios_str = kwargs.get("network_reg_loraplus_ratios", None)
+    network_reg_loraplus_ratios = _parse_kv_pairs(network_reg_loraplus_ratios_str, is_int=False) if network_reg_loraplus_ratios_str is not None else None
+
     ggpo_beta = kwargs.get("ggpo_beta", None)
     ggpo_sigma = kwargs.get("ggpo_sigma", None)
     ggpo_conv = kwargs.get("ggpo_conv", False)
@@ -393,6 +396,7 @@ def create_network(
         include_patterns=include_patterns,
         network_reg_dims=network_reg_dims,
         network_reg_lrs=network_reg_lrs,
+        network_reg_loraplus_ratios=network_reg_loraplus_ratios,
         # GoRA parameters
         gora_ref_rank=gora_ref_rank,
         gora_min_rank=gora_min_rank,
@@ -584,6 +588,7 @@ class LycorisNetworkKohya(LycorisNetwork):
     INCLUDE_PATTERNS = None
     NETWORK_REG_DIMS = None
     NETWORK_REG_LRS = None
+    NETWORK_REG_LORAPLUS_RATIOS = None
 
     @classmethod
     def apply_preset(cls, preset):
@@ -615,6 +620,8 @@ class LycorisNetworkKohya(LycorisNetwork):
             cls.NETWORK_REG_DIMS = preset["network_reg_dims"]
         if "network_reg_lrs" in preset:
             cls.NETWORK_REG_LRS = preset["network_reg_lrs"]
+        if "network_reg_loraplus_ratios" in preset:
+            cls.NETWORK_REG_LORAPLUS_RATIOS = preset["network_reg_loraplus_ratios"]
         return cls
 
     def __init__(
@@ -639,6 +646,7 @@ class LycorisNetworkKohya(LycorisNetwork):
         include_patterns=None,
         network_reg_dims=None,
         network_reg_lrs=None,
+        network_reg_loraplus_ratios=None,
         **kwargs,
     ) -> None:
         torch.nn.Module.__init__(self)
@@ -757,10 +765,12 @@ class LycorisNetworkKohya(LycorisNetwork):
         effective_include_patterns = include_patterns if include_patterns is not None else self.INCLUDE_PATTERNS
         effective_reg_dims = network_reg_dims if network_reg_dims is not None else self.NETWORK_REG_DIMS
         effective_reg_lrs = network_reg_lrs if network_reg_lrs is not None else self.NETWORK_REG_LRS
+        effective_reg_loraplus_ratios = network_reg_loraplus_ratios if network_reg_loraplus_ratios is not None else self.NETWORK_REG_LORAPLUS_RATIOS
 
-        # Store network_reg_dims and network_reg_lrs
+        # Store network_reg_dims, network_reg_lrs, and network_reg_loraplus_ratios
         self.network_reg_dims = effective_reg_dims
         self.network_reg_lrs = effective_reg_lrs
+        self.network_reg_loraplus_ratios = effective_reg_loraplus_ratios
 
         # Compile include/exclude regex patterns
         def _compile_patterns(patterns):
@@ -784,6 +794,8 @@ class LycorisNetworkKohya(LycorisNetwork):
             logger.info(f"Regex-specific dimensions: {self.network_reg_dims}")
         if self.network_reg_lrs:
             logger.info(f"Regex-specific learning rates: {self.network_reg_lrs}")
+        if self.network_reg_loraplus_ratios:
+            logger.info(f"Regex-specific LoRA+ ratios: {self.network_reg_loraplus_ratios}")
 
         def _is_excluded(full_name):
             """Check if a module name should be excluded, respecting include overrides.
@@ -1340,6 +1352,21 @@ class LycorisNetworkKohya(LycorisNetwork):
                             logger.info(f"Module {lora.original_name} matched regex '{regex_str}' -> LR {reg_lr}")
                             break
 
+        # Build reg_loraplus lookup: lora_name -> reg_loraplus_idx
+        reg_loraplus_lookup = {}  # lora_name -> reg_loraplus_idx
+        reg_loraplus_values = {}  # reg_loraplus_idx -> ratio_value
+        if self.network_reg_loraplus_ratios:
+            reg_loraplus_list = list(self.network_reg_loraplus_ratios.items())
+            for i, (_, ratio_val) in enumerate(reg_loraplus_list):
+                reg_loraplus_values[i] = ratio_val
+            for lora in self.loras:
+                if hasattr(lora, 'original_name'):
+                    for i, (regex_str, ratio_val) in enumerate(reg_loraplus_list):
+                        if re.fullmatch(regex_str, lora.original_name):
+                            reg_loraplus_lookup[lora.lora_name] = i
+                            logger.info(f"Module {lora.original_name} matched regex '{regex_str}' -> LoRA+ ratio {ratio_val}")
+                            break
+
         # Iterate through all named parameters of the model
         for name, param in self.named_parameters():
             comp_type = 'unet' # Default to unet
@@ -1359,16 +1386,19 @@ class LycorisNetworkKohya(LycorisNetwork):
             # Determine if this parameter should go into the OrthoGrad=True group
             is_ortho_group = apply_orthograd and is_target
 
-            is_lora_plus = (name is not None and any(target in name for target in LORA_PLUS_TARGETS) and
-                            ((comp_type == 'textencoder' and (self.loraplus_text_encoder_lr_ratio is not None or self.loraplus_lr_ratio is not None)) or 
-                             (comp_type == 'unet' and (self.loraplus_unet_lr_ratio is not None or self.loraplus_lr_ratio is not None))))
-
-            # Check if parameter belongs to a module with regex-specific LR
+            # Check if parameter belongs to a module with regex-specific LR or LoRA+ ratio
             lora_module_name = name.split('.')[0]
             reg_lr_idx = reg_lr_lookup.get(lora_module_name)
+            reg_loraplus_idx = reg_loraplus_lookup.get(lora_module_name)
+
+            is_lora_plus = (name is not None and any(target in name for target in LORA_PLUS_TARGETS) and (
+                            reg_loraplus_idx is not None  # regex-specific ratio set
+                            or (comp_type == 'textencoder' and (self.loraplus_text_encoder_lr_ratio is not None or self.loraplus_lr_ratio is not None))
+                            or (comp_type == 'unet' and (self.loraplus_unet_lr_ratio is not None or self.loraplus_lr_ratio is not None))
+                            ))
 
             # Assign the parameter to the correct temporary list
-            group_key = (comp_type, comp_idx, is_ortho_group, is_lora_plus, reg_lr_idx)
+            group_key = (comp_type, comp_idx, is_ortho_group, is_lora_plus, reg_lr_idx, reg_loraplus_idx)
             grouped_params[group_key].append(param)
 
         num_of_te = len(found_te_ids)
@@ -1392,32 +1422,36 @@ class LycorisNetworkKohya(LycorisNetwork):
         # --- Construct Final Parameter Groups ---
         all_param_groups = []
         all_lr_descriptions = []
-        for (comp_type, comp_idx, is_ortho_group, is_lora_plus, reg_lr_idx), params in grouped_params.items():
+        for (comp_type, comp_idx, is_ortho_group, is_lora_plus, reg_lr_idx, reg_loraplus_idx), params in grouped_params.items():
 
             # Determine Learning Rate for this group
             current_lr = None
+
+            # Determine the effective LoRA+ ratio with precedence: regex > component > global
+            loraplus_ratio = None
+            if is_lora_plus:
+                if reg_loraplus_idx is not None:
+                    loraplus_ratio = reg_loraplus_values[reg_loraplus_idx]
+                elif comp_type == 'unet':
+                    loraplus_ratio = self.loraplus_unet_lr_ratio or self.loraplus_lr_ratio
+                elif comp_type == 'textencoder':
+                    loraplus_ratio = self.loraplus_text_encoder_lr_ratio or self.loraplus_lr_ratio
+
             if reg_lr_idx is not None:
                 # Use regex-specific learning rate
                 base_lr = reg_lr_values[reg_lr_idx]
-                if is_lora_plus:
-                    ratio = None
-                    if comp_type == 'unet':
-                        ratio = self.loraplus_unet_lr_ratio or self.loraplus_lr_ratio
-                    elif comp_type == 'textencoder':
-                        ratio = self.loraplus_text_encoder_lr_ratio or self.loraplus_lr_ratio
-                    current_lr = base_lr * ratio if ratio else base_lr
+                if is_lora_plus and loraplus_ratio is not None:
+                    current_lr = base_lr * loraplus_ratio
                 else:
                     current_lr = base_lr
             elif comp_type == 'unet':
                 if is_lora_plus:
-                    current_lr = ((unet_lr if unet_lr is not None else learning_rate) * 
-                                  (self.loraplus_unet_lr_ratio if self.loraplus_unet_lr_ratio is not None else self.loraplus_lr_ratio))
+                    current_lr = ((unet_lr if unet_lr is not None else learning_rate) * loraplus_ratio)
                 else:
                     current_lr = unet_lr if unet_lr is not None else learning_rate
             elif comp_type == 'textencoder':
                 if is_lora_plus:
-                    current_lr = ((text_encoder_lr[comp_idx - 1] * 
-                                   (self.loraplus_text_encoder_lr_ratio if self.loraplus_text_encoder_lr_ratio is not None else self.loraplus_lr_ratio)))
+                    current_lr = (text_encoder_lr[comp_idx - 1] * loraplus_ratio)
                 else:
                     current_lr = text_encoder_lr[comp_idx - 1]
                 
@@ -1428,7 +1462,8 @@ class LycorisNetworkKohya(LycorisNetwork):
                 logger.warning(f"Not training {group_name_prefix}{reg_lr_suffix} as LR is {str(current_lr)}.")
                 continue
 
-            lr_description = f"{comp_type}{comp_idx if comp_type == 'textencoder' else ''}{' Ortho' if is_ortho_group else ''}{' plus' if is_lora_plus else ''}{' reg_lr_' + str(reg_lr_idx) if reg_lr_idx is not None else ''}"
+            loraplus_suffix = f"_regplus{reg_loraplus_idx}" if reg_loraplus_idx is not None else ""
+            lr_description = f"{comp_type}{comp_idx if comp_type == 'textencoder' else ''}{' Ortho' if is_ortho_group else ''}{' plus' if is_lora_plus else ''}{loraplus_suffix}{' reg_lr_' + str(reg_lr_idx) if reg_lr_idx is not None else ''}"
 
             group_dict = {
                 'params': params,
@@ -1438,7 +1473,7 @@ class LycorisNetworkKohya(LycorisNetwork):
                 'lr': torch.tensor(current_lr),
             }
 
-            group_name = f"{group_name_prefix}{reg_lr_suffix}{'_Ortho' if is_ortho_group else ''}{'_Plus' if is_lora_plus else ''}"
+            group_name = f"{group_name_prefix}{reg_lr_suffix}{loraplus_suffix}{'_Ortho' if is_ortho_group else ''}{'_Plus' if is_lora_plus else ''}"
             group_dict['name'] = group_name
             all_param_groups.append(group_dict)
             all_lr_descriptions.append(lr_description)

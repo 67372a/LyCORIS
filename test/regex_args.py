@@ -424,5 +424,234 @@ class LycorisRegexArgsTests(unittest.TestCase):
             reset_globals()
 
 
+class LycorisRegLoraplusTests(unittest.TestCase):
+    """Tests for network_reg_loraplus_ratios feature."""
+
+    def _get_lora_names(self, network):
+        return sorted([lora.lora_name for lora in network.loras])
+
+    def test_reg_loraplus_ratios_stored(self):
+        """network_reg_loraplus_ratios should be stored on the network object."""
+        try:
+            from lycoris.kohya import LycorisNetworkKohya
+
+            LycorisNetworkKohya.apply_preset({
+                "enable_conv": True,
+                "unet_target_module": ["Linear"],
+                "unet_target_name": [],
+                "text_encoder_target_module": [],
+                "text_encoder_target_name": [],
+            })
+            net = SimpleNet()
+            network = LycorisNetworkKohya(
+                None, net, 1.0, lora_dim=4, alpha=1,
+                network_reg_loraplus_ratios={r".*attn.*": 2.0, r".*mlp.*": 4.0},
+            )
+            self.assertIsNotNone(network.network_reg_loraplus_ratios)
+            self.assertEqual(len(network.network_reg_loraplus_ratios), 2)
+            self.assertEqual(network.network_reg_loraplus_ratios[r".*attn.*"], 2.0)
+            self.assertEqual(network.network_reg_loraplus_ratios[r".*mlp.*"], 4.0)
+        finally:
+            reset_globals()
+
+    def test_reg_loraplus_ratios_preset_fallback(self):
+        """network_reg_loraplus_ratios from preset should be used when not set via network args."""
+        try:
+            from lycoris.kohya import LycorisNetworkKohya
+
+            LycorisNetworkKohya.apply_preset({
+                "enable_conv": True,
+                "unet_target_module": ["Linear"],
+                "unet_target_name": [],
+                "text_encoder_target_module": [],
+                "text_encoder_target_name": [],
+                "network_reg_loraplus_ratios": {r".*attn.*": 3.0},
+            })
+            net = SimpleNet()
+            network = LycorisNetworkKohya(
+                None, net, 1.0, lora_dim=4, alpha=1,
+            )
+            self.assertIsNotNone(network.network_reg_loraplus_ratios)
+            self.assertIn(r".*attn.*", network.network_reg_loraplus_ratios)
+            self.assertEqual(network.network_reg_loraplus_ratios[r".*attn.*"], 3.0)
+        finally:
+            reset_globals()
+
+    def test_reg_loraplus_ratios_override_preset(self):
+        """Network arg network_reg_loraplus_ratios should override preset."""
+        try:
+            from lycoris.kohya import LycorisNetworkKohya
+
+            LycorisNetworkKohya.apply_preset({
+                "enable_conv": True,
+                "unet_target_module": ["Linear"],
+                "unet_target_name": [],
+                "text_encoder_target_module": [],
+                "text_encoder_target_name": [],
+                "network_reg_loraplus_ratios": {r".*attn.*": 1.5},
+            })
+            net = SimpleNet()
+            network = LycorisNetworkKohya(
+                None, net, 1.0, lora_dim=4, alpha=1,
+                network_reg_loraplus_ratios={r".*attn.*": 5.0},
+            )
+            self.assertEqual(network.network_reg_loraplus_ratios[r".*attn.*"], 5.0)
+        finally:
+            reset_globals()
+
+    def test_reg_loraplus_prepare_optimizer_groups(self):
+        """prepare_optimizer_params should group params with regex-specific LoRA+ ratios."""
+        try:
+            from lycoris.kohya import LycorisNetworkKohya
+
+            LycorisNetworkKohya.apply_preset({
+                "enable_conv": True,
+                "unet_target_module": ["Linear"],
+                "unet_target_name": [],
+                "text_encoder_target_module": [],
+                "text_encoder_target_name": [],
+            })
+            net = SimpleNet()
+            network = LycorisNetworkKohya(
+                None, net, 1.0, lora_dim=4, alpha=1,
+                network_reg_loraplus_ratios={r".*attn.*": 2.0},
+            )
+            network.apply_to(None, net, apply_text_encoder=False, apply_unet=True)
+
+            groups, descriptions = network.prepare_optimizer_params(
+                unet_lr=1e-4, learning_rate=1e-5,
+            )
+            self.assertGreater(len(groups), 0, "Should have at least one param group")
+
+            # Find groups with LoRA+ enabled
+            plus_groups = [g for g in groups if g.get('is_lora_plus_group', False)]
+            self.assertGreater(len(plus_groups), 0,
+                "Should have LoRA+ groups when network_reg_loraplus_ratios is set")
+
+            # Verify plus groups have the correct ratio applied (base_lr * 2.0)
+            for g in plus_groups:
+                # attn modules should get ratio 2.0 applied to their base LR
+                expected_lr = 1e-4 * 2.0
+                self.assertAlmostEqual(g['lr'].item(), expected_lr, delta=1e-10,
+                    msg=f"LoRA+ group should have lr={expected_lr}, got {g['lr'].item()}")
+        finally:
+            reset_globals()
+
+    def test_reg_loraplus_without_global_ratio(self):
+        """Modules matching regex should get LoRA+ treatment even without global Loraplus ratios."""
+        try:
+            from lycoris.kohya import LycorisNetworkKohya
+
+            LycorisNetworkKohya.apply_preset({
+                "enable_conv": True,
+                "unet_target_module": ["Linear"],
+                "unet_target_name": [],
+                "text_encoder_target_module": [],
+                "text_encoder_target_name": [],
+            })
+            net = SimpleNet()
+            network = LycorisNetworkKohya(
+                None, net, 1.0, lora_dim=4, alpha=1,
+                network_reg_loraplus_ratios={r".*attn.*": 3.0},
+                # No loraplus_lr_ratio or loraplus_unet_lr_ratio set
+            )
+            network.apply_to(None, net, apply_text_encoder=False, apply_unet=True)
+
+            groups, descriptions = network.prepare_optimizer_params(
+                unet_lr=1e-4, learning_rate=1e-5,
+            )
+            # Should still have LoRA+ groups even without global ratio
+            plus_groups = [g for g in groups if g.get('is_lora_plus_group', False)]
+            self.assertGreater(len(plus_groups), 0,
+                "Should have LoRA+ groups even without global loraplus ratio set")
+
+            for g in plus_groups:
+                expected_lr = 1e-4 * 3.0
+                self.assertAlmostEqual(g['lr'].item(), expected_lr, delta=1e-10,
+                    msg=f"LoRA+ group should have lr={expected_lr}, got {g['lr'].item()}")
+        finally:
+            reset_globals()
+
+    def test_reg_loraplus_precedence_over_global(self):
+        """Regex-specific LoRA+ ratio should override global ratio for matching modules."""
+        try:
+            from lycoris.kohya import LycorisNetworkKohya
+
+            LycorisNetworkKohya.apply_preset({
+                "enable_conv": True,
+                "unet_target_module": ["Linear"],
+                "unet_target_name": [],
+                "text_encoder_target_module": [],
+                "text_encoder_target_name": [],
+            })
+            net = SimpleNet()
+            network = LycorisNetworkKohya(
+                None, net, 1.0, lora_dim=4, alpha=1,
+                loraplus_lr_ratio=10.0,  # global, should be overridden by regex
+                network_reg_loraplus_ratios={r".*attn.*": 2.0},
+            )
+            network.set_loraplus_lr_ratio(10.0, None, None)
+            network.apply_to(None, net, apply_text_encoder=False, apply_unet=True)
+
+            groups, descriptions = network.prepare_optimizer_params(
+                unet_lr=1e-4, learning_rate=1e-5,
+            )
+            plus_groups = [g for g in groups if g.get('is_lora_plus_group', False)]
+            self.assertGreater(len(plus_groups), 0)
+
+            # After grouping, groups with different loraplus_ratios should have different LRs
+            lrs = set()
+            for g in plus_groups:
+                lr_val = g['lr'].item()
+                lrs.add(lr_val)
+            # Should have at least 1 distinct LRs: regex-matched and/or global fallback
+            self.assertGreaterEqual(len(lrs), 1,
+                "Should have at least one distinct LR value")
+
+            # Verify that at least one group uses the regex ratio (2.0)
+            regex_lrs = [g['lr'].item() for g in plus_groups
+                         if abs(g['lr'].item() - 1e-4 * 2.0) < 1e-6]
+            self.assertGreater(len(regex_lrs), 0,
+                "At least one LoRA+ group should use the regex ratio 2.0 instead of global 10.0")
+        finally:
+            reset_globals()
+
+    def test_reg_loraplus_non_matching_uses_global(self):
+        """Modules not matching any regex should use global/component ratio."""
+        try:
+            from lycoris.kohya import LycorisNetworkKohya
+
+            LycorisNetworkKohya.apply_preset({
+                "enable_conv": True,
+                "unet_target_module": ["Linear"],
+                "unet_target_name": [],
+                "text_encoder_target_module": [],
+                "text_encoder_target_name": [],
+            })
+            net = SimpleNet()
+            network = LycorisNetworkKohya(
+                None, net, 1.0, lora_dim=4, alpha=1,
+                loraplus_unet_lr_ratio=5.0,
+                network_reg_loraplus_ratios={r".*nonexistent.*": 2.0},
+            )
+            network.set_loraplus_lr_ratio(None, 5.0, None)
+            network.apply_to(None, net, apply_text_encoder=False, apply_unet=True)
+
+            groups, descriptions = network.prepare_optimizer_params(
+                unet_lr=1e-4, learning_rate=1e-5,
+            )
+            plus_groups = [g for g in groups if g.get('is_lora_plus_group', False)]
+            self.assertGreater(len(plus_groups), 0,
+                "Should have LoRA+ groups from global/component ratio")
+
+            for g in plus_groups:
+                # Should use component ratio 5.0 since no regex matches
+                expected_lr = 1e-4 * 5.0
+                self.assertAlmostEqual(g['lr'].item(), expected_lr, delta=1e-10,
+                    msg=f"Non-matching module should use global ratio 5.0 (lr={expected_lr}), got {g['lr'].item()}")
+        finally:
+            reset_globals()
+
+
 if __name__ == "__main__":
     unittest.main()
