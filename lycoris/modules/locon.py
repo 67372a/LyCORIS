@@ -230,6 +230,15 @@ class LoConModule(LycorisBaseModule):
 
         self.init_ggpo()
 
+        # Cache the static portion of the apply_ggpo check to avoid
+        # recomputing 4 invariant conditions on every forward pass.
+        self._ggpo_enabled = (
+            self.ggpo_sigma is not None
+            and self.ggpo_beta is not None
+            and (self.module_type == "linear"
+                 or (self.module_type.startswith("conv") and self.ggpo_conv))
+        )
+
         # Store PiSSA-specific config
         self.pissa_niter = pissa_niter
         self.pissa_convert = pissa_convert
@@ -559,7 +568,9 @@ class LoConModule(LycorisBaseModule):
         diff_weight = diff_weight.view(self.shape)
         diff_weight = self._apply_rank_dropout(diff_weight, device)
 
-        diff_weight = (diff_weight * self.scalar.to(device=device)).to(dtype=dtype) * self.scale
+        # Cast scalar to target device+dtype once to avoid implicit fp32 upcast then
+        # downcast back to dtype on every forward pass.
+        diff_weight = (diff_weight * self.scalar.to(device=device, dtype=dtype)) * self.scale
         return diff_weight
 
     def _compute_diff_weight_multitask(self, device, dtype):
@@ -582,7 +593,8 @@ class LoConModule(LycorisBaseModule):
             task_weight = self._apply_rank_dropout(task_weight, device)
 
             scalar = self.lora_scalar_list[idx] if idx < len(self.lora_scalar_list) else self.scalar
-            task_weight = (task_weight * scalar.to(device=device)).to(dtype=dtype) * self.scale
+            # Pre-cast scalar to target device+dtype to avoid implicit fp32 upcast/downcast.
+            task_weight = (task_weight * scalar.to(device=device, dtype=dtype)) * self.scale
             if total is None:
                 total = task_weight
             else:
@@ -1103,13 +1115,11 @@ class LoConModule(LycorisBaseModule):
             if torch.rand(1) < self.module_dropout:
                 return self.org_forward(x)
         
-        # Check if perturbation is needed - early return if not in training
-        apply_ggpo = (self.training and 
-                    self.ggpo_sigma is not None and 
-                    self.ggpo_beta is not None and 
-                    self.combined_weight_norms is not None and 
-                    self.grad_norms is not None and
-                    (self.module_type == "linear" or (self.module_type.startswith("conv") and self.ggpo_conv)))
+        # Check if perturbation is needed — static conditions cached in _ggpo_enabled
+        apply_ggpo = (self._ggpo_enabled
+                      and self.training
+                      and self.combined_weight_norms is not None
+                      and self.grad_norms is not None)
         
         # Handle bypass mode first - simpler path
         if self.bypass_mode:
