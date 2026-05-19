@@ -1149,7 +1149,7 @@ class LycorisNetwork(torch.nn.Module):
             # Per-module torch.compile: compile each module's rebuild-mode
             # forward (weight construction + fused op) rather than the
             # network container which has no forward().
-            if self._torch_compile and hasattr(lora, 'compile_forward'):
+            if getattr(self, '_torch_compile', False) and hasattr(lora, 'compile_forward'):
                 with torch._dynamo.utils.disable_cache_limit():
                     lora.compile_forward(**self._torch_compile_kwargs)
             self.add_module(lora.lora_name, lora)
