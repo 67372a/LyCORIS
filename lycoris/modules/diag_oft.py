@@ -270,7 +270,7 @@ class DiagOFTModule(LycorisBaseModule):
     def bypass_forward(self, x, scale=1):
         return self._bypass_forward(x, scale, diff=False)
 
-    def _forward_rebuild_core(self, x, org_weight, org_bias):
+    def _forward_rebuild_core(self, x, org_weight, bias):
         """Rebuild-mode forward pass — the torch.compile target.
 
         Computes OFT weight via Cayley transform and einsum, merging with
@@ -280,7 +280,7 @@ class DiagOFTModule(LycorisBaseModule):
         r = self.get_r()
         r = self._apply_multiplicative_dropout(r)
 
-        scale = self.multiplier
+        scale = self.multiplier_buf
         org_dtype = org_weight.dtype
         r_dtype = r.dtype
         target_dtype = torch.promote_types(org_dtype, r_dtype)
@@ -301,9 +301,7 @@ class DiagOFTModule(LycorisBaseModule):
 
         w = w.to(org_dtype)
 
-        bias = org_bias.to(x.dtype, non_blocking=True) if org_bias is not None else None
-        kw_dict = {**self.kw_dict, "weight": w, "bias": bias}
-        return self.op(x, **kw_dict)
+        return self._call_op(x, w, bias)
 
     def forward(self, x: torch.Tensor, *args, **kwargs):
         if self.module_dropout and self.training:
@@ -314,7 +312,13 @@ class DiagOFTModule(LycorisBaseModule):
         if self.bypass_mode:
             return self.bypass_forward(x, scale)
 
+        x = x.to(self._cached_dtype)
         org_weight = self.get_org_weight_for_compute(x.device)
         org_bias = self.get_org_bias_for_compute(x.device)
+        # Pre-resolve bias to real tensor or None (avoids numel check in compiled graph)
+        if org_bias is not None:
+            bias = org_bias.to(x.dtype, non_blocking=True)
+        else:
+            bias = None
 
-        return self._forward_rebuild_core(x, org_weight, org_bias)
+        return self._forward_rebuild_core(x, org_weight, bias)

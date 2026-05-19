@@ -330,7 +330,7 @@ class GLoRAModule(LycorisBaseModule):
     def bypass_forward(self, x, scale=1):
         return self._bypass_forward(x, scale=scale, diff=False)
 
-    def _forward_rebuild_core(self, x, org_weight, org_bias):
+    def _forward_rebuild_core(self, x, org_weight, bias):
         """Rebuild-mode forward pass — the torch.compile target.
 
         Computes GLoRA diff weight (branch A: org-based, branch B: weight-only),
@@ -338,7 +338,7 @@ class GLoRAModule(LycorisBaseModule):
         linear/conv operation.  All inputs are pre-fetched GPU tensors.
         """
         device = x.device
-        dtype = self.dtype
+        dtype = self._cached_dtype
 
         wa1 = self._orthogonalize(self.a1.weight).view(self.a1.weight.size(0), -1)
         wa2 = self._orthogonalize(self.a2.weight).view(-1, self.a2.weight.size(1))
@@ -361,19 +361,18 @@ class GLoRAModule(LycorisBaseModule):
         else:
             w_wa2 = (orig @ wa1) @ wa2
 
-        diff_w = (wb + w_wa2) * self.scale * self.scalar.to(device=device) * self.multiplier
+        diff_w = (wb + w_wa2) * self.scale * self.scalar.to(device=device) * self.multiplier_buf
         weight = orig.add(diff_w)
 
         if self.dropout:
             x = self.drop(x)
 
-        bias = org_bias
         if weight.dtype != x.dtype:
             weight = weight.to(x.dtype)
         if bias is not None and bias.dtype != x.dtype:
             bias = bias.to(x.dtype, non_blocking=True)
 
-        return self.op(x, weight, bias, **self.kw_dict)
+        return self._call_op(x, weight, bias)
 
     def forward(self, x, *args, **kwargs):
         if self.module_dropout and self.training:
@@ -382,10 +381,16 @@ class GLoRAModule(LycorisBaseModule):
         if self.bypass_mode:
             return self.bypass_forward(x, self.multiplier)
 
+        x = x.to(self._cached_dtype)
         org_weight = self.get_org_weight_for_compute(x.device)
         org_bias = self.get_org_bias_for_compute(x.device)
+        # Pre-resolve bias to real tensor or None (avoids numel check in compiled graph)
+        if org_bias is not None:
+            bias = org_bias.to(x.dtype, non_blocking=True)
+        else:
+            bias = None
 
-        return self._forward_rebuild_core(x, org_weight, org_bias)
+        return self._forward_rebuild_core(x, org_weight, bias)
         
     @torch.no_grad()
     def apply_max_norm(self, max_norm, device=None):

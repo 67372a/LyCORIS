@@ -132,22 +132,21 @@ class IA3Module(LycorisBaseModule):
     def bypass_forward(self, x, scale=1):
         return self._bypass_forward(x, scale, diff=False)
 
-    def _forward_rebuild_core(self, x, org_weight, org_bias):
+    def _forward_rebuild_core(self, x, org_weight, bias):
         """Rebuild-mode forward pass — the torch.compile target.
 
         Computes element-wise scaled org_weight and runs the fused
         linear/conv operation.  All inputs are pre-fetched GPU tensors
         so no conditional device transfers occur inside this method.
         """
-        weight = org_weight.to(self.dtype)
-        w = self.weight * self.multiplier + 1
+        weight = org_weight.to(self._cached_dtype)
+        w = self.weight * self.multiplier_buf + 1
         if self.train_input:
             weight = weight * w
         else:
             weight = weight.transpose(0, 1) * w
             weight = weight.transpose(0, 1)
-        bias = org_bias.to(x.dtype, non_blocking=True) if org_bias is not None else None
-        return self.op(x, weight, bias, **self.kw_dict)
+        return self._call_op(x, weight, bias)
 
     def forward(self, x, *args, **kwargs):
         if self.module_dropout and self.training:
@@ -156,7 +155,13 @@ class IA3Module(LycorisBaseModule):
         if self.bypass_mode:
             return self.bypass_forward(x, self.multiplier)
 
-        org_weight = self.get_org_weight_for_compute(x.device).to(self.dtype, non_blocking=True)
+        x = x.to(self._cached_dtype)
+        org_weight = self.get_org_weight_for_compute(x.device).to(self._cached_dtype, non_blocking=True)
         org_bias = self.get_org_bias_for_compute(x.device)
+        # Pre-resolve bias to real tensor or None (avoids numel check in compiled graph)
+        if org_bias is not None:
+            bias = org_bias.to(x.dtype, non_blocking=True)
+        else:
+            bias = None
 
-        return self._forward_rebuild_core(x, org_weight, org_bias)
+        return self._forward_rebuild_core(x, org_weight, bias)

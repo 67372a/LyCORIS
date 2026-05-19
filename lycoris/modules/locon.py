@@ -6,7 +6,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .base import LycorisBaseModule
-from .pissa_utils import pissa_svd, convert_pissa_to_lora
 from ..functional.general import rebuild_tucker
 from ..logging import logger
 
@@ -724,8 +723,9 @@ class LoConModule(LycorisBaseModule):
             ) + torch.finfo(weight.dtype).eps
 
         scale = self.dora_scale.to(weight.device) / weight_norm
-        if multiplier != 1:
-            scale = multiplier * (scale - 1) + 1
+        # Always apply: when multiplier==1 this simplifies to scale unchanged.
+        # Avoids data-dependent branch that causes torch.compile graph breaks.
+        scale = multiplier * (scale - 1) + 1
 
         return weight * scale
 
@@ -1110,7 +1110,7 @@ class LoConModule(LycorisBaseModule):
     def bypass_forward(self, x, scale=1):
         return self.org_forward(x) + self.bypass_forward_diff(x, scale=scale)
 
-    def _forward_rebuild_core(self, x, org_weight, org_bias):
+    def _forward_rebuild_core(self, x, org_weight, bias):
         """Rebuild-mode forward pass — the torch.compile target.
 
         Computes lora weight delta, merges with the pre-fetched original weight,
@@ -1121,10 +1121,11 @@ class LoConModule(LycorisBaseModule):
         Args:
             x: Input tensor.
             org_weight: Original module weight, already on compute device and dtype.
-            org_bias: Original module bias (or None), already on compute device.
+            bias: Pre-resolved bias tensor or None (numel check done in forward()).
         """
-        dtype = self.dtype
+        dtype = self._cached_dtype
         device = x.device
+        multiplier = self.multiplier_buf
 
         # Weight difference computation
         if (not self.wd and (self.tucker or self.rank_dropout)):
@@ -1138,19 +1139,48 @@ class LoConModule(LycorisBaseModule):
         # Merge weights
         weight = org_weight
         if self.wd:
-            weight = self.apply_weight_decompose(weight + diff_weight, self.multiplier)
+            weight = self.apply_weight_decompose(weight + diff_weight, multiplier)
             # Input dropout for DoRA
             x = self.drop(x)
         else:
-            weight = weight + diff_weight * self.multiplier
+            weight = weight + diff_weight * multiplier
 
-        # Bias handling
-        if org_bias is not None:
-            bias = org_bias.to(dtype, non_blocking=True)
-        else:
-            bias = None
+        return self._call_op(x, weight, bias)
 
-        return self.op(x, weight, bias, **self.kw_dict)
+    def _forward_bypass_core(self, x, down_weight, up_weight, mid_weight, scale):
+        """Compiled bypass diff forward — pure tensor math, no device transfers.
+
+        Args:
+            x: Input tensor.
+            down_weight: Pre-fetched lora_down weight (orthogonalized if needed).
+            up_weight: Pre-fetched lora_up weight (orthogonalized if needed).
+            mid_weight: Pre-fetched lora_mid weight or None.
+            scale: Scalar multiplier (scalar * self.scale * scale).
+        """
+        # Down projection
+        mid = self._call_op(x, down_weight)
+
+        # Optional Tucker mid
+        if self.tucker:
+            mid = self._call_op(mid, mid_weight)
+
+        # Rank dropout
+        if self.rank_dropout and self.training:
+            drop = (
+                torch.rand(self.lora_dim, device=mid.device) > self.rank_dropout
+            ).to(mid.dtype)
+            if self.rank_dropout_scale:
+                drop /= drop.mean()
+            if (dims := len(x.shape)) == 4:
+                drop = drop.view(1, -1, 1, 1)
+            else:
+                drop = drop.view(*[1] * (dims - 1), -1)
+            mid = mid * drop
+
+        # Up projection
+        up = self._call_op(mid, up_weight)
+
+        return self.drop(up * scale)
 
     def forward(self, x):
         if self.module_dropout and self.training:
@@ -1178,12 +1208,18 @@ class LoConModule(LycorisBaseModule):
         
         # Pre-fetch original weights outside the compiled region to avoid
         # graph breaks from conditional device transfers (ramtorch, async).
-        dtype = self.dtype
+        dtype = self._cached_dtype
+        x = x.to(dtype)
         org_weight = self.get_org_weight_for_compute(x.device).to(dtype, non_blocking=True)
         org_bias = self.get_org_bias_for_compute(x.device)
+        # Pre-resolve bias to real tensor or None (avoids numel check in compiled graph)
+        if org_bias is not None:
+            bias = org_bias.to(dtype, non_blocking=True)
+        else:
+            bias = None
 
         # Compiled rebuild path
-        result = self._forward_rebuild_core(x, org_weight, org_bias)
+        result = self._forward_rebuild_core(x, org_weight, bias)
         
         # Apply GGPO perturbation if needed (outside compiled region)
         if apply_ggpo:
@@ -1219,7 +1255,7 @@ class LoConModule(LycorisBaseModule):
             perturbation = perturbation * perturbation_scale_factor.view(*view_shape)
             
             # Use the appropriate convolution operation
-            return self.op(x, perturbation, None, **self.kw_dict)
+            return self._call_op(x, perturbation, None)
         else:
             return None
 

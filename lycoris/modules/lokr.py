@@ -570,8 +570,9 @@ class LokrModule(LycorisBaseModule):
             ) + torch.finfo(weight.dtype).eps
 
         scale = self.dora_scale.to(weight.device) / weight_norm
-        if multiplier != 1:
-            scale = multiplier * (scale - 1) + 1
+        # Always apply: when multiplier==1 this simplifies to scale unchanged.
+        # Avoids data-dependent branch that causes torch.compile graph breaks.
+        scale = multiplier * (scale - 1) + 1
 
         return weight * scale
 
@@ -661,19 +662,19 @@ class LokrModule(LycorisBaseModule):
             h_in_group = h.reshape(*h.shape[:-1], uq, -1)
 
         if self.use_w2:
-            hb = self.op(h_in_group, ba, **self.kw_dict)
+            hb = self._call_op(h_in_group, ba)
         else:
             if is_conv:
                 if self.tucker:
-                    ha = self.op(h_in_group, a)
-                    ht = self.op(ha, t, **self.kw_dict)
-                    hb = self.op(ht, b)
+                    ha = self._call_op(h_in_group, a)
+                    ht = self._call_op(ha, t)
+                    hb = self._call_op(ht, b)
                 else:
-                    ha = self.op(h_in_group, a, **self.kw_dict)
-                    hb = self.op(ha, b)
+                    ha = self._call_op(h_in_group, a)
+                    hb = self._call_op(ha, b)
             else:
-                ha = self.op(h_in_group, a, **self.kw_dict)
-                hb = self.op(ha, b)
+                ha = self._call_op(h_in_group, a)
+                hb = self._call_op(ha, b)
 
         if is_conv:
             # (b, uq), vp, ..., f
@@ -705,23 +706,23 @@ class LokrModule(LycorisBaseModule):
     def bypass_forward(self, x, scale=1):
         return self.org_forward(x) + self.bypass_forward_diff(x, scale=scale)
 
-    def _forward_rebuild_core(self, x, org_weight, org_bias):
+    def _forward_rebuild_core(self, x, org_weight, bias):
         """Rebuild-mode forward pass — the torch.compile target.
 
         Computes diff weight via Kronecker product decomposition, merges
         with the pre-fetched original weight, and runs the fused
         linear/conv operation.  All inputs are pre-fetched GPU tensors.
         """
-        diff_weight = self.get_weight(self.shape).to(self.dtype) * self.scalar
+        diff_weight = self.get_weight(self.shape).to(self._cached_dtype) * self.scalar
         weight = org_weight
+        multiplier = self.multiplier_buf
         if self.wd:
-            weight = self.apply_weight_decompose(weight + diff_weight, self.multiplier)
-        elif self.multiplier == 1:
-            weight = weight + diff_weight
+            weight = self.apply_weight_decompose(weight + diff_weight, multiplier)
         else:
-            weight = weight + diff_weight * self.multiplier
-        bias = org_bias.to(x.dtype, non_blocking=True) if org_bias is not None else None
-        return self.op(x, weight, bias, **self.kw_dict)
+            # Always apply multiplier (no-op when multiplier==1 since x*1=x).
+            # Avoids data-dependent branch that causes torch.compile graph breaks.
+            weight = weight + diff_weight * multiplier
+        return self._call_op(x, weight, bias)
 
     def forward(self, x: torch.Tensor, *args, **kwargs):
         if self.module_dropout and self.training:
@@ -730,10 +731,16 @@ class LokrModule(LycorisBaseModule):
         if self.bypass_mode:
             return self.bypass_forward(x, self.multiplier)
 
-        org_weight = self.get_org_weight_for_compute(x.device).data.to(self.dtype, non_blocking=True)
+        x = x.to(self._cached_dtype)
+        org_weight = self.get_org_weight_for_compute(x.device).data.to(self._cached_dtype, non_blocking=True)
         org_bias = self.get_org_bias_for_compute(x.device)
+        # Pre-resolve bias to real tensor or None (avoids numel check in compiled graph)
+        if org_bias is not None:
+            bias = org_bias.to(x.dtype, non_blocking=True)
+        else:
+            bias = None
 
-        return self._forward_rebuild_core(x, org_weight, org_bias)
+        return self._forward_rebuild_core(x, org_weight, bias)
 
 
 if __name__ == "__main__":

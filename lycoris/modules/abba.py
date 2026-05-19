@@ -404,26 +404,26 @@ class AbbaModule(LycorisBaseModule):
             if bias is not None:
                 bias = bias.to(x.dtype, non_blocking=True)
 
-            return self.drop(self.op(x, diff_weight * current_scale, bias, **self.kw_dict))
+            return self.drop(self._call_op(x, diff_weight * current_scale, bias))
 
-    def _forward_rebuild_core(self, x, org_weight, org_bias):
+    def _forward_rebuild_core(self, x, org_weight, bias):
         """Rebuild-mode forward pass — the torch.compile target.
 
         Computes diff weight via Hadamard product of two low-rank pairs,
         merges with the pre-fetched original weight, and runs the fused
         linear/conv operation.  All inputs are pre-fetched GPU tensors.
         """
-        diff_weight = self.make_weight(x.device).to(self.dtype) * self.scale * self.multiplier
+        multiplier = self.multiplier_buf
+        diff_weight = self.make_weight(x.device).to(self._cached_dtype) * self.scale * multiplier
 
         weight = org_weight
         if self.wd:
-            weight = self.apply_weight_decompose(weight + diff_weight, self.multiplier)
+            weight = self.apply_weight_decompose(weight + diff_weight, multiplier)
             x = self.drop(x)
         else:
             weight = weight + diff_weight
 
-        bias = org_bias.to(x.dtype, non_blocking=True) if org_bias is not None else None
-        return self.op(x, weight, bias, **self.kw_dict)
+        return self._call_op(x, weight, bias)
 
     def forward(self, x):
         """
@@ -440,15 +440,21 @@ class AbbaModule(LycorisBaseModule):
         # with the delta computation, so keep this branch uncompiled.
         if self.dropout and not self.wd:
             base_output = self.org_forward(x)
-            diff_weight = self.make_weight(x.device).to(self.dtype)
-            delta_output = self.op(x, diff_weight, None, **self.kw_dict)
+            diff_weight = self.make_weight(x.device).to(self._cached_dtype)
+            delta_output = self._call_op(x, diff_weight, None)
             final_delta = self.drop(delta_output * self.scale * self.multiplier)
             return base_output + final_delta
 
-        org_weight = self.get_org_weight_for_compute(x.device).to(self.dtype, non_blocking=True)
+        x = x.to(self._cached_dtype)
+        org_weight = self.get_org_weight_for_compute(x.device).to(self._cached_dtype, non_blocking=True)
         org_bias = self.get_org_bias_for_compute(x.device)
+        # Pre-resolve bias to real tensor or None (avoids numel check in compiled graph)
+        if org_bias is not None:
+            bias = org_bias.to(x.dtype, non_blocking=True)
+        else:
+            bias = None
 
-        return self._forward_rebuild_core(x, org_weight, org_bias)
+        return self._forward_rebuild_core(x, org_weight, bias)
 
     @torch.no_grad()
     def apply_max_norm(self, max_norm, device=None):
@@ -488,8 +494,9 @@ class AbbaModule(LycorisBaseModule):
             ) + torch.finfo(weight.dtype).eps
 
         scale = self.dora_scale.to(weight.device) / weight_norm
-        if multiplier != 1:
-            scale = multiplier * (scale - 1) + 1
+        # Always apply: when multiplier==1 this simplifies to scale unchanged.
+        # Avoids data-dependent branch that causes torch.compile graph breaks.
+        scale = multiplier * (scale - 1) + 1
 
         return weight * scale
     
@@ -517,6 +524,6 @@ class AbbaModule(LycorisBaseModule):
             perturbation = perturbation * perturbation_scale_factor.view(*view_shape)
             
             # Use the appropriate convolution operation
-            return self.op(x, perturbation, None, **self.kw_dict)
+            return self._call_op(x, perturbation, None)
         else:
             return None

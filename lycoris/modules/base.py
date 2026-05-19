@@ -9,6 +9,8 @@ from ..utils.quant import QuantLinears, log_bypass, log_suspect
 from ..logging import logger
 from typing import Optional
 import math
+import torch._dynamo
+torch._dynamo.config.recompile_limit = max(32, torch._dynamo.config.recompile_limit)
 
 try:
     from ramtorch.modules.linear import CPUBouncingLinear
@@ -255,7 +257,17 @@ class LycorisBaseModule(ModuleCustomSD):
             self.not_supported = True
             self.module_type = "unknown"
 
+        # Compile-friendly conv parameter cache (avoids **kw_dict graph breaks)
+        if self.module_type.startswith("conv"):
+            self._conv_stride = org_module.stride
+            self._conv_padding = org_module.padding
+            self._conv_dilation = org_module.dilation
+            self._conv_groups = org_module.groups
+
         self.register_buffer("dtype_tensor", torch.tensor(0.0), persistent=False)
+        # Cache dtype as plain attribute to avoid property access in compiled graphs.
+        # Kept in sync via _apply() override.
+        self._cached_dtype = self.dtype_tensor.dtype
 
         self.is_quant = False
         if isinstance(org_module, QuantLinears):
@@ -290,7 +302,12 @@ class LycorisBaseModule(ModuleCustomSD):
             nn.Identity() if rank_dropout == 0 else nn.Dropout(rank_dropout)
         )
 
-        self.multiplier = multiplier
+        self._multiplier = float(multiplier)
+        self.register_buffer(
+            "multiplier_buf",
+            torch.tensor(float(multiplier), dtype=torch.float32),
+            persistent=False,
+        )
         self.org_forward = org_module.forward
         self.org_module = [org_module]
 
@@ -298,6 +315,38 @@ class LycorisBaseModule(ModuleCustomSD):
         self.ggpo_beta = ggpo_beta
         self.ggpo_conv = ggpo_conv
         self.ggpo_conv_weight_sample_size = ggpo_conv_weight_sample_size
+
+    def _call_op(self, x, weight, bias=None):
+        """Compile-friendly op dispatch — avoids ``**kw_dict`` graph breaks.
+
+        Uses explicit ``F.linear`` / ``F.conv{1,2,3}d`` calls with cached
+        conv parameters instead of ``self.op(x, w, b, **self.kw_dict)``.
+        """
+        mt = self.module_type
+        if mt == "linear":
+            return F.linear(x, weight, bias)
+        if mt == "conv1d":
+            return F.conv1d(
+                x, weight, bias,
+                stride=self._conv_stride, padding=self._conv_padding,
+                dilation=self._conv_dilation, groups=self._conv_groups,
+            )
+        if mt == "conv2d":
+            return F.conv2d(
+                x, weight, bias,
+                stride=self._conv_stride, padding=self._conv_padding,
+                dilation=self._conv_dilation, groups=self._conv_groups,
+            )
+        if mt == "conv3d":
+            return F.conv3d(
+                x, weight, bias,
+                stride=self._conv_stride, padding=self._conv_padding,
+                dilation=self._conv_dilation, groups=self._conv_groups,
+            )
+        # Fallback for norm types and others
+        if bias is not None:
+            return self.op(x, weight, bias, **self.kw_dict)
+        return self.op(x, weight, **self.kw_dict)
 
     def _orthogonalize(self, weight_matrix: torch.Tensor) -> torch.Tensor:
         """
@@ -385,11 +434,29 @@ class LycorisBaseModule(ModuleCustomSD):
 
     @property
     def dtype(self):
-        return self.dtype_tensor.dtype
+        return self._cached_dtype
 
     @property
     def device(self):
         return self.dtype_tensor.device
+
+    def _apply(self, fn, recurse=True):
+        """Override to keep _cached_dtype in sync after .to() / .cuda() etc."""
+        result = super()._apply(fn, recurse=recurse)
+        self._cached_dtype = self.dtype_tensor.dtype
+        if hasattr(self, '_multiplier'):
+            self._multiplier = float(self.multiplier_buf.item())
+        return result
+
+    @property
+    def multiplier(self):
+        return self._multiplier
+
+    @multiplier.setter
+    def multiplier(self, value):
+        self._multiplier = float(value)
+        if hasattr(self, 'multiplier_buf'):
+            self.multiplier_buf.fill_(float(value))
 
     @property
     def org_weight(self):
@@ -503,20 +570,22 @@ class LycorisBaseModule(ModuleCustomSD):
         raise NotImplementedError
 
     def compile_forward(self, **compile_kwargs):
-        """Compile the rebuild-mode forward for performance.
+        """Compile the rebuild-mode and bypass-mode forwards for performance.
 
-        Wraps ``_forward_rebuild_core`` with ``torch.compile`` so that
-        weight-construction math and the final linear/conv op are fused into
-        optimized kernels.  Dispatch logic (module_dropout, bypass_mode,
-        GGPO) remains in the uncompiled ``forward()`` wrapper.
-
-        Subclasses that override ``_forward_rebuild_core`` will have their
-        version compiled automatically.  Subclasses that do not define it
-        (e.g. bypass-only modules) are silently skipped.
+        Wraps ``_forward_rebuild_core`` and ``_forward_bypass_core`` with
+        ``torch.compile`` so that weight-construction math and the final
+        linear/conv op are fused into optimized kernels.  Dispatch logic
+        (module_dropout, bypass_mode, GGPO) remains in the uncompiled
+        ``forward()`` wrapper.
         """
+
         if hasattr(self, '_forward_rebuild_core'):
             self._forward_rebuild_core = torch.compile(
                 self._forward_rebuild_core, **compile_kwargs
+            )
+        if hasattr(self, '_forward_bypass_core'):
+            self._forward_bypass_core = torch.compile(
+                self._forward_bypass_core, **compile_kwargs
             )
     
     @torch.no_grad()
