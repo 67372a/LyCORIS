@@ -705,29 +705,35 @@ class LokrModule(LycorisBaseModule):
     def bypass_forward(self, x, scale=1):
         return self.org_forward(x) + self.bypass_forward_diff(x, scale=scale)
 
+    def _forward_rebuild_core(self, x, org_weight, org_bias):
+        """Rebuild-mode forward pass — the torch.compile target.
+
+        Computes diff weight via Kronecker product decomposition, merges
+        with the pre-fetched original weight, and runs the fused
+        linear/conv operation.  All inputs are pre-fetched GPU tensors.
+        """
+        diff_weight = self.get_weight(self.shape).to(self.dtype) * self.scalar
+        weight = org_weight
+        if self.wd:
+            weight = self.apply_weight_decompose(weight + diff_weight, self.multiplier)
+        elif self.multiplier == 1:
+            weight = weight + diff_weight
+        else:
+            weight = weight + diff_weight * self.multiplier
+        bias = org_bias.to(x.dtype, non_blocking=True) if org_bias is not None else None
+        return self.op(x, weight, bias, **self.kw_dict)
+
     def forward(self, x: torch.Tensor, *args, **kwargs):
         if self.module_dropout and self.training:
             if torch.rand(1) < self.module_dropout:
                 return self.org_forward(x)
         if self.bypass_mode:
             return self.bypass_forward(x, self.multiplier)
-        else:
-            diff_weight = self.get_weight(self.shape).to(self.dtype) * self.scalar
-            weight = self.get_org_weight_for_compute(x.device).data.to(self.dtype, non_blocking=True)
-            if self.wd:
-                weight = self.apply_weight_decompose(
-                    weight + diff_weight, self.multiplier
-                )
-            elif self.multiplier == 1:
-                weight = weight + diff_weight
-            else:
-                weight = weight + diff_weight * self.multiplier
 
-            bias = self.get_org_bias_for_compute(x.device)
-            if bias is not None:
-                bias = bias.to(x.dtype, non_blocking=True)
+        org_weight = self.get_org_weight_for_compute(x.device).data.to(self.dtype, non_blocking=True)
+        org_bias = self.get_org_bias_for_compute(x.device)
 
-            return self.op(x, weight, bias, **self.kw_dict)
+        return self._forward_rebuild_core(x, org_weight, org_bias)
 
 
 if __name__ == "__main__":

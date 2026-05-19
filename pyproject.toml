@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lycoris_lora"
-version = "3.2.0.dev32"
+version = "3.2.0.dev33"
 description = "Lora beYond Conventional methods, Other Rank adaptation Implementations for Stable diffusion"
 readme = "README.md"
 license = "Apache-2.0"
@@ -28,7 +28,7 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "torch>=2.4.1",
+    "torch>=2.7.1",
     "einops>=0.8.1",
     "toml>=0.10.2",
     "tqdm>=4.67.1",
@@ -63,8 +63,8 @@ kohya = [
     "ninja>=1.11.0",
     "cmake>=3.28.0",
     "setuptools>=69.0.0",
-    "triton>=2.0.0; platform_system == 'Linux'",
-    "triton-windows>=3.0.0; platform_system == 'Windows'",
+    "triton>=3.3.1; platform_system == 'Linux'",
+    "triton-windows>=3.3.1; platform_system == 'Windows'",
     "prodigy-plus-schedule-free>=1.0.0",
     "kornia>=0.7.0",
     "PyWavelets>=1.5.0",

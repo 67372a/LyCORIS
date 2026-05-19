@@ -270,6 +270,41 @@ class DiagOFTModule(LycorisBaseModule):
     def bypass_forward(self, x, scale=1):
         return self._bypass_forward(x, scale, diff=False)
 
+    def _forward_rebuild_core(self, x, org_weight, org_bias):
+        """Rebuild-mode forward pass — the torch.compile target.
+
+        Computes OFT weight via Cayley transform and einsum, merging with
+        the pre-fetched original weight.  All inputs are pre-fetched GPU
+        tensors so no conditional device transfers occur inside this method.
+        """
+        r = self.get_r()
+        r = self._apply_multiplicative_dropout(r)
+
+        scale = self.multiplier
+        org_dtype = org_weight.dtype
+        r_dtype = r.dtype
+        target_dtype = torch.promote_types(org_dtype, r_dtype)
+
+        _, *shape = org_weight.shape
+        org = org_weight.to(target_dtype, non_blocking=True)
+        org_reshaped = org.view(self.block_num, self.block_size, *shape)
+
+        # diag_oft einsum: R * org_weight (R = I + skew-symmetric via Cayley)
+        w = torch.einsum(
+            "k n m, k n ... -> k m ...",
+            self.rank_drop(r * scale) - scale * self.I + self.I,
+            org_reshaped,
+        ).view(-1, *shape)
+
+        if self.rescaled:
+            w = self.rescale * w
+
+        w = w.to(org_dtype)
+
+        bias = org_bias.to(x.dtype, non_blocking=True) if org_bias is not None else None
+        kw_dict = {**self.kw_dict, "weight": w, "bias": bias}
+        return self.op(x, **kw_dict)
+
     def forward(self, x: torch.Tensor, *args, **kwargs):
         if self.module_dropout and self.training:
             if torch.rand(1) < self.module_dropout:
@@ -278,13 +313,8 @@ class DiagOFTModule(LycorisBaseModule):
 
         if self.bypass_mode:
             return self.bypass_forward(x, scale)
-        else:
-            w = self.make_weight(scale, x.device)
-            
-            current_bias = self.get_org_bias_for_compute(x.device)
-            if current_bias is not None:
-                current_bias = current_bias.to(x.dtype, non_blocking=True)
-            
-            kw_dict = {**self.kw_dict, "weight": w, "bias": current_bias}
 
-            return self.op(x, **kw_dict)
+        org_weight = self.get_org_weight_for_compute(x.device)
+        org_bias = self.get_org_bias_for_compute(x.device)
+
+        return self._forward_rebuild_core(x, org_weight, org_bias)

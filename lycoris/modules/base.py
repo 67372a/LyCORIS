@@ -501,6 +501,23 @@ class LycorisBaseModule(ModuleCustomSD):
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError
+
+    def compile_forward(self, **compile_kwargs):
+        """Compile the rebuild-mode forward for performance.
+
+        Wraps ``_forward_rebuild_core`` with ``torch.compile`` so that
+        weight-construction math and the final linear/conv op are fused into
+        optimized kernels.  Dispatch logic (module_dropout, bypass_mode,
+        GGPO) remains in the uncompiled ``forward()`` wrapper.
+
+        Subclasses that override ``_forward_rebuild_core`` will have their
+        version compiled automatically.  Subclasses that do not define it
+        (e.g. bypass-only modules) are silently skipped.
+        """
+        if hasattr(self, '_forward_rebuild_core'):
+            self._forward_rebuild_core = torch.compile(
+                self._forward_rebuild_core, **compile_kwargs
+            )
     
     @torch.no_grad()
     def initialize_norm_cache(self, org_module_weight: torch.Tensor):

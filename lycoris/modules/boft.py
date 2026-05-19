@@ -311,6 +311,52 @@ class ButterflyOFTModule(LycorisBaseModule):
     def bypass_forward(self, x, scale=1):
         return self._bypass_forward(x, scale, diff=False)
 
+    def _forward_rebuild_core(self, x, org_weight, org_bias):
+        """Rebuild-mode forward pass — the torch.compile target.
+
+        Computes BOFT weight via butterfly factorization over m stages,
+        merges with the pre-fetched original weight, and runs the fused
+        linear/conv operation.  All inputs are pre-fetched GPU tensors.
+        """
+        m = self.boft_m
+        b = self.boft_b
+        r_b = b // 2
+        r = self.get_r()
+        r = self._apply_multiplicative_dropout(r)
+
+        scale = self.multiplier
+        org_dtype = org_weight.dtype
+        r_dtype = r.dtype
+        target_dtype = torch.promote_types(org_dtype, r_dtype)
+
+        inp = org_weight.to(target_dtype, non_blocking=True)
+
+        for i in range(m):
+            bi = r[i]  # b_num, b_size, b_size
+            g = 2
+            k = 2**i * r_b
+            if scale != 1:
+                bi = bi * scale + (1 - scale) * self.I.to(device=bi.device, dtype=bi.dtype)
+            inp = (
+                inp.unflatten(0, (-1, g, k))
+                .transpose(1, 2)
+                .flatten(0, 2)
+                .unflatten(0, (-1, b))
+            )
+            inp = torch.einsum("b i j, b j ...-> b i ...", bi, inp)
+            inp = (
+                inp.flatten(0, 1).unflatten(0, (-1, k, g)).transpose(1, 2).flatten(0, 2)
+            )
+
+        if self.rescaled:
+            inp = inp * self.rescale.to(device=inp.device, dtype=inp.dtype)
+
+        w = inp.to(org_dtype)
+
+        bias = org_bias.to(x.dtype, non_blocking=True) if org_bias is not None else None
+        kw_dict = {**self.kw_dict, "weight": w, "bias": bias}
+        return self.op(x, **kw_dict)
+
     def forward(self, x, *args, **kwargs):
         if self.module_dropout and self.training:
             if torch.rand(1) < self.module_dropout:
@@ -319,14 +365,9 @@ class ButterflyOFTModule(LycorisBaseModule):
 
         if self.bypass_mode:
             return self.bypass_forward(x, scale)
-        else:
-            w = self.make_weight(scale, x.device)
 
-            current_bias = self.get_org_bias_for_compute(x.device)
-            if current_bias is not None:
-                current_bias = current_bias.to(x.dtype, non_blocking=True)
-            
-            kw_dict = {**self.kw_dict, "weight": w, "bias": current_bias}
+        org_weight = self.get_org_weight_for_compute(x.device)
+        org_bias = self.get_org_bias_for_compute(x.device)
 
-            return self.op(x, **kw_dict)
+        return self._forward_rebuild_core(x, org_weight, org_bias)
 

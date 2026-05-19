@@ -330,36 +330,62 @@ class GLoRAModule(LycorisBaseModule):
     def bypass_forward(self, x, scale=1):
         return self._bypass_forward(x, scale=scale, diff=False)
 
+    def _forward_rebuild_core(self, x, org_weight, org_bias):
+        """Rebuild-mode forward pass — the torch.compile target.
+
+        Computes GLoRA diff weight (branch A: org-based, branch B: weight-only),
+        merges with the pre-fetched original weight, and runs the fused
+        linear/conv operation.  All inputs are pre-fetched GPU tensors.
+        """
+        device = x.device
+        dtype = self.dtype
+
+        wa1 = self._orthogonalize(self.a1.weight).view(self.a1.weight.size(0), -1)
+        wa2 = self._orthogonalize(self.a2.weight).view(-1, self.a2.weight.size(1))
+        orig = org_weight.to(dtype)
+
+        if self.tucker:
+            wb1 = self._orthogonalize(self.b1.weight)
+            wb2 = self._orthogonalize(self.b2.weight)
+            wbm = self._orthogonalize(self.bm.weight)
+            wb = tucker_weight_from_conv(wb1, wb2, wbm)
+        else:
+            wb1 = self._orthogonalize(self.b1.weight).view(self.b1.weight.size(0), -1)
+            wb2 = self._orthogonalize(self.b2.weight).view(self.b2.weight.size(0), -1)
+            wb = wb1 @ wb2
+            wb = wb.view(*orig.shape)
+
+        if orig.dim() > 2:
+            w_wa1 = torch.einsum("o i ..., i j -> o j ...", orig, wa1)
+            w_wa2 = torch.einsum("o i ..., i j -> o j ...", w_wa1, wa2)
+        else:
+            w_wa2 = (orig @ wa1) @ wa2
+
+        diff_w = (wb + w_wa2) * self.scale * self.scalar.to(device=device) * self.multiplier
+        weight = orig.add(diff_w)
+
+        if self.dropout:
+            x = self.drop(x)
+
+        bias = org_bias
+        if weight.dtype != x.dtype:
+            weight = weight.to(x.dtype)
+        if bias is not None and bias.dtype != x.dtype:
+            bias = bias.to(x.dtype, non_blocking=True)
+
+        return self.op(x, weight, bias, **self.kw_dict)
+
     def forward(self, x, *args, **kwargs):
         if self.module_dropout and self.training:
             if torch.rand(1) < self.module_dropout:
                 return self.org_forward(x)
         if self.bypass_mode:
             return self.bypass_forward(x, self.multiplier)
-        else:
-            weight = self.get_org_weight_for_compute(x.device)
 
-            # Ensure correct dtype
-            if weight.dtype != self.dtype:
-                weight = weight.to(self.dtype)
+        org_weight = self.get_org_weight_for_compute(x.device)
+        org_bias = self.get_org_bias_for_compute(x.device)
 
-            diff_w, _ = self.get_diff_weight(multiplier=self.multiplier, device=x.device)
-
-            weight = weight.add(diff_w)
-
-            bias = self.get_org_bias_for_compute(x.device)
-
-            if self.dropout:
-                x = self.drop(x)
-
-            if weight.dtype != x.dtype:
-                weight = weight.to(x.dtype)
-            if bias is not None and bias.dtype != x.dtype:
-                bias = bias.to(x.dtype)
-
-            result = self.op(x, weight, bias, **self.kw_dict)
-
-            return result
+        return self._forward_rebuild_core(x, org_weight, org_bias)
         
     @torch.no_grad()
     def apply_max_norm(self, max_norm, device=None):

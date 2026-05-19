@@ -118,9 +118,9 @@ def create_network(
 
     train_t5xxl = str_bool(kwargs.get("train_t5xxl", False))
     torch_compile = str_bool(kwargs.get("torch_compile", False))
-    torch_compile_mode = kwargs.get("torch_compile_mode", "max-autotune")
-    torch_compile_dynamic = str_bool(kwargs.get("torch_compile_dynamic", False))
-    torch_compile_fullgraph = str_bool(kwargs.get("torch_compile_fullgraph", True))
+    torch_compile_mode = kwargs.get("torch_compile_mode", "default")
+    torch_compile_dynamic = str_bool(kwargs.get("torch_compile_dynamic", True))
+    torch_compile_fullgraph = str_bool(kwargs.get("torch_compile_fullgraph", False))
     train_llm_adapter = str_bool(kwargs.get("train_llm_adapter", False))
 
     svd_segment = kwargs.get("svd_segment", None)
@@ -435,10 +435,18 @@ def create_network(
         )
 
     if torch_compile:
-        with torch._dynamo.utils.disable_cache_limit():
-            return torch.compile(network, dynamic=torch_compile_dynamic, mode=torch_compile_mode, fullgraph=torch_compile_fullgraph)
-    else:
-        return network
+        # Store compile settings on the network; actual per-module compilation
+        # happens in apply_to() so each lora module's rebuild-mode forward
+        # is individually compiled (rather than compiling the container which
+        # has no forward()).
+        network._torch_compile = True
+        network._torch_compile_kwargs = dict(
+            dynamic=torch_compile_dynamic,
+            mode=torch_compile_mode,
+            fullgraph=torch_compile_fullgraph,
+        )
+
+    return network
 
 
 def create_network_from_weights(
@@ -1227,6 +1235,12 @@ class LycorisNetworkKohya(LycorisNetwork):
 
         for lora in self.loras:
             lora.apply_to()
+            # Per-module torch.compile: compile each module's rebuild-mode
+            # forward (weight construction + fused op) rather than the
+            # network container which has no forward().
+            if self._torch_compile and hasattr(lora, 'compile_forward'):
+                with torch._dynamo.utils.disable_cache_limit():
+                    lora.compile_forward(**self._torch_compile_kwargs)
             self.add_module(lora.lora_name, lora)
 
         if self.weights_sd:

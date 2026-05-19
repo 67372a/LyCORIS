@@ -406,6 +406,25 @@ class AbbaModule(LycorisBaseModule):
 
             return self.drop(self.op(x, diff_weight * current_scale, bias, **self.kw_dict))
 
+    def _forward_rebuild_core(self, x, org_weight, org_bias):
+        """Rebuild-mode forward pass — the torch.compile target.
+
+        Computes diff weight via Hadamard product of two low-rank pairs,
+        merges with the pre-fetched original weight, and runs the fused
+        linear/conv operation.  All inputs are pre-fetched GPU tensors.
+        """
+        diff_weight = self.make_weight(x.device).to(self.dtype) * self.scale * self.multiplier
+
+        weight = org_weight
+        if self.wd:
+            weight = self.apply_weight_decompose(weight + diff_weight, self.multiplier)
+            x = self.drop(x)
+        else:
+            weight = weight + diff_weight
+
+        bias = org_bias.to(x.dtype, non_blocking=True) if org_bias is not None else None
+        return self.op(x, weight, bias, **self.kw_dict)
+
     def forward(self, x):
         """
         Standard forward pass. Handles module dropout and bypass/rebuild modes.
@@ -416,42 +435,20 @@ class AbbaModule(LycorisBaseModule):
 
         if self.bypass_mode:
             return self.org_forward(x) + self.bypass_forward_diff(x, self.multiplier)
-        else:
-            if self.wd:
-                # Rebuild mode: merge weights on-the-fly
-                merged_weight, _ = self.get_merged_weight(self.multiplier, device=x.device)
 
-                bias = self.get_org_bias_for_compute(x.device)
-                if bias is not None:
-                    bias = bias.to(x.dtype, non_blocking=True)
-                    
-                return self.op(self.drop(x), merged_weight, bias, **self.kw_dict)
-            elif self.dropout:
-                # 1. Get the original module's output
-                # self.org_forward(x) correctly calls the original layer's forward pass.
-                base_output = self.org_forward(x)
+        # Dropout path without weight decomposition: cannot fuse org_forward
+        # with the delta computation, so keep this branch uncompiled.
+        if self.dropout and not self.wd:
+            base_output = self.org_forward(x)
+            diff_weight = self.make_weight(x.device).to(self.dtype)
+            delta_output = self.op(x, diff_weight, None, **self.kw_dict)
+            final_delta = self.drop(delta_output * self.scale * self.multiplier)
+            return base_output + final_delta
 
-                # 2. Calculate the LoRA delta output
-                diff_weight = self.make_weight(x.device).to(self.dtype)
-                
-                # The delta path has no bias.
-                delta_output = self.op(x, diff_weight, None, **self.kw_dict)
+        org_weight = self.get_org_weight_for_compute(x.device).to(self.dtype, non_blocking=True)
+        org_bias = self.get_org_bias_for_compute(x.device)
 
-                # 3. Apply scaling, multiplier, and network dropout to the delta output
-                # This mirrors the logic in bypass_forward_diff
-                final_delta = self.drop(delta_output * self.scale * self.multiplier)
-                
-                # 4. Return the sum
-                return base_output + final_delta
-            else:
-                # Rebuild mode: merge weights on-the-fly
-                merged_weight, _ = self.get_merged_weight(self.multiplier, device=x.device)
-
-                bias = self.get_org_bias_for_compute(x.device)
-                if bias is not None:
-                    bias = bias.to(x.dtype, non_blocking=True)
-
-                return self.op(x, merged_weight, bias, **self.kw_dict)
+        return self._forward_rebuild_core(x, org_weight, org_bias)
 
     @torch.no_grad()
     def apply_max_norm(self, max_norm, device=None):

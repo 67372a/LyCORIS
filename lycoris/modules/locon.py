@@ -1110,6 +1110,48 @@ class LoConModule(LycorisBaseModule):
     def bypass_forward(self, x, scale=1):
         return self.org_forward(x) + self.bypass_forward_diff(x, scale=scale)
 
+    def _forward_rebuild_core(self, x, org_weight, org_bias):
+        """Rebuild-mode forward pass — the torch.compile target.
+
+        Computes lora weight delta, merges with the pre-fetched original weight,
+        and runs the fused linear/conv operation. All inputs are pre-fetched GPU
+        tensors so no conditional device transfers occur inside this method,
+        keeping the compiled graph free of graph breaks.
+
+        Args:
+            x: Input tensor.
+            org_weight: Original module weight, already on compute device and dtype.
+            org_bias: Original module bias (or None), already on compute device.
+        """
+        dtype = self.dtype
+        device = x.device
+
+        # Weight difference computation
+        if (not self.wd and (self.tucker or self.rank_dropout)):
+            if self.olora:
+                diff_weight = self._compute_diff_weight_multitask(device, dtype)
+            else:
+                diff_weight = self._compute_diff_weight_single(device, dtype)
+        else:
+            diff_weight = self.make_weight(device).to(dtype) * self.scale
+
+        # Merge weights
+        weight = org_weight
+        if self.wd:
+            weight = self.apply_weight_decompose(weight + diff_weight, self.multiplier)
+            # Input dropout for DoRA
+            x = self.drop(x)
+        else:
+            weight = weight + diff_weight * self.multiplier
+
+        # Bias handling
+        if org_bias is not None:
+            bias = org_bias.to(dtype, non_blocking=True)
+        else:
+            bias = None
+
+        return self.op(x, weight, bias, **self.kw_dict)
+
     def forward(self, x):
         if self.module_dropout and self.training:
             if torch.rand(1) < self.module_dropout:
@@ -1130,51 +1172,25 @@ class LoConModule(LycorisBaseModule):
                     perturbation_output = self.ggpo_pertubation(x)
                 
                 if perturbation_output is not None:
-                    # Add perturbation to result and return
                     result = result + perturbation_output
                     
             return result
         
-        # Non-bypass mode with perturbation
+        # Pre-fetch original weights outside the compiled region to avoid
+        # graph breaks from conditional device transfers (ramtorch, async).
         dtype = self.dtype
-        # Non-bypass mode: Get org_weight with async transfer
-        org_weight_gpu = self.get_org_weight_for_compute(x.device).to(dtype, non_blocking=True)
-        
-        # Apply lora dropout during weight computation if enabled
-        if (not self.wd and (self.tucker or self.rank_dropout)):
-            if self.olora:
-                diff_weight = self._compute_diff_weight_multitask(x.device, dtype)
-            else:
-                diff_weight = self._compute_diff_weight_single(x.device, dtype)
-        else:
-            diff_weight = self.make_weight(x.device).to(dtype) * self.scale
-        
-        # Apply the weight to the input
-        weight = org_weight_gpu
-        
-        if self.wd:
-            weight = self.apply_weight_decompose(weight + diff_weight, self.multiplier)
+        org_weight = self.get_org_weight_for_compute(x.device).to(dtype, non_blocking=True)
+        org_bias = self.get_org_bias_for_compute(x.device)
 
-            # Input dropout for DoRA
-            x = self.drop(x)
-        else:
-            weight = weight + diff_weight * self.multiplier
+        # Compiled rebuild path
+        result = self._forward_rebuild_core(x, org_weight, org_bias)
         
-        # Get bias
-        bias = self.get_org_bias_for_compute(x.device)
-        if bias is not None:
-            bias = bias.to(dtype, non_blocking=True)
-
-        # Apply operation with weights
-        result = self.op(x, weight, bias, **self.kw_dict)
-        
-        # Apply GGPO perturbation if needed
+        # Apply GGPO perturbation if needed (outside compiled region)
         if apply_ggpo:
             with torch.no_grad():
                 perturbation_output = self.ggpo_pertubation(x)
                 
             if perturbation_output is not None:
-                # Add perturbation to result and return
                 result = result + perturbation_output
         
         return result
