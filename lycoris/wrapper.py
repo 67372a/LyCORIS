@@ -27,6 +27,7 @@ from .modules.full import FullModule
 from .modules.diag_oft import DiagOFTModule
 from .modules.boft import ButterflyOFTModule
 from .modules.tlora import TLoraModule
+from .modules.lora2 import LoRA2Module
 from .modules import get_module, make_module
 
 from .config import PRESET
@@ -77,6 +78,7 @@ network_module_dict = {
     "diag-oft": DiagOFTModule,
     "boft": ButterflyOFTModule,
     "tlora": TLoraModule,
+    "lora2": LoRA2Module,
 }
 deprecated_arg_dict = {
     "disable_conv_cp": "use_tucker",
@@ -314,6 +316,21 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
             )
             use_scalar = False
 
+    # LoRA² parameters (Adaptive Rank LoRA)
+    lora2_nu_init = kwargs.get("lora2_nu_init", None)
+    lora2_nu_target = kwargs.get("lora2_nu_target", None)
+    lora2_quantile = float(kwargs.get("lora2_quantile", 0.9))
+    lora2_lambda_r = float(kwargs.get("lora2_lambda_r", 1e-4))
+    lora2_lambda_e = float(kwargs.get("lora2_lambda_e", 1e-4))
+
+    if algo == "lora2":
+        logger.info("LoRA²: Adaptive Rank LoRA enabled")
+        logger.info(f"  quantile={lora2_quantile}, lambda_r={lora2_lambda_r}, lambda_e={lora2_lambda_e}")
+        if lora2_nu_target is not None:
+            logger.info(f"  nu_target_rank={lora2_nu_target}")
+        if lora2_nu_init is not None:
+            logger.info(f"  nu_init={lora2_nu_init}")
+
     preset = kwargs.get("preset", "full")
     if preset not in PRESET:
         preset = read_preset(preset)
@@ -415,6 +432,12 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
         ralora_svd_threshold=ralora_svd_threshold,
         ralora_cumulative_variance=ralora_cumulative_variance,
         ralora_forward_method=ralora_forward_method,
+        # LoRA² parameters
+        lora2_nu_init=lora2_nu_init,
+        lora2_nu_target=lora2_nu_target,
+        lora2_quantile=lora2_quantile,
+        lora2_lambda_r=lora2_lambda_r,
+        lora2_lambda_e=lora2_lambda_e,
     )
 
     if torch_compile:

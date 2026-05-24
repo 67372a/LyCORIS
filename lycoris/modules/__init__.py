@@ -14,12 +14,14 @@ from .glora import GLoRAModule
 from .dylora import DyLoraModule
 from .ia3 import IA3Module
 from .tlora import TLoraModule
+from .lora2 import LoRA2Module
 
 from ..functional.general import factorization
 
 
 MODULE_LIST = [
     AbbaModule,
+    LoRA2Module,  # Before LoConModule: algo_check uses lora2_nu (unique key)
     LoConModule,
     GoRAModule,
     RaLoRAModule,
