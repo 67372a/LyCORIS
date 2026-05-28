@@ -320,6 +320,7 @@ class LycorisBaseModule(ModuleCustomSD):
         # wrapper, or passed through **kwargs from subclasses that forward them.
         self.weight_noise_sigma = kwargs.get('weight_noise_sigma', None)
         self.weight_noise_mode = kwargs.get('weight_noise_mode', 'relative')
+        self.weight_noise_dynamic_sigma = kwargs.get('weight_noise_dynamic_sigma', False)
 
     def _call_op(self, x, weight, bias=None):
         """Compile-friendly op dispatch — avoids ``**kw_dict`` graph breaks.
@@ -950,7 +951,7 @@ class LycorisBaseModule(ModuleCustomSD):
         return None
 
     @torch.no_grad()
-    def inject_weight_noise(self) -> float:
+    def inject_weight_noise(self, lr: float = 1e-4, effective_batch_size: int = 1, param_lr_map: dict = None) -> float:
         """Add Gaussian noise directly to trainable parameter values.
 
         Inspired by ai-toolkit-perceptual's Weight Noising. Adds noise
@@ -964,6 +965,16 @@ class LycorisBaseModule(ModuleCustomSD):
             weight RMS (default). Zero-init params (e.g. LoRA-up)
             get zero noise until they learn something.
 
+        When ``weight_noise_dynamic_sigma`` is True, the computed sigma
+        is further scaled by ``lr / √effective_batch_size``, making
+        noise magnitude proportional to learning rate and inversely
+        proportional to √batch size (consistent with SGLD theory).
+
+        Args:
+            lr: Current learning rate (used only when dynamic_sigma=True).
+            effective_batch_size: Total effective batch size
+                (batch_size × gradient_accumulation_steps).
+
         Returns:
             Sum of squared noise values (for Frobenius norm computation
             at the network level).
@@ -971,11 +982,22 @@ class LycorisBaseModule(ModuleCustomSD):
         if self.weight_noise_sigma is None or self.weight_noise_sigma <= 0:
             return 0.0
 
+        # Dynamic sigma scaling: multiply base sigma by lr / √eff_bs
         noise_sq = 0.0
         for p in self.parameters():
             if not p.requires_grad:
                 continue
             w = p.data
+
+            # Per-parameter LR: use param_lr_map if available, else fallback to global lr
+            p_lr = lr
+            if param_lr_map is not None and id(p) in param_lr_map:
+                p_lr = param_lr_map[id(p)]
+
+            dyn_scale = 1.0
+            if getattr(self, 'weight_noise_dynamic_sigma', False):
+                dyn_scale = p_lr / max(math.sqrt(effective_batch_size), 1e-30)
+
             if self.weight_noise_mode == 'absolute':
                 sigma = self.weight_noise_sigma
             elif self.weight_noise_mode == 'relative':
@@ -983,6 +1005,7 @@ class LycorisBaseModule(ModuleCustomSD):
                 sigma = self.weight_noise_sigma * rms
             else:
                 continue
+            sigma = sigma * dyn_scale
             if sigma <= 0:
                 continue
             noise = torch.randn_like(w) * sigma

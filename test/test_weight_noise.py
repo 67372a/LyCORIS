@@ -382,5 +382,136 @@ class CUDADeviceWeightNoiseTests(unittest.TestCase):
         self.assertGreater(result, 0.0)
 
 
+class DynamicSigmaTests(unittest.TestCase):
+    """Tests for weight_noise_dynamic_sigma scaling."""
+
+    def _make_module(self, module_cls, base_module, device, dtype,
+                     weight_noise_sigma=None, weight_noise_mode="relative",
+                     weight_noise_dynamic_sigma=False):
+        base_module = base_module.to(device, dtype)
+        net = module_cls(
+            "test", base_module, multiplier=1, lora_dim=4, alpha=1,
+        ).to(device, dtype)
+        net.weight_noise_sigma = weight_noise_sigma
+        net.weight_noise_mode = weight_noise_mode
+        net.weight_noise_dynamic_sigma = weight_noise_dynamic_sigma
+        net.apply_to()
+        return net
+
+    def test_dynamic_sigma_scaled_by_lr(self):
+        """Larger LR should produce larger noise with dynamic sigma."""
+        base = nn.Linear(16, 16)
+        net = self._make_module(LoConModule, base, torch.device("cpu"), torch.float32,
+                                weight_noise_sigma=0.01, weight_noise_mode="absolute",
+                                weight_noise_dynamic_sigma=True)
+
+        params_before = {n: p.data.clone() for n, p in net.named_parameters() if p.requires_grad}
+
+        result_small = net.inject_weight_noise(lr=1e-5, effective_batch_size=1)
+        params_after_small = {n: p.data.clone() for n, p in net.named_parameters() if p.requires_grad}
+
+        # Reset params
+        for n, p in net.named_parameters():
+            if p.requires_grad:
+                p.data.copy_(params_before[n])
+
+        result_large = net.inject_weight_noise(lr=1e-2, effective_batch_size=1)
+
+        # Larger LR → larger noise norm
+        self.assertGreater(result_large, result_small)
+
+    def test_dynamic_sigma_scaled_by_batch_size(self):
+        """Larger batch size should produce smaller noise with dynamic sigma."""
+        base = nn.Linear(16, 16)
+        net = self._make_module(LoConModule, base, torch.device("cpu"), torch.float32,
+                                weight_noise_sigma=0.01, weight_noise_mode="absolute",
+                                weight_noise_dynamic_sigma=True)
+
+        params_before = {n: p.data.clone() for n, p in net.named_parameters() if p.requires_grad}
+
+        result_small_bs = net.inject_weight_noise(lr=1e-3, effective_batch_size=1)
+
+        # Reset params
+        for n, p in net.named_parameters():
+            if p.requires_grad:
+                p.data.copy_(params_before[n])
+
+        result_large_bs = net.inject_weight_noise(lr=1e-3, effective_batch_size=16)
+
+        # Larger batch → smaller noise (inversely proportional to √batch_size)
+        self.assertGreater(result_small_bs, result_large_bs)
+
+    def test_dynamic_sigma_quantitative(self):
+        """Verify dynamic sigma produces a different noise level than static.
+
+        inject_weight_noise returns noise_sq (squared Frobenius norm), so
+        ratio should be (sigma_a / sigma_b)^2 when sigma scales linearly.
+        """
+        base = nn.Linear(16, 16)
+        net = self._make_module(LoConModule, base, torch.device("cpu"), torch.float32,
+                                weight_noise_sigma=1.0, weight_noise_mode="absolute",
+                                weight_noise_dynamic_sigma=True)
+
+        # dyn_scale = lr / sqrt(eff_bs)
+        # sigma_a = 1.0 * 0.01 / 1 = 0.01
+        # sigma_b = 1.0 * 0.001 / 1 = 0.001
+        # noise_sq ∝ sigma^2, so ratio ≈ (0.01/0.001)^2 = 100
+        result_a = net.inject_weight_noise(lr=0.01, effective_batch_size=1)
+        for p in net.parameters():
+            if p.requires_grad:
+                p.data.zero_()
+        result_b = net.inject_weight_noise(lr=0.001, effective_batch_size=1)
+
+        ratio = result_a / result_b
+        self.assertAlmostEqual(ratio, 100.0, delta=30.0)
+
+    def test_dynamic_sigma_off_by_default(self):
+        """When dynamic_sigma is False, LR and batch_size should not affect noise."""
+        base = nn.Linear(16, 16)
+        net = self._make_module(LoConModule, base, torch.device("cpu"), torch.float32,
+                                weight_noise_sigma=0.01, weight_noise_mode="absolute",
+                                weight_noise_dynamic_sigma=False)
+
+        # Use same seed for deterministic random draws
+        torch.manual_seed(42)
+        for p in net.parameters():
+            if p.requires_grad:
+                p.data.fill_(1.0)
+        result1 = net.inject_weight_noise(lr=1e-5, effective_batch_size=1)
+
+        torch.manual_seed(42)
+        for p in net.parameters():
+            if p.requires_grad:
+                p.data.fill_(1.0)
+        result2 = net.inject_weight_noise(lr=1e-2, effective_batch_size=64)
+
+        # The noise norm should be identical since dynamic_sigma is off
+        self.assertEqual(result1, result2)
+
+    def test_network_dynamic_sigma_passthrough(self):
+        """Network should propagate dynamic_sigma to modules."""
+        model = nn.Sequential(nn.Linear(16, 16))
+        network = create_lycoris(
+            model,
+            multiplier=1.0, linear_dim=4, linear_alpha=1, algo="lora",
+            weight_noise_sigma=0.01, weight_noise_mode="relative",
+            weight_noise_dynamic_sigma=True,
+        )
+        network.apply_to()
+
+        for lora in network.loras:
+            self.assertTrue(lora.weight_noise_dynamic_sigma)
+
+        # Verify it actually affects noise when lr/bs are passed
+        params_before = {}
+        for lora in network.loras:
+            for n, p in lora.named_parameters():
+                if p.requires_grad:
+                    params_before[f"{lora.lora_name}.{n}"] = p.data.clone()
+
+        result = network.inject_weight_noise(lr=0.01, effective_batch_size=4)
+        self.assertGreater(result, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

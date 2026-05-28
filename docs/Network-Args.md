@@ -215,6 +215,7 @@ Inspired by ai-toolkit-perceptual's Weight Noising. Adds Gaussian noise directly
 
 - Set with `weight_noise_sigma=FLOAT` to enable
 - Set mode with `weight_noise_mode=STRING` (default: `relative`)
+- Enable dynamic scaling with `weight_noise_dynamic_sigma=True` (default: `False`)
 - Valid for all algorithms
 
 **Modes:**
@@ -224,16 +225,39 @@ Inspired by ai-toolkit-perceptual's Weight Noising. Adds Gaussian noise directly
 | `relative` (default) | σ = `weight_noise_sigma` × per-param weight RMS. Adapts to per-tensor scale automatically. Zero-init params (e.g. LoRA-up) get zero noise until they learn something. |
 | `absolute` | σ fixed at `weight_noise_sigma` for every parameter. Use when you know the target perturbation magnitude in absolute terms. |
 
+**Dynamic Sigma Scaling:**
+
+When `weight_noise_dynamic_sigma=True`, the computed sigma is further scaled by `lr / √effective_batch_size` (based on SGLD theory — Welling & Teh 2011, Neelakantan et al. 2015):
+
+```
+σ_final = σ_base × lr / √effective_batch_size
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `weight_noise_dynamic_sigma` | `True` to enable LR/batch-size scaling (default: `False`) |
+
+**Scaling behavior:**
+
+| Scenario | Effect | Rationale |
+|----------|--------|-----------|
+| Larger LR | σ increases | Larger steps → more noise for regularization |
+| Larger batch | σ decreases (by √B) | Larger batches have less gradient noise |
+| LR warmup | σ increases gradually | Matches increasing step size |
+| LR decay | σ decreases gradually | Matches decreasing step size |
+
 **Usage:**
-- The training framework must call `network.inject_weight_noise()` after `optimizer.step()`
+- The training framework must call `network.inject_weight_noise(lr=lr, effective_batch_size=eff_bs)` after `optimizer.step()`
 - Returns the Frobenius norm of injected noise (for logging)
 
 **Example:**
 ```
-network_args=["weight_noise_sigma=1e-3", "weight_noise_mode=relative"]
+network_args=["weight_noise_sigma=1e-3", "weight_noise_mode=relative", "weight_noise_dynamic_sigma=True"]
 ```
 
 **Notes:**
 - Weight noising runs after optimizer step, so it does not affect gradient computation
 - For best results with relative mode, start with `weight_noise_sigma=1e-3` (the ai-toolkit default)
 - Can be combined with GGPO for dual regularization (weight-space + activation-space noise)
+- With `dynamic_sigma=True`, `weight_noise_sigma` becomes a dimensionless tuning knob; noise magnitude is auto-scaled to LR and batch size
+- Dynamic sigma uses per-parameter-group LR from `optimizer.param_groups` when available, falling back to the `lr` argument

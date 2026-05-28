@@ -206,6 +206,7 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
 
     weight_noise_sigma = kwargs.get("weight_noise_sigma", None)
     weight_noise_mode = kwargs.get("weight_noise_mode", "relative")
+    weight_noise_dynamic_sigma = str_bool(kwargs.get("weight_noise_dynamic_sigma", False))
 
     if weight_noise_sigma is not None:
         weight_noise_sigma = float(weight_noise_sigma)
@@ -213,7 +214,7 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
         weight_noise_mode = str(weight_noise_mode)
 
     if weight_noise_sigma is not None and weight_noise_sigma > 0:
-        logger.info(f"Weight noising enabled: sigma={weight_noise_sigma}, mode={weight_noise_mode}")
+        logger.info(f"Weight noising enabled: sigma={weight_noise_sigma}, mode={weight_noise_mode}, dynamic={weight_noise_dynamic_sigma}")
 
     if unbalanced_factorization:
         logger.info("Unbalanced factorization for LoKr is enabled")
@@ -405,6 +406,7 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
         ggpo_conv_weight_sample_size=ggpo_conv_weight_sample_size,
         weight_noise_sigma=weight_noise_sigma,
         weight_noise_mode=weight_noise_mode,
+        weight_noise_dynamic_sigma=weight_noise_dynamic_sigma,
         orthogonalize=orthogonalize,
         orthogonal_init=orthogonal_init,
         svd_segment=svd_segment,
@@ -623,6 +625,7 @@ class LycorisNetwork(torch.nn.Module):
 
         self.weight_noise_sigma = kwargs.get("weight_noise_sigma", None)
         self.weight_noise_mode = kwargs.get("weight_noise_mode", "relative")
+        self.weight_noise_dynamic_sigma = kwargs.get("weight_noise_dynamic_sigma", False)
         if self.weight_noise_sigma is not None:
             self.weight_noise_sigma = float(self.weight_noise_sigma)
 
@@ -1192,6 +1195,7 @@ class LycorisNetwork(torch.nn.Module):
             # and don't forward these kwargs.
             lora.weight_noise_sigma = self.weight_noise_sigma
             lora.weight_noise_mode = self.weight_noise_mode
+            lora.weight_noise_dynamic_sigma = self.weight_noise_dynamic_sigma
 
             lora.apply_to()
             # Per-module torch.compile: compile each module's rebuild-mode
@@ -1249,19 +1253,44 @@ class LycorisNetwork(torch.nn.Module):
         return torch.stack(unscaled_norms)
 
     @torch.no_grad()
-    def inject_weight_noise(self) -> float:
+    def inject_weight_noise(self, lr: float = 1e-4, effective_batch_size: int = 1, optimizer=None) -> float:
         """Add Gaussian noise to all LoRA module parameters after optimizer step.
 
         Inspired by ai-toolkit-perceptual's Weight Noising. Each
         module's trainable parameters are perturbed with Gaussian
         noise whose scale is determined by ``weight_noise_mode``.
 
+        When ``weight_noise_dynamic_sigma`` is True, sigma is further
+        scaled by ``lr / √effective_batch_size``, where ``lr`` is
+        per-parameter (resolved from ``optimizer.param_groups`` when
+        provided, otherwise the ``lr`` argument is used as fallback).
+
+        Args:
+            lr: Fallback learning rate (used when dynamic_sigma=True and
+                no optimizer is provided, or for params not found in
+                optimizer).
+            effective_batch_size: batch_size × gradient_accumulation_steps.
+            optimizer: Optional optimizer object; used to build a
+                param→LR mapping for per-group LR scaling.
+
         Returns:
             Frobenius norm of total injected noise (for logging).
         """
+        # Build per-parameter LR map from optimizer if available
+        param_lr_map = None
+        if optimizer is not None and self.weight_noise_dynamic_sigma:
+            param_lr_map = {}
+            for group in optimizer.param_groups:
+                group_lr = group.get('lr', lr)
+                for p in group.get('params', []):
+                    param_lr_map[id(p)] = group_lr
+
         total_noise_sq = 0.0
         for lora in self.loras:
-            total_noise_sq += lora.inject_weight_noise()
+            total_noise_sq += lora.inject_weight_noise(
+                lr=lr, effective_batch_size=effective_batch_size,
+                param_lr_map=param_lr_map,
+            )
         return total_noise_sq ** 0.5 if total_noise_sq > 0 else 0.0
 
     def enable_gradient_checkpointing(self):
