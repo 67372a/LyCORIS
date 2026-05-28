@@ -195,6 +195,18 @@ def create_network(
 
     if ggpo_beta is not None and ggpo_sigma is not None:
         logger.info(f"LoRA-GGPO training sigma: {ggpo_sigma} beta: {ggpo_beta}")
+
+    weight_noise_sigma = kwargs.get("weight_noise_sigma", None)
+    weight_noise_mode = kwargs.get("weight_noise_mode", "relative")
+
+    if weight_noise_sigma is not None:
+        weight_noise_sigma = float(weight_noise_sigma)
+    if weight_noise_mode is not None:
+        weight_noise_mode = str(weight_noise_mode)
+
+    if weight_noise_sigma is not None and weight_noise_sigma > 0:
+        logger.info(f"Weight noising enabled: sigma={weight_noise_sigma}, mode={weight_noise_mode}")
+
     # lora_plus
     loraplus_lr_ratio = (
         float(kwargs.get("loraplus_lr_ratio", None))
@@ -401,6 +413,8 @@ def create_network(
         ggpo_sigma=ggpo_sigma,
         ggpo_conv=ggpo_conv,
         ggpo_conv_weight_sample_size=ggpo_conv_weight_sample_size,
+        weight_noise_sigma=weight_noise_sigma,
+        weight_noise_mode=weight_noise_mode,
         orthogonalize=orthogonalize,
         orthogonal_init=orthogonal_init,
         svd_segment=svd_segment,

@@ -204,6 +204,17 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
     if ggpo_beta is not None and ggpo_sigma is not None:
         logger.info(f"LoRA-GGPO training sigma: {ggpo_sigma} beta: {ggpo_beta}")
 
+    weight_noise_sigma = kwargs.get("weight_noise_sigma", None)
+    weight_noise_mode = kwargs.get("weight_noise_mode", "relative")
+
+    if weight_noise_sigma is not None:
+        weight_noise_sigma = float(weight_noise_sigma)
+    if weight_noise_mode is not None:
+        weight_noise_mode = str(weight_noise_mode)
+
+    if weight_noise_sigma is not None and weight_noise_sigma > 0:
+        logger.info(f"Weight noising enabled: sigma={weight_noise_sigma}, mode={weight_noise_mode}")
+
     if unbalanced_factorization:
         logger.info("Unbalanced factorization for LoKr is enabled")
 
@@ -392,6 +403,8 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
         ggpo_beta=ggpo_beta,
         ggpo_sigma=ggpo_sigma,
         ggpo_conv_weight_sample_size=ggpo_conv_weight_sample_size,
+        weight_noise_sigma=weight_noise_sigma,
+        weight_noise_mode=weight_noise_mode,
         orthogonalize=orthogonalize,
         orthogonal_init=orthogonal_init,
         svd_segment=svd_segment,
@@ -607,6 +620,11 @@ class LycorisNetwork(torch.nn.Module):
 
         if self.ggpo_conv_weight_sample_size is not None:
             self.ggpo_conv_weight_sample_size = int(self.ggpo_conv_weight_sample_size)
+
+        self.weight_noise_sigma = kwargs.get("weight_noise_sigma", None)
+        self.weight_noise_mode = kwargs.get("weight_noise_mode", "relative")
+        if self.weight_noise_sigma is not None:
+            self.weight_noise_sigma = float(self.weight_noise_sigma)
 
         # GoRA configuration (extracted from root_kwargs for prepare_gora)
         self._gora_needs_init = (
@@ -1168,6 +1186,13 @@ class LycorisNetwork(torch.nn.Module):
         Register to modules to the subclass so that torch sees them.
         """
         for lora in self.loras:
+            # Propagate weight noise config from network to each module.
+            # This is set here rather than in each module's __init__ because
+            # subclass constructors pass args positionally to super().__init__()
+            # and don't forward these kwargs.
+            lora.weight_noise_sigma = self.weight_noise_sigma
+            lora.weight_noise_mode = self.weight_noise_mode
+
             lora.apply_to()
             # Per-module torch.compile: compile each module's rebuild-mode
             # forward (weight construction + fused op) rather than the
@@ -1222,6 +1247,22 @@ class LycorisNetwork(torch.nn.Module):
                 unscaled_norms.append(unscaled_norm)
 
         return torch.stack(unscaled_norms)
+
+    @torch.no_grad()
+    def inject_weight_noise(self) -> float:
+        """Add Gaussian noise to all LoRA module parameters after optimizer step.
+
+        Inspired by ai-toolkit-perceptual's Weight Noising. Each
+        module's trainable parameters are perturbed with Gaussian
+        noise whose scale is determined by ``weight_noise_mode``.
+
+        Returns:
+            Frobenius norm of total injected noise (for logging).
+        """
+        total_noise_sq = 0.0
+        for lora in self.loras:
+            total_noise_sq += lora.inject_weight_noise()
+        return total_noise_sq ** 0.5 if total_noise_sq > 0 else 0.0
 
     def enable_gradient_checkpointing(self):
         # not supported

@@ -208,3 +208,32 @@ These arguments control the GoRA algorithm behavior. They are valid only when `a
 - GoRA is compatible with weight_decompose (DoRA), use_scalar, orthogonalize, and QLoRA/bnb layers
 - For inference, the checkpoint can be loaded as standard LoRA without special handling
 - For adaptively changing γ, set `gora_adaptive_gamma=True` (adds one pre-training forward pass)
+
+### Weight Noising
+
+Inspired by ai-toolkit-perceptual's Weight Noising. Adds Gaussian noise directly to LoRA parameter values after each optimizer step. Adam's loss-minimization corrects the drift, causing weights to wander around the optimizer trajectory inside a bounded ball. This is complementary to GGPO (which perturbs forward-pass outputs).
+
+- Set with `weight_noise_sigma=FLOAT` to enable
+- Set mode with `weight_noise_mode=STRING` (default: `relative`)
+- Valid for all algorithms
+
+**Modes:**
+
+| Mode | Description |
+|------|-------------|
+| `relative` (default) | σ = `weight_noise_sigma` × per-param weight RMS. Adapts to per-tensor scale automatically. Zero-init params (e.g. LoRA-up) get zero noise until they learn something. |
+| `absolute` | σ fixed at `weight_noise_sigma` for every parameter. Use when you know the target perturbation magnitude in absolute terms. |
+
+**Usage:**
+- The training framework must call `network.inject_weight_noise()` after `optimizer.step()`
+- Returns the Frobenius norm of injected noise (for logging)
+
+**Example:**
+```
+network_args=["weight_noise_sigma=1e-3", "weight_noise_mode=relative"]
+```
+
+**Notes:**
+- Weight noising runs after optimizer step, so it does not affect gradient computation
+- For best results with relative mode, start with `weight_noise_sigma=1e-3` (the ai-toolkit default)
+- Can be combined with GGPO for dual regularization (weight-space + activation-space noise)

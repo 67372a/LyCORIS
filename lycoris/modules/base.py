@@ -316,6 +316,11 @@ class LycorisBaseModule(ModuleCustomSD):
         self.ggpo_conv = ggpo_conv
         self.ggpo_conv_weight_sample_size = ggpo_conv_weight_sample_size
 
+        # Weight noising config — set after construction by the network
+        # wrapper, or passed through **kwargs from subclasses that forward them.
+        self.weight_noise_sigma = kwargs.get('weight_noise_sigma', None)
+        self.weight_noise_mode = kwargs.get('weight_noise_mode', 'relative')
+
     def _call_op(self, x, weight, bias=None):
         """Compile-friendly op dispatch — avoids ``**kw_dict`` graph breaks.
 
@@ -943,3 +948,44 @@ class LycorisBaseModule(ModuleCustomSD):
 
     def ggpo_pertubation(self, x):
         return None
+
+    @torch.no_grad()
+    def inject_weight_noise(self) -> float:
+        """Add Gaussian noise directly to trainable parameter values.
+
+        Inspired by ai-toolkit-perceptual's Weight Noising. Adds noise
+        after the optimizer step so Adam's loss-minimization corrects
+        the drift, causing weights to wander around the optimizer
+        trajectory inside a bounded ball.
+
+        Modes:
+          - ``'absolute'``: σ fixed at ``weight_noise_sigma``.
+          - ``'relative'``: σ = ``weight_noise_sigma`` × per-param
+            weight RMS (default). Zero-init params (e.g. LoRA-up)
+            get zero noise until they learn something.
+
+        Returns:
+            Sum of squared noise values (for Frobenius norm computation
+            at the network level).
+        """
+        if self.weight_noise_sigma is None or self.weight_noise_sigma <= 0:
+            return 0.0
+
+        noise_sq = 0.0
+        for p in self.parameters():
+            if not p.requires_grad:
+                continue
+            w = p.data
+            if self.weight_noise_mode == 'absolute':
+                sigma = self.weight_noise_sigma
+            elif self.weight_noise_mode == 'relative':
+                rms = float(w.detach().pow(2).mean().clamp_min(1e-30).sqrt())
+                sigma = self.weight_noise_sigma * rms
+            else:
+                continue
+            if sigma <= 0:
+                continue
+            noise = torch.randn_like(w) * sigma
+            noise_sq += float(noise.pow(2).sum())
+            w.add_(noise)
+        return noise_sq
