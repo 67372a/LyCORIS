@@ -513,5 +513,160 @@ class DynamicSigmaTests(unittest.TestCase):
         self.assertGreater(result, 0.0)
 
 
+class KohyaWeightNoiseTests(unittest.TestCase):
+    """Tests for LycorisNetworkKohya weight noise attributes and propagation.
+
+    Regression tests for the bug where LycorisNetworkKohya.__init__ bypasses
+    LycorisNetwork.__init__ (calling torch.nn.Module.__init__ directly) and
+    omits weight_noise_sigma, weight_noise_mode, and weight_noise_dynamic_sigma
+    initialization, causing AttributeError in inject_weight_noise().
+    """
+
+    def _make_kohya_network(self, weight_noise_sigma=None, weight_noise_mode="relative",
+                            weight_noise_dynamic_sigma=False, algo="locon"):
+        """Create a LycorisNetworkKohya with mock models that match target module names.
+
+        LycorisNetworkKohya only creates LoRA modules for specific module class
+        names (e.g. Transformer2DModel, CLIPAttention), so we create dummy
+        modules with matching names that contain nn.Linear submodules.
+        """
+        from lycoris.kohya import LycorisNetworkKohya
+
+        # Create dummy modules whose class names match LycorisNetworkKohya targets
+        class Transformer2DModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = nn.Linear(16, 16)
+
+        class CLIPAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.q_proj = nn.Linear(16, 16)
+
+        text_encoder = nn.Module()
+        text_encoder.encoder = CLIPAttention()
+
+        unet = nn.Module()
+        unet.down = Transformer2DModel()
+
+        kwargs = {}
+        if weight_noise_sigma is not None:
+            kwargs["weight_noise_sigma"] = weight_noise_sigma
+        kwargs["weight_noise_mode"] = weight_noise_mode
+        kwargs["weight_noise_dynamic_sigma"] = weight_noise_dynamic_sigma
+
+        network = LycorisNetworkKohya(
+            text_encoder,
+            unet,
+            multiplier=1.0,
+            lora_dim=4,
+            conv_lora_dim=0,
+            alpha=1,
+            network_module=algo,
+            **kwargs,
+        )
+        network.apply_to(text_encoder, unet, True, True)
+        return network
+
+    def test_kohya_has_weight_noise_attributes(self):
+        """LycorisNetworkKohya should have weight_noise_* attributes after __init__."""
+        network = self._make_kohya_network(weight_noise_sigma=0.01)
+        self.assertTrue(hasattr(network, 'weight_noise_sigma'))
+        self.assertEqual(network.weight_noise_sigma, 0.01)
+        self.assertTrue(hasattr(network, 'weight_noise_mode'))
+        self.assertEqual(network.weight_noise_mode, "relative")
+        self.assertTrue(hasattr(network, 'weight_noise_dynamic_sigma'))
+        self.assertFalse(network.weight_noise_dynamic_sigma)
+
+    def test_kohya_weight_noise_sigma_default_none(self):
+        """weight_noise_sigma should default to None when not specified."""
+        network = self._make_kohya_network()
+        self.assertIsNone(network.weight_noise_sigma)
+
+    def test_kohya_inject_weight_noise_no_error(self):
+        """inject_weight_noise should not raise AttributeError.
+
+        This is the exact regression test for the reported bug.
+        """
+        network = self._make_kohya_network(weight_noise_sigma=0.01)
+        # This was the exact call path from the traceback
+        result = network.inject_weight_noise(lr=1e-4, effective_batch_size=1, optimizer=None)
+        self.assertGreaterEqual(result, 0.0)
+
+    def test_kohya_inject_weight_noise_with_optimizer(self):
+        """inject_weight_noise with optimizer should work when dynamic_sigma is False."""
+        network = self._make_kohya_network(weight_noise_sigma=0.01)
+        # Create a dummy optimizer
+        optimizer = torch.optim.Adam(network.parameters(), lr=1e-4)
+        result = network.inject_weight_noise(lr=1e-4, effective_batch_size=1, optimizer=optimizer)
+        self.assertGreaterEqual(result, 0.0)
+
+    def test_kohya_inject_weight_noise_dynamic_sigma_with_optimizer(self):
+        """inject_weight_noise with optimizer and dynamic_sigma should not raise."""
+        network = self._make_kohya_network(
+            weight_noise_sigma=0.01,
+            weight_noise_dynamic_sigma=True,
+        )
+        optimizer = torch.optim.Adam(network.parameters(), lr=1e-4)
+        result = network.inject_weight_noise(lr=1e-4, effective_batch_size=1, optimizer=optimizer)
+        self.assertGreater(result, 0.0)
+
+    def test_kohya_weight_noise_propagated_to_modules(self):
+        """weight_noise attrs should be propagated to child lora modules via apply_to."""
+        network = self._make_kohya_network(
+            weight_noise_sigma=0.005,
+            weight_noise_mode="absolute",
+            weight_noise_dynamic_sigma=True,
+        )
+        for lora in network.loras:
+            self.assertEqual(lora.weight_noise_sigma, 0.005)
+            self.assertEqual(lora.weight_noise_mode, "absolute")
+            self.assertTrue(lora.weight_noise_dynamic_sigma)
+
+    def test_kohya_weight_noise_disabled_returns_zero(self):
+        """inject_weight_noise should return 0 when sigma is None."""
+        network = self._make_kohya_network(weight_noise_sigma=None)
+        result = network.inject_weight_noise()
+        self.assertEqual(result, 0.0)
+
+    def test_kohya_weight_noise_adds_noise(self):
+        """With sigma > 0, inject_weight_noise should modify parameters."""
+        network = self._make_kohya_network(
+            weight_noise_sigma=0.01,
+            weight_noise_mode="absolute",
+        )
+
+        params_before = {}
+        for lora in network.loras:
+            for n, p in lora.named_parameters():
+                if p.requires_grad:
+                    params_before[f"{lora.lora_name}.{n}"] = p.data.clone()
+
+        result = network.inject_weight_noise()
+        self.assertGreater(result, 0.0)
+
+        any_changed = False
+        for lora in network.loras:
+            for n, p in lora.named_parameters():
+                if p.requires_grad:
+                    key = f"{lora.lora_name}.{n}"
+                    if key in params_before and not torch.equal(p.data, params_before[key]):
+                        any_changed = True
+                        break
+            if any_changed:
+                break
+        self.assertTrue(any_changed, "At least one parameter should have changed after noise injection")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
+    def test_kohya_weight_noise_cuda(self):
+        """Weight noise should work on CUDA for LycorisNetworkKohya."""
+        network = self._make_kohya_network(
+            weight_noise_sigma=0.01,
+            weight_noise_mode="relative",
+        )
+        result = network.inject_weight_noise()
+        self.assertGreater(result, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
