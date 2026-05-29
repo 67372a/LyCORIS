@@ -723,6 +723,12 @@ class LycorisNetworkKohya(LycorisNetwork):
         if self.ggpo_conv_weight_sample_size is not None:
             self.ggpo_conv_weight_sample_size = int(self.ggpo_conv_weight_sample_size)
 
+        self.weight_noise_sigma = kwargs.get("weight_noise_sigma", None)
+        self.weight_noise_mode = kwargs.get("weight_noise_mode", "relative")
+        self.weight_noise_dynamic_sigma = kwargs.get("weight_noise_dynamic_sigma", False)
+        if self.weight_noise_sigma is not None:
+            self.weight_noise_sigma = float(self.weight_noise_sigma)
+
         # GoRA configuration — matches LycorisNetwork pattern
         self._gora_needs_init = (
             network_module == "gora"
@@ -1273,6 +1279,12 @@ class LycorisNetworkKohya(LycorisNetwork):
         self.loras = self.text_encoder_loras + self.unet_loras
 
         for lora in self.loras:
+            # Propagate weight noise config from network to each module,
+            # matching LycorisNetwork.apply_to behavior.
+            lora.weight_noise_sigma = self.weight_noise_sigma
+            lora.weight_noise_mode = self.weight_noise_mode
+            lora.weight_noise_dynamic_sigma = self.weight_noise_dynamic_sigma
+
             lora.apply_to()
             # Per-module torch.compile: compile each module's rebuild-mode
             # forward (weight construction + fused op) rather than the
