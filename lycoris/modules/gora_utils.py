@@ -708,7 +708,11 @@ def gora_precompute_gradients(
         {lora_name: allocated_rank} dict.
     """
     if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # Infer device from the first module's weight to ensure consistency
+        # between model weights and batch tensors during forward pass.
+        first_mod = modules[0]
+        first_w = first_mod.org_weight if hasattr(first_mod, 'org_weight') else first_mod.weight
+        device = first_w.device
 
     logger.info(
         f"GoRA: Pre-computing gradients (max_steps={max_steps}, adaptive_n={adaptive_n}) "

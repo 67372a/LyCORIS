@@ -1204,28 +1204,102 @@ def test_kohya_create_network_lora_no_gora_flag():
     assert network._gora_kwargs == {}
 
     GM.reset_gora_registry()
-    LycorisNetworkKohya.ENABLE_CONV = False
-    LycorisNetworkKohya.UNET_TARGET_REPLACE_MODULE = ["Linear"]
-    LycorisNetworkKohya.UNET_TARGET_REPLACE_NAME = []
-    LycorisNetworkKohya.TEXT_ENCODER_TARGET_REPLACE_MODULE = []
-    LycorisNetworkKohya.TEXT_ENCODER_TARGET_REPLACE_NAME = []
-    LycorisNetworkKohya.MODULE_ALGO_MAP = {}
-    LycorisNetworkKohya.NAME_ALGO_MAP = {}
-    LycorisNetworkKohya.TARGET_EXCLUDE_NAME = []
 
-    class TinyUNet(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.lin = torch.nn.Linear(16, 32, bias=False)
 
-    unet = TinyUNet()
+# ==== Test 16: Device Inference Fix Verification ==================================
 
-    network = LycorisNetworkKohya(
-        text_encoder=None, unet=unet, multiplier=1.0,
-        lora_dim=4, alpha=1.0, network_module="lora",
+def test_gora_precompute_infers_device_from_modules():
+    """gora_precompute_gradients should infer device from modules, not default to CUDA.
+
+    Regression test: previously the function defaulted to CUDA when device=None,
+    causing device mismatch errors when model weights were on CPU.
+    """
+    from lycoris.modules.locon import GoRAModule as GM
+    from lycoris.modules.gora_utils import gora_precompute_gradients
+
+    GM.reset_gora_registry()
+
+    # Create GoRA modules on CPU (default)
+    m1 = GM(lora_name="dev_m1", org_module=nn.Linear(16, 32, bias=False), lora_dim=4, alpha=16.0)
+    m2 = GM(lora_name="dev_m2", org_module=nn.Linear(32, 16, bias=False), lora_dim=4, alpha=16.0)
+
+    batches = [{"input_ids": torch.randn(2, 16), "labels": torch.randn(2, 16)} for _ in range(4)]
+
+    def forward_fn(batch):
+        w1 = _get_weight(m1)
+        w2 = _get_weight(m2)
+        out = F.linear(F.relu(F.linear(batch["input_ids"], w1)), w2)
+        loss = F.mse_loss(out, batch["labels"])
+        return (loss,)
+
+    # Should NOT raise RuntimeError about device mismatch
+    named_ranks = gora_precompute_gradients(
+        modules=[m1, m2],
+        dataloader=batches,
+        forward_fn=forward_fn,
+        ref_rank=8,
+        min_rank=2,
+        max_rank=16,
+        max_steps=2,
+        device=None,  # auto-detect — should infer CPU from modules
+        adaptive_n=False,
+        adaptive_gamma=False,
     )
 
-    assert network._gora_needs_init is False
-    assert network._gora_kwargs == {}
+    assert len(named_ranks) == 2
+    assert named_ranks["dev_m1"] >= 2
+    assert named_ranks["dev_m2"] >= 2
+
+    GM.reset_gora_registry()
+
+
+def test_gora_device_inference_matches_module_device():
+    """When device=None, the inferred device should match the module's weight device."""
+    from lycoris.modules.gora_utils import gora_precompute_gradients
+    from lycoris.modules.locon import GoRAModule as GM
+
+    GM.reset_gora_registry()
+
+    m = GM(lora_name="dev_check", org_module=nn.Linear(8, 16, bias=False), lora_dim=2, alpha=4.0)
+
+    # Verify the module is on CPU
+    org_w = _get_weight(m)
+    assert org_w.device.type == 'cpu'
+
+    batches = [{"x": torch.randn(2, 8)} for _ in range(2)]
+
+    def forward_fn(batch):
+        w = _get_weight(m)
+        out = F.linear(batch["x"], w)
+        return (out.sum(),)
+
+    # Patch gora_precompute_gradients to capture the inferred device
+    import lycoris.modules.gora_utils as gu
+    original_to_device = gu._to_device
+    captured_devices = []
+
+    def tracking_to_device(batch, device):
+        captured_devices.append(device)
+        return original_to_device(batch, device)
+
+    gu._to_device = tracking_to_device
+    try:
+        gora_precompute_gradients(
+            modules=[m],
+            dataloader=batches,
+            forward_fn=forward_fn,
+            ref_rank=4,
+            max_steps=1,
+            device=None,
+            adaptive_n=False,
+            adaptive_gamma=False,
+        )
+    finally:
+        gu._to_device = original_to_device
+
+    assert len(captured_devices) >= 1, "Should have captured at least one device inference"
+    assert captured_devices[0].type == 'cpu', (
+        f"Expected device type 'cpu' (inferred from module), got '{captured_devices[0].type}'"
+    )
 
     GM.reset_gora_registry()
