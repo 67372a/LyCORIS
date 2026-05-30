@@ -829,21 +829,32 @@ class LoConModule(LycorisBaseModule):
             )
             return False
 
-        # Compute portable LoRA weights
-        lora_up_curr = self.lora_up.weight.data.clone()
+        # Compute portable LoRA weights.
+        # Bake scalar into lora_up before concatenation so the converted
+        # adapter produces  scalar*A'B' - A₀B₀  (matching custom_state_dict).
+        scalar_val = self.scalar.to(
+            device=self.lora_up.weight.device, non_blocking=True
+        )
+        lora_up_curr = self.lora_up.weight.data.clone() * scalar_val
         lora_down_curr = self.lora_down.weight.data.clone()
         pissa_up_init = self.pissa_A_init.to(lora_up_curr.device)
         pissa_down_init = self.pissa_B_init.to(lora_down_curr.device)
 
-        # ΔA = [A' | A₀]  → lora_up shape becomes (out, 2*r)
+        # ΔA = [scalar*A' | A₀]  → lora_up shape becomes (out, 2*r)
         delta_up = torch.cat([lora_up_curr, pissa_up_init], dim=1)
-        # ΔB = [B' | -B₀] → lora_down shape becomes (2*r, in)
+        # ΔB = [B' | -B₀]       → lora_down shape becomes (2*r, in)
         delta_down = torch.cat([lora_down_curr, -pissa_down_init], dim=0)
 
         # Replace adapter weights
         self.lora_up.weight.data = delta_up
         self.lora_down.weight.data = delta_down
         self.lora_dim = 2 * self.lora_dim
+
+        # Reset scalar to 1.0 since it has been absorbed into lora_up
+        if isinstance(self.scalar, nn.Parameter):
+            self.scalar.data.fill_(1.0)
+        else:
+            self.scalar.fill_(1.0)
 
         # Restore original weight: W = W^res + A₀B₀
         # The base weight currently holds W^res, so we add back A₀B₀
