@@ -306,7 +306,10 @@ class LohaModule(LycorisBaseModule):
             weight = weight.reshape(shape)
         if self.training and self.rank_dropout:
             drop = (torch.rand(weight.size(0)) > self.rank_dropout).to(weight.dtype)
-            drop = drop.view(-1, *[1] * len(weight.shape[1:])).to(weight.device)
+            # Use pre-computed _rank_drop_shape instead of dynamic
+            # len(weight.shape[1:]) splat — avoids graph breaks from
+            # Python container traversal on symbolic tensor shapes.
+            drop = drop.view(self._rank_drop_shape).to(weight.device)
             if self.rank_dropout_scale:
                 drop /= drop.mean()
             weight *= drop

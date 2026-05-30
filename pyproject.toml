@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lycoris_lora"
-version = "3.2.0.dev40"
+version = "3.2.0.dev41"
 description = "Lora beYond Conventional methods, Other Rank adaptation Implementations for Stable diffusion"
 readme = "README.md"
 license = "Apache-2.0"

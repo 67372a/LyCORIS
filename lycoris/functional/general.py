@@ -7,8 +7,35 @@ FUNC_LIST = [None, None, F.linear, F.conv1d, F.conv2d, F.conv3d]
 
 
 def rebuild_tucker(t, wa, wb):
-    rebuild2 = torch.einsum("i j ..., i p, j r -> p r ...", t, wa, wb)
-    return rebuild2
+    """Reconstruct full weight from Tucker decomposition.
+
+    Equivalent to ``torch.einsum("i j ..., i p, j r -> p r ...", t, wa, wb)``
+    but implemented with explicit ``torch.tensordot`` + permute to avoid
+    complex multi-operand einsum patterns that can cause graph breaks in
+    ``torch.compile``.
+
+    Args:
+        t: Core tensor of shape ``(i, j, *kernel)``.
+        wa: Left factor of shape ``(i, p)``.
+        wb: Right factor of shape ``(j, r)``.
+
+    Returns:
+        Reconstructed weight of shape ``(p, r, *kernel)``.
+    """
+    # Step 1: contract t with wa along i-dim.
+    # tensordot(t, wa, ([0],[0])) → (j, *kernel, p)
+    temp = torch.tensordot(t, wa, dims=([0], [0]))
+    # Permute to (p, j, *kernel):  move last dim (p) to front.
+    ndim = temp.ndim
+    temp = temp.permute(ndim - 1, *range(ndim - 1))
+
+    # Step 2: contract temp with wb along j-dim (now dim 1).
+    # tensordot(temp, wb, ([1],[0])) → (p, *kernel, r)
+    result = torch.tensordot(temp, wb, dims=([1], [0]))
+    # Permute to (p, r, *kernel):  move last dim (r) to position 1.
+    ndim = result.ndim
+    result = result.permute(0, ndim - 1, *range(1, ndim - 1))
+    return result
 
 
 def factorization(dimension: int, factor: int = -1) -> tuple[int, int]:

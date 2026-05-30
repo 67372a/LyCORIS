@@ -284,6 +284,14 @@ class LycorisBaseModule(ModuleCustomSD):
             # Bypass-mode rank dropout: drop viewed as (1, rank, 1, 1, ...)
             self._bypass_rank_drop_shape = [1, -1] + [1] * max(ndim - 2, 0)
 
+        # Compile-friendly QR orthogonalization cache.
+        # Cache the weight ndim so _orthogonalize never calls len(shape)
+        # inside compiled graphs (avoids Python container traversal on
+        # symbolic shapes).  The rows >= cols check on the 2D matrix
+        # remains as a Dynamo guard (shapes are static parameters, so
+        # Dynamo specializes once without graph breaks).
+        self._qr_ndim = self._expected_ndim  # None for norm modules
+
         self.register_buffer("dtype_tensor", torch.tensor(0.0), persistent=False)
         # Cache dtype as plain attribute to avoid property access in compiled graphs.
         # Kept in sync via _apply() override.
@@ -414,24 +422,33 @@ class LycorisBaseModule(ModuleCustomSD):
         )
 
     def _orthogonalize(self, weight_matrix: torch.Tensor) -> torch.Tensor:
-        """
-        Orthogonalizes the weight matrix using QR decomposition.
-        This is only active during training if `use_orthogonal_weights` is True.
+        """Orthogonalizes the weight matrix using QR decomposition.
+
+        Compile-friendly: uses pre-cached ``_qr_ndim`` (from
+        ``_expected_ndim``) instead of ``len(shape)`` to avoid Python
+        container traversal on symbolic tensor shapes inside compiled
+        graphs.  The ``rows >= cols`` check on the 2-D matrix is a
+        static Dynamo guard (weight shapes never change) — not a graph
+        break.
         """
         if not self.use_orthogonal_weights or not self.training:
             return weight_matrix
 
-        # QR decomposition works on 2D matrices.
-        # Conv weights can be > 2D, but LoKr factors are 2D.
         shape = weight_matrix.shape
-        dimcount = len(shape)
-        if dimcount == 0:
+
+        # Use pre-cached ndim when available to avoid len(shape) in
+        # compiled graphs.  Fall back to .dim() for unknown module types.
+        ndim = self._qr_ndim if self._qr_ndim is not None else weight_matrix.dim()
+        if ndim == 0:
             return weight_matrix
-        elif dimcount > 2:
-            weight_matrix = weight_matrix.reshape(len(weight_matrix), -1) # Make 2D if conv or 1 dim
-        elif dimcount < 2:
-            weight_matrix = weight_matrix.reshape(1, -1) # Make 2D if conv or 1 dim
-        
+
+        # Reshape to 2-D for QR decomposition.
+        # shape[0] avoids len(tensor) which traverses Python container.
+        if ndim > 2:
+            weight_matrix = weight_matrix.reshape(shape[0], -1)
+        elif ndim < 2:
+            weight_matrix = weight_matrix.reshape(1, -1)
+
         # Upcast to fp32 for QR (bf16 CUDA kernel not implemented)
         orig_dtype = weight_matrix.dtype
         weight_matrix_fp32 = weight_matrix.to(torch.float32)
@@ -439,6 +456,8 @@ class LycorisBaseModule(ModuleCustomSD):
         # For matrices where rows >= cols, QR gives orthonormal columns.
         # For matrices where rows < cols, we transpose to make columns from rows,
         # apply QR, and transpose back. This results in orthonormal rows.
+        # NOTE: rows/cols are static nn.Parameter dimensions → Dynamo guards
+        # once without graph breaks.
         rows, cols = weight_matrix.shape
         if rows >= cols:
             q, r = torch.linalg.qr(weight_matrix_fp32)
