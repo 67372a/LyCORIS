@@ -378,10 +378,10 @@ class LycorisBaseModule(ModuleCustomSD):
             return F.group_norm(
                 x, self._gn_num_groups, weight, bias, eps=self._gn_eps
             )
-        # Ultimate fallback for unknown types (shouldn't normally be reached)
-        if bias is not None:
-            return self.op(x, weight, bias, **self.kw_dict)
-        return self.op(x, weight, **self.kw_dict)
+        raise NotImplementedError(
+            f"Unsupported module_type '{mt}' in _call_op. "
+            f"Supported: linear, conv1d, conv2d, conv3d, layernorm, groupnorm."
+        )
 
     def _call_op_1x1(self, x, weight, bias=None):
         """Compile-friendly 1×1 op dispatch — for 1×1 convolutions.
@@ -408,10 +408,10 @@ class LycorisBaseModule(ModuleCustomSD):
             return F.group_norm(
                 x, self._gn_num_groups, weight, bias, eps=self._gn_eps
             )
-        # Ultimate fallback for unknown types (shouldn't normally be reached)
-        if bias is not None:
-            return self.op(x, weight, bias, **self.kw_dict)
-        return self.op(x, weight, **self.kw_dict)
+        raise NotImplementedError(
+            f"Unsupported module_type '{mt}' in _call_op_1x1. "
+            f"Supported: linear, conv1d, conv2d, conv3d, layernorm, groupnorm."
+        )
 
     def _orthogonalize(self, weight_matrix: torch.Tensor) -> torch.Tensor:
         """

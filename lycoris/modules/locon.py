@@ -236,6 +236,13 @@ class LoConModule(LycorisBaseModule):
 
         self.init_ggpo()
 
+        # Cache _scale_in_diff: determines which weight-construction path
+        # is taken in _forward_rebuild_core.  All values are init-time
+        # constants so this can be computed once.
+        self._scale_in_diff = (
+            not self.wd and (self.tucker or self.rank_dropout)
+        )
+
         # Cache the static portion of the apply_ggpo check to avoid
         # recomputing 4 invariant conditions on every forward pass.
         self._ggpo_enabled = (
@@ -1088,8 +1095,7 @@ class LoConModule(LycorisBaseModule):
         # scalar * scale in the returned diff_weight.
         # Path 2: make_weight includes scalar but NOT scale; scale is
         # applied below.
-        _scale_in_diff = (not self.wd and (self.tucker or self.rank_dropout))
-        if _scale_in_diff:
+        if self._scale_in_diff:
             if self.olora:
                 diff_weight = self._compute_diff_weight_multitask(device, dtype)
             else:
@@ -1105,7 +1111,7 @@ class LoConModule(LycorisBaseModule):
                 weight + diff_weight * self.scale, multiplier)
             # Input dropout for DoRA
             x = self.drop(x)
-        elif _scale_in_diff:
+        elif self._scale_in_diff:
             # diff_weight already includes scale; just apply multiplier
             weight = weight + diff_weight * multiplier
         else:
