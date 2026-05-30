@@ -93,15 +93,15 @@ def tucker_weight(wa, wb, t):
 
 
 def apply_dora_scale(org_weight, rebuild, dora_scale, scale):
-    dora_norm_dims = org_weight.dim() - 1
     weight = org_weight + rebuild
-    weight = weight.to(dora_scale.dtype)
-    weight_norm = (
-        weight.transpose(0, 1)
-        .reshape(weight.shape[1], -1)
-        .norm(dim=1, keepdim=True)
-        .reshape(weight.shape[1], *[1] * dora_norm_dims)
-        .transpose(0, 1)
+    if weight.dtype != dora_scale.dtype:
+        weight = weight.to(dora_scale.dtype)
+    # Norm along all dims except dim 1 (input dim) — the wd_on_output=False case.
+    # torch.linalg.vector_norm avoids the transpose→reshape→norm→reshape→transpose
+    # chain that materialises a full contiguous copy.
+    dora_norm_dims = (0,) + tuple(range(2, weight.dim()))
+    weight_norm = torch.linalg.vector_norm(
+        weight, dim=dora_norm_dims, keepdim=True
     )
     merged_scale1 = weight / weight_norm * dora_scale
     diff_weight = merged_scale1 - org_weight

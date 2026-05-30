@@ -164,25 +164,32 @@ class LoConModule(LycorisBaseModule):
             # torch.norm is read-only so no clone needed; .float() creates a
             # new tensor for numerical precision.
             org_weight = org_module.weight.data.float()
-            self.dora_norm_dims = org_weight.dim() - 1
-            if self.wd_on_output:
-                self.dora_scale = nn.Parameter(
-                    torch.norm(
-                        org_weight.reshape(org_weight.shape[0], -1),
-                        dim=1,
-                        keepdim=True,
-                    ).reshape(org_weight.shape[0], *[1] * self.dora_norm_dims)
-                ).float()
+            ndim = org_weight.dim()
+            self.dora_norm_dims = ndim - 1
+
+            # Pre-compute dimension tuples for torch.linalg.vector_norm in
+            # apply_weight_decompose — avoids runtime tuple construction and
+            # eliminates the transpose→reshape→norm→reshape→transpose chain
+            # that materialises a full contiguous copy for non-wd_on_output.
+            #   wd_on_output=True : norm along all dims except dim 0 (output)
+            #   wd_on_output=False: norm along all dims except dim 1 (input)
+            if wd_on_output:
+                self._dora_norm_dims = tuple(range(1, ndim))
             else:
-                self.dora_scale = nn.Parameter(
-                    torch.norm(
-                        org_weight.transpose(1, 0).reshape(org_weight.shape[1], -1),
-                        dim=1,
-                        keepdim=True,
-                    )
-                    .reshape(org_weight.shape[1], *[1] * self.dora_norm_dims)
-                    .transpose(1, 0)
-                ).float()
+                self._dora_norm_dims = (0,) + tuple(range(2, ndim))
+
+            # Pre-compute eps to avoid torch.finfo lookup every forward pass.
+            self.register_buffer(
+                "_dora_eps",
+                torch.tensor(torch.finfo(torch.float32).eps),
+                persistent=False,
+            )
+
+            self.dora_scale = nn.Parameter(
+                torch.linalg.vector_norm(
+                    org_weight, dim=self._dora_norm_dims, keepdim=True
+                )
+            ).float()
 
         if dropout and self.wd:
             log_wd()
@@ -706,23 +713,24 @@ class LoConModule(LycorisBaseModule):
         return merged, None
 
     def apply_weight_decompose(self, weight, multiplier=1):
-        weight = weight.to(self.dora_scale.dtype)
-        if self.wd_on_output:
-            weight_norm = (
-                weight.reshape(weight.shape[0], -1)
-                .norm(dim=1)
-                .reshape(weight.shape[0], *[1] * self.dora_norm_dims)
-            ) + torch.finfo(weight.dtype).eps
-        else:
-            weight_norm = (
-                weight.transpose(0, 1)
-                .reshape(weight.shape[1], -1)
-                .norm(dim=1, keepdim=True)
-                .reshape(weight.shape[1], *[1] * self.dora_norm_dims)
-                .transpose(0, 1)
-            ) + torch.finfo(weight.dtype).eps
+        if weight.dtype != self.dora_scale.dtype:
+            weight = weight.to(self.dora_scale.dtype)
 
-        scale = self.dora_scale.to(weight.device) / weight_norm
+        # Use torch.linalg.vector_norm with pre-computed dim tuple and
+        # keepdim=True.  This replaces the old
+        #   reshape→norm(dim=1)→reshape + transpose chain
+        # with a single fused call that:
+        #  (a) eliminates intermediate tensor allocations from reshape/transpose
+        #  (b) avoids the O(n) contiguous copy forced by transpose→reshape
+        #      in the wd_on_output=False path (transpose makes the tensor
+        #      non-contiguous, so reshape must copy the entire weight)
+        weight_norm = (
+            torch.linalg.vector_norm(
+                weight, dim=self._dora_norm_dims, keepdim=True
+            ) + self._dora_eps
+        )
+
+        scale = self.dora_scale.to(weight.device, non_blocking=True) / weight_norm
         # Always apply: when multiplier==1 this simplifies to scale unchanged.
         # Avoids data-dependent branch that causes torch.compile graph breaks.
         scale = multiplier * (scale - 1) + 1
