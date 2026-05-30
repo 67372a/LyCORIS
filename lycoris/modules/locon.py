@@ -497,7 +497,7 @@ class LoConModule(LycorisBaseModule):
         drop = (torch.rand(weight.size(0), device=device) > self.rank_dropout).to(
             weight.dtype
         )
-        drop = drop.view(-1, *[1] * len(weight.shape[1:]))
+        drop = drop.view(self._rank_drop_shape)
         if self.rank_dropout_scale:
             drop /= drop.mean()
         return weight * drop
@@ -1041,11 +1041,7 @@ class LoConModule(LycorisBaseModule):
                 ).to(mid.dtype)
                 if self.rank_dropout_scale:
                     drop /= drop.mean()
-                if (dims := len(x.shape)) == 4:
-                    drop = drop.view(1, -1, 1, 1)
-                else:
-                    drop = drop.view(*[1] * (dims - 1), -1)
-                mid = mid * drop
+                mid = mid * drop.view(self._bypass_rank_drop_shape)
 
             if self.isconv:
                 up = self.up_op(
@@ -1088,22 +1084,33 @@ class LoConModule(LycorisBaseModule):
         multiplier = self.multiplier_buf
 
         # Weight difference computation
-        if (not self.wd and (self.tucker or self.rank_dropout)):
+        # Path 1: _compute_diff_weight_single/multitask already includes
+        # scalar * scale in the returned diff_weight.
+        # Path 2: make_weight includes scalar but NOT scale; scale is
+        # applied below.
+        _scale_in_diff = (not self.wd and (self.tucker or self.rank_dropout))
+        if _scale_in_diff:
             if self.olora:
                 diff_weight = self._compute_diff_weight_multitask(device, dtype)
             else:
                 diff_weight = self._compute_diff_weight_single(device, dtype)
         else:
-            diff_weight = self.make_weight(device).to(dtype) * self.scale
+            diff_weight = self.make_weight(device).to(dtype)
 
         # Merge weights
         weight = org_weight
         if self.wd:
-            weight = self.apply_weight_decompose(weight + diff_weight, multiplier)
+            # DoRA path: _scale_in_diff is always False here, so apply scale
+            weight = self.apply_weight_decompose(
+                weight + diff_weight * self.scale, multiplier)
             # Input dropout for DoRA
             x = self.drop(x)
-        else:
+        elif _scale_in_diff:
+            # diff_weight already includes scale; just apply multiplier
             weight = weight + diff_weight * multiplier
+        else:
+            # Fuse scale * multiplier into a single multiplication
+            weight = weight + diff_weight * (self.scale * multiplier)
 
         return self._call_op(x, weight, bias)
 
@@ -1133,18 +1140,15 @@ class LoConModule(LycorisBaseModule):
         if self.tucker:
             mid = self._call_op(mid, mid_weight)
 
-        # Rank dropout
+        # Rank dropout — uses pre-computed view shape to avoid
+        # len(x.shape) graph breaks in compiled region.
         if self.rank_dropout and self.training:
             drop = (
                 torch.rand(self.lora_dim, device=mid.device) > self.rank_dropout
             ).to(mid.dtype)
             if self.rank_dropout_scale:
                 drop /= drop.mean()
-            if (dims := len(x.shape)) == 4:
-                drop = drop.view(1, -1, 1, 1)
-            else:
-                drop = drop.view(*[1] * (dims - 1), -1)
-            mid = mid * drop
+            mid = mid * drop.view(self._bypass_rank_drop_shape)
 
         # Up projection — always 1×1 conv (or linear)
         up = self._call_op_1x1(mid, up_weight)

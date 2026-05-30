@@ -264,6 +264,26 @@ class LycorisBaseModule(ModuleCustomSD):
             self._conv_dilation = org_module.dilation
             self._conv_groups = org_module.groups
 
+        # Compile-friendly norm parameter cache (avoids **kw_dict graph breaks)
+        if self.module_type == "layernorm":
+            self._ln_normalized_shape = org_module.normalized_shape
+            self._ln_eps = org_module.eps
+        elif self.module_type == "groupnorm":
+            self._gn_num_groups = org_module.num_groups
+            self._gn_eps = org_module.eps
+
+        # Pre-compute expected input ndim and rank-dropout view shapes.
+        # These are constants per module, so torch.compile specializes once
+        # and never recompiles due to ndim changes.
+        _NDIM_MAP = {"linear": 2, "conv1d": 3, "conv2d": 4, "conv3d": 5}
+        self._expected_ndim = _NDIM_MAP.get(self.module_type, None)
+        if self._expected_ndim is not None:
+            ndim = self._expected_ndim
+            # Weight-based rank dropout: drop viewed as (out, 1, 1, ...)
+            self._rank_drop_shape = [-1] + [1] * (ndim - 1)
+            # Bypass-mode rank dropout: drop viewed as (1, rank, 1, 1, ...)
+            self._bypass_rank_drop_shape = [1, -1] + [1] * max(ndim - 2, 0)
+
         self.register_buffer("dtype_tensor", torch.tensor(0.0), persistent=False)
         # Cache dtype as plain attribute to avoid property access in compiled graphs.
         # Kept in sync via _apply() override.
@@ -349,7 +369,16 @@ class LycorisBaseModule(ModuleCustomSD):
                 stride=self._conv_stride, padding=self._conv_padding,
                 dilation=self._conv_dilation, groups=self._conv_groups,
             )
-        # Fallback for norm types and others
+        # Explicit norm dispatch — avoids **kw_dict graph breaks
+        if mt == "layernorm":
+            return F.layer_norm(
+                x, self._ln_normalized_shape, weight, bias, eps=self._ln_eps
+            )
+        if mt == "groupnorm":
+            return F.group_norm(
+                x, self._gn_num_groups, weight, bias, eps=self._gn_eps
+            )
+        # Ultimate fallback for unknown types (shouldn't normally be reached)
         if bias is not None:
             return self.op(x, weight, bias, **self.kw_dict)
         return self.op(x, weight, **self.kw_dict)
@@ -370,7 +399,16 @@ class LycorisBaseModule(ModuleCustomSD):
             return F.conv2d(x, weight, bias)
         if mt == "conv3d":
             return F.conv3d(x, weight, bias)
-        # Fallback for norm types and others
+        # Explicit norm dispatch — avoids **kw_dict graph breaks
+        if mt == "layernorm":
+            return F.layer_norm(
+                x, self._ln_normalized_shape, weight, bias, eps=self._ln_eps
+            )
+        if mt == "groupnorm":
+            return F.group_norm(
+                x, self._gn_num_groups, weight, bias, eps=self._gn_eps
+            )
+        # Ultimate fallback for unknown types (shouldn't normally be reached)
         if bias is not None:
             return self.op(x, weight, bias, **self.kw_dict)
         return self.op(x, weight, **self.kw_dict)
