@@ -331,5 +331,49 @@ class PiSSAMathValidation(unittest.TestCase):
                         f"Converted LoRA delta must be near-zero at init, got {delta.norm().item():.2e}")
 
 
+    # ------------------------------------------------------------------
+    # Randomized SVD with non-fp32 weights: must upcast internally
+    # ------------------------------------------------------------------
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required for bf16 test")
+    def test_randomized_svd_uses_fp32_for_bf16_weights(self):
+        """Randomized SVD must upcast bf16 weights to fp32 internally.
+
+        Before the fix, the randomized SVD path computed W_float but then
+        used org_weight_2d (bf16) for the matrix operations, producing
+        inaccurate results due to bf16 quantization noise amplification
+        in power iterations.  After the fix, all ops use W_float (fp32).
+
+        We verify by seeding the RNG so both bf16 and fp32 paths use
+        the same random projection Omega, then comparing singular values.
+        If W_float were NOT used, the bf16 matmuls in power iterations
+        would produce different (less accurate) singular values.
+        """
+        torch.manual_seed(42)
+        W_bf16 = torch.randn(self.m, self.n, dtype=torch.bfloat16, device="cuda")
+        W_fp32 = W_bf16.float()
+
+        # Randomized SVD on bf16 — should internally upcast to fp32
+        torch.manual_seed(77)
+        _, Sr_bf16, _ = LycorisBaseModule._compute_svd_pissa(
+            W_bf16, self.r, niter=4
+        )
+
+        # Randomized SVD on fp32 — reference with same seed
+        torch.manual_seed(77)
+        _, Sr_fp32, _ = LycorisBaseModule._compute_svd_pissa(
+            W_fp32, self.r, niter=4
+        )
+
+        # With the same seed, both produce the same Omega. Since both now
+        # use W_float (fp32) for the matmuls, the singular values must match.
+        sv_error = (Sr_fp32 - Sr_bf16).abs().max().item()
+        self.assertEqual(
+            sv_error,
+            0.0,
+            f"bf16 and fp32 fast SVD singular values differ by {sv_error:.2e} "
+            f"with same seed. This indicates W_float is not being used.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

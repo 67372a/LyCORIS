@@ -354,6 +354,27 @@ class LycorisBaseModule(ModuleCustomSD):
             return self.op(x, weight, bias, **self.kw_dict)
         return self.op(x, weight, **self.kw_dict)
 
+    def _call_op_1x1(self, x, weight, bias=None):
+        """Compile-friendly 1×1 op dispatch — for 1×1 convolutions.
+
+        Like :meth:`_call_op` but uses default conv params (stride=1,
+        padding=0, dilation=1, groups=1).  Correct for lora_up (always
+        1×1) and lora_down in tucker mode (1×1).
+        """
+        mt = self.module_type
+        if mt == "linear":
+            return F.linear(x, weight, bias)
+        if mt == "conv1d":
+            return F.conv1d(x, weight, bias)
+        if mt == "conv2d":
+            return F.conv2d(x, weight, bias)
+        if mt == "conv3d":
+            return F.conv3d(x, weight, bias)
+        # Fallback for norm types and others
+        if bias is not None:
+            return self.op(x, weight, bias, **self.kw_dict)
+        return self.op(x, weight, **self.kw_dict)
+
     def _orthogonalize(self, weight_matrix: torch.Tensor) -> torch.Tensor:
         """
         Orthogonalizes the weight matrix using QR decomposition.
@@ -888,18 +909,18 @@ class LycorisBaseModule(ModuleCustomSD):
         r_oversampled = min(lora_dim + n_oversamples, h)
 
         # Step 1: Random projection
-        Omega = torch.randn((n, r_oversampled), dtype=torch.float32, device=org_weight_2d.device)
-        Y = org_weight_2d @ Omega
+        Omega = torch.randn((n, r_oversampled), dtype=torch.float32, device=W_float.device)
+        Y = W_float @ Omega
 
         # Step 2: Power iterations to improve accuracy
         for _ in range(niter):
-            Y = org_weight_2d @ (org_weight_2d.T @ Y)
+            Y = W_float @ (W_float.T @ Y)
 
         # Step 3: QR decomposition of Y
         Q, _ = torch.linalg.qr(Y)
 
         # Step 4: Project weight to subspace
-        B_proj = Q.T @ org_weight_2d  # (r_oversampled, n)
+        B_proj = Q.T @ W_float  # (r_oversampled, n)
 
         # Step 5: SVD of the small projected matrix
         Ub, S, Vh = torch.linalg.svd(B_proj, full_matrices=False)

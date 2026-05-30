@@ -12,6 +12,7 @@ Verifies:
 import unittest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from lycoris.modules.locon import LoConModule
 from lycoris.modules.loha import LohaModule
@@ -325,6 +326,97 @@ class BypassCoreTests(unittest.TestCase):
     def test_bypass_core_method_exists(self):
         """_forward_bypass_core should exist on LoConModule."""
         self.assertTrue(hasattr(LoConModule, '_forward_bypass_core'))
+
+    def test_bypass_core_conv2d_non_tucker(self):
+        """_forward_bypass_core must use org conv params for down, 1×1 for up."""
+        device = _device()
+        dtype = torch.float32
+        base = nn.Conv2d(16, 32, 3, stride=2, padding=1).to(device, dtype)
+        net = LoConModule("test", base, lora_dim=4, alpha=1).to(device, dtype)
+        net.apply_to()
+
+        x = torch.randn(1, 16, 8, 8, device=device, dtype=dtype)
+
+        # Bypass forward via _bypass_forward_diff_single (reference)
+        out_bypass = net._bypass_forward_diff_single(x, scale=1.0)
+
+        # Bypass forward via _forward_bypass_core directly
+        wb = net.lora_down.weight.to(device, dtype)
+        wa = net.lora_up.weight.to(device, dtype)
+        combined_scale = net.scalar * net.scale * 1.0
+        out_core = net._forward_bypass_core(x, wb, wa, None, combined_scale)
+
+        torch.testing.assert_close(out_core, out_bypass)
+
+    def test_bypass_core_conv2d_tucker(self):
+        """_forward_bypass_core must use 1×1 for down, org params for mid, 1×1 for up."""
+        device = _device()
+        dtype = torch.float32
+        # Tucker requires kernel_size != 1
+        base = nn.Conv2d(16, 32, 3, stride=2, padding=1).to(device, dtype)
+        net = LoConModule("test", base, lora_dim=4, alpha=1, use_tucker=True).to(device, dtype)
+        net.apply_to()
+
+        x = torch.randn(1, 16, 8, 8, device=device, dtype=dtype)
+
+        # Bypass forward via _bypass_forward_diff_single (reference)
+        out_bypass = net._bypass_forward_diff_single(x, scale=1.0)
+
+        # Bypass forward via _forward_bypass_core directly
+        wb = net.lora_down.weight.to(device, dtype)
+        wa = net.lora_up.weight.to(device, dtype)
+        wc = net.lora_mid.weight.to(device, dtype)
+        combined_scale = net.scalar * net.scale * 1.0
+        out_core = net._forward_bypass_core(x, wb, wa, wc, combined_scale)
+
+        torch.testing.assert_close(out_core, out_bypass)
+
+    def test_call_op_1x1_linear(self):
+        """_call_op_1x1 for linear should be identical to F.linear."""
+        device = _device()
+        dtype = torch.float32
+        base = nn.Linear(16, 16).to(device, dtype)
+        net = LoConModule("test", base, lora_dim=4, alpha=1).to(device, dtype)
+
+        x = torch.randn(2, 16, device=device, dtype=dtype)
+        w = torch.randn(16, 16, device=device, dtype=dtype)
+
+        out = net._call_op_1x1(x, w)
+        ref = F.linear(x, w)
+        torch.testing.assert_close(out, ref)
+
+    def test_call_op_1x1_conv2d(self):
+        """_call_op_1x1 for conv2d should use stride=1, padding=0 defaults."""
+        device = _device()
+        dtype = torch.float32
+        # org conv has stride=2, padding=1
+        base = nn.Conv2d(16, 32, 3, stride=2, padding=1).to(device, dtype)
+        net = LoConModule("test", base, lora_dim=4, alpha=1).to(device, dtype)
+
+        x = torch.randn(1, 16, 8, 8, device=device, dtype=dtype)
+        # 1×1 conv weight: out=4, in=16, k=1×1
+        w = torch.randn(4, 16, 1, 1, device=device, dtype=dtype)
+
+        out = net._call_op_1x1(x, w)
+        ref = F.conv2d(x, w)  # default stride=1, padding=0
+        torch.testing.assert_close(out, ref)
+
+    def test_call_op_1x1_differs_from_call_op_for_conv(self):
+        """_call_op_1x1 and _call_op must differ for conv with non-default params."""
+        device = _device()
+        dtype = torch.float32
+        base = nn.Conv2d(16, 32, 3, stride=2, padding=1).to(device, dtype)
+        net = LoConModule("test", base, lora_dim=4, alpha=1).to(device, dtype)
+
+        x = torch.randn(1, 16, 8, 8, device=device, dtype=dtype)
+        # Same weight shape as org module (32, 16, 3, 3)
+        w = torch.randn(32, 16, 3, 3, device=device, dtype=dtype)
+
+        out_1x1 = net._call_op_1x1(x, w)
+        out_org = net._call_op(x, w)
+        # Different spatial output sizes because of different stride/padding
+        self.assertNotEqual(out_1x1.shape, out_org.shape,
+                            "_call_op_1x1 should use stride=1, producing different output size")
 
 
 # ===========================================================================

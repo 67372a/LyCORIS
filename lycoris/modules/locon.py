@@ -990,67 +990,19 @@ class LoConModule(LycorisBaseModule):
         return self._bypass_forward_diff_single(x, scale)
 
     def _bypass_forward_diff_single(self, x, scale=1):
-        """Original single-task bypass forward diff (used when olora=False)."""
-        # Use _maybe_orthogonalize to skip the function call overhead
-        # when orthogonalization is disabled (the common case).
+        """Single-task bypass forward diff — pre-fetches weights, delegates to compiled core."""
+        # Pre-fetch and orthogonalize weights outside the compiled region
+        # to avoid graph breaks from conditional device transfers.
         wb = self._maybe_orthogonalize(self.lora_down.weight).to(x.device, dtype=x.dtype)
         wa = self._maybe_orthogonalize(self.lora_up.weight).to(x.device, dtype=x.dtype)
-
-        # Manually apply the down network using the orthogonalized weight
-        if self.isconv:
-            # For convolution, we need to pass the module's parameters (stride, padding, etc.)
-            mid = self.down_op(
-                x,
-                wb,
-                bias=None,
-                stride=self.lora_down.stride,
-                padding=self.lora_down.padding,
-                dilation=self.lora_down.dilation,
-                groups=self.lora_down.groups,
-            )
-        else: # is linear
-            mid = self.down_op(x, wb)
-
+        wc = None
         if self.tucker:
-            wc = self._maybe_orthogonalize(self.lora_mid.weight)
-            mid = self.op(
-                mid,
-                wc,
-                bias=None,
-                stride=self.lora_mid.stride,
-                padding=self.lora_mid.padding,
-                dilation=self.lora_mid.dilation,
-                groups=self.lora_mid.groups,
-            )
+            wc = self._maybe_orthogonalize(self.lora_mid.weight).to(x.device, dtype=x.dtype)
 
-        if self.rank_dropout and self.training:
-            drop = (
-                torch.rand(self.lora_dim, device=mid.device) > self.rank_dropout
-            ).to(mid.dtype)
-            if self.rank_dropout_scale:
-                drop /= drop.mean()
-            if (dims := len(x.shape)) == 4:
-                drop = drop.view(1, -1, 1, 1)
-            else:
-                drop = drop.view(*[1] * (dims - 1), -1)
-            mid = mid * drop
+        # Pre-combined scalar to avoid triple multiply inside compiled region
+        combined_scale = self.scalar.to(device=x.device, dtype=x.dtype) * self.scale * scale
 
-        # Manually apply the up network using the orthogonalized weight
-        if self.isconv:
-            # For convolution, we need to pass the module's parameters (stride, padding, etc.)
-            up = self.up_op(
-                mid,
-                wa,
-                bias=None,
-                stride=self.lora_up.stride,
-                padding=self.lora_up.padding,
-                dilation=self.lora_up.dilation,
-                groups=self.lora_up.groups,
-            )
-        else: # is linear
-            up = self.up_op(mid, wa)
-
-        return self.drop(up * self.scalar * self.scale * scale)
+        return self._forward_bypass_core(x, wb, wa, wc, combined_scale)
 
     def _bypass_forward_diff_multitask(self, x, scale=1):
         """Multi-task O-LoRA bypass forward diff: sum over all task LoRA pairs."""
@@ -1158,6 +1110,10 @@ class LoConModule(LycorisBaseModule):
     def _forward_bypass_core(self, x, down_weight, up_weight, mid_weight, scale):
         """Compiled bypass diff forward — pure tensor math, no device transfers.
 
+        Uses :meth:`_call_op` (org conv params) for operations whose kernel
+        matches the original module, and :meth:`_call_op_1x1` (default
+        stride=1, padding=0) for 1×1 convolutions (lora_up, tucker lora_down).
+
         Args:
             x: Input tensor.
             down_weight: Pre-fetched lora_down weight (orthogonalized if needed).
@@ -1165,10 +1121,15 @@ class LoConModule(LycorisBaseModule):
             mid_weight: Pre-fetched lora_mid weight or None.
             scale: Scalar multiplier (scalar * self.scale * scale).
         """
-        # Down projection
-        mid = self._call_op(x, down_weight)
+        # Down projection:
+        #   Tucker mode: lora_down is 1×1 conv → use _call_op_1x1
+        #   Non-tucker:  lora_down has org stride/padding → use _call_op
+        if self.tucker:
+            mid = self._call_op_1x1(x, down_weight)
+        else:
+            mid = self._call_op(x, down_weight)
 
-        # Optional Tucker mid
+        # Optional Tucker mid (has org kernel/stride/padding)
         if self.tucker:
             mid = self._call_op(mid, mid_weight)
 
@@ -1185,8 +1146,8 @@ class LoConModule(LycorisBaseModule):
                 drop = drop.view(*[1] * (dims - 1), -1)
             mid = mid * drop
 
-        # Up projection
-        up = self._call_op(mid, up_weight)
+        # Up projection — always 1×1 conv (or linear)
+        up = self._call_op_1x1(mid, up_weight)
 
         return self.drop(up * scale)
 
