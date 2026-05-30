@@ -668,7 +668,7 @@ class LycorisBaseModule(ModuleCustomSD):
         if not (hasattr(self, 'lora_down') and hasattr(self.lora_down, 'weight') and self.lora_down.weight.grad is not None):
             return
         
-        if not (hasattr(self, 'lora_up') and hasattr(self.lora_up, 'weight') and self.lora_down.weight.grad is not None):
+        if not (hasattr(self, 'lora_up') and hasattr(self.lora_up, 'weight') and self.lora_up.weight.grad is not None):
             return
         
         # Skip update every other step for convolutions to reduce overhead
