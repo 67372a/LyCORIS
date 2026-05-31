@@ -27,6 +27,7 @@ from .modules.full import FullModule
 from .modules.diag_oft import DiagOFTModule
 from .modules.boft import ButterflyOFTModule
 from .modules.tlora import TLoraModule
+from .modules.tsm import TSMModule, set_tsm_timestep, get_tsm_timestep, clear_tsm_timestep
 from .modules.lora2 import LoRA2Module
 from .modules.ortholora import OrthoLoRAModule
 from .modules import get_module, make_module
@@ -80,6 +81,7 @@ network_module_dict = {
     "diag-oft": DiagOFTModule,
     "boft": ButterflyOFTModule,
     "tlora": TLoraModule,
+    "tsm": TSMModule,
     "lora2": LoRA2Module,
 }
 deprecated_arg_dict = {
@@ -333,6 +335,21 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
             )
             use_scalar = False
 
+    # TSM parameters
+    tsm_n_scales = kwargs.get("tsm_n_scales", None)
+    tsm_num_timesteps = int(kwargs.get("tsm_num_timesteps", 1000))
+    tsm_stage = int(kwargs.get("tsm_stage", 1))
+    tsm_router_input = kwargs.get("tsm_router_input", "input")
+
+    if algo == "tsm":
+        if tsm_n_scales is not None:
+            if isinstance(tsm_n_scales, str):
+                tsm_n_scales = [int(x.strip()) for x in tsm_n_scales.split(",")]
+            logger.info(f"TSM: n_scales={tsm_n_scales}, num_timesteps={tsm_num_timesteps}, stage={tsm_stage}, router_input={tsm_router_input}")
+        else:
+            tsm_n_scales = [8, 1]
+            logger.info(f"TSM: using default n_scales={tsm_n_scales}")
+
     # LoRA² parameters (Adaptive Rank LoRA)
     lora2_nu_init = kwargs.get("lora2_nu_init", None)
     lora2_nu_target = kwargs.get("lora2_nu_target", None)
@@ -459,6 +476,11 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
         lora2_lambda_r=lora2_lambda_r,
         lora2_lambda_e=lora2_lambda_e,
         use_timestep_mask=use_timestep_mask,
+        # TSM parameters
+        tsm_n_scales=tsm_n_scales,
+        tsm_num_timesteps=tsm_num_timesteps,
+        tsm_stage=tsm_stage,
+        tsm_router_input=tsm_router_input,
     )
 
     if torch_compile:
@@ -1252,6 +1274,37 @@ class LycorisNetwork(torch.nn.Module):
         shared = self._shared_timestep_mask
         if shared is not None:
             shared.fill_(1.0)
+
+    # ------------------------------------------------------------------
+    # TSM: TimeStep Master timestep context
+    # ------------------------------------------------------------------
+
+    def set_tsm_timestep(self, timestep: int) -> None:
+        """Set the current diffusion timestep for all TSM modules.
+
+        Call this before each forward pass with the current denoising timestep.
+
+        Args:
+            timestep: Current denoising timestep (0 to T-1 or 1 to T).
+        """
+        set_tsm_timestep(timestep)
+
+    def clear_tsm_timestep(self) -> None:
+        """Clear the TSM timestep context after the forward pass."""
+        clear_tsm_timestep()
+
+    def set_tsm_stage(self, stage: int) -> None:
+        """Switch all TSM modules between fostering (1) and assembling (2) stages.
+
+        In stage 1 (fostering), all experts are trainable and the router is frozen.
+        In stage 2 (assembling), all experts are frozen and the router is trainable.
+
+        Args:
+            stage: 1 for fostering, 2 for assembling.
+        """
+        for lora in self.loras:
+            if isinstance(lora, TSMModule):
+                lora.set_stage(stage)
 
     @staticmethod
     def compute_timestep_mask(

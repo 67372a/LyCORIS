@@ -24,6 +24,12 @@ from .modules.tlora import (
     compute_timestep_mask,
     compute_timestep_mask_batch,
 )
+from .modules.tsm import (
+    TSMModule,
+    set_tsm_timestep,
+    get_tsm_timestep,
+    clear_tsm_timestep,
+)
 from .modules import make_module
 
 from .wrapper import (

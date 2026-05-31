@@ -27,6 +27,7 @@ from .modules.full import FullModule
 from .modules.diag_oft import DiagOFTModule
 from .modules.boft import ButterflyOFTModule
 from .modules.tlora import TLoraModule
+from .modules.tsm import TSMModule, set_tsm_timestep, get_tsm_timestep, clear_tsm_timestep
 from .modules import make_module, get_module
 
 from .config import PRESET
@@ -125,6 +126,20 @@ def create_network(
     use_timestep_mask = str_bool(kwargs.get("use_timestep_mask", False))
     if use_timestep_mask:
         logger.info("T-LoRA timestep rank masking is enabled")
+
+    # TSM parameters
+    tsm_n_scales = kwargs.get("tsm_n_scales", None)
+    tsm_num_timesteps = int(kwargs.get("tsm_num_timesteps", 1000))
+    tsm_stage = int(kwargs.get("tsm_stage", 1))
+    tsm_router_input = kwargs.get("tsm_router_input", "input")
+    if algo == "tsm":
+        if tsm_n_scales is not None:
+            if isinstance(tsm_n_scales, str):
+                tsm_n_scales = [int(x.strip()) for x in tsm_n_scales.split(",")]
+            logger.info(f"TSM: n_scales={tsm_n_scales}, num_timesteps={tsm_num_timesteps}, stage={tsm_stage}, router_input={tsm_router_input}")
+        else:
+            tsm_n_scales = [8, 1]
+            logger.info(f"TSM: using default n_scales={tsm_n_scales}")
 
     svd_segment = kwargs.get("svd_segment", None)
 
@@ -467,6 +482,11 @@ def create_network(
         lora2_lambda_r=lora2_lambda_r,
         lora2_lambda_e=lora2_lambda_e,
         use_timestep_mask=use_timestep_mask,
+        # TSM parameters
+        tsm_n_scales=tsm_n_scales,
+        tsm_num_timesteps=tsm_num_timesteps,
+        tsm_stage=tsm_stage,
+        tsm_router_input=tsm_router_input,
     )
     if (
         loraplus_lr_ratio is not None
@@ -1204,6 +1224,16 @@ class LycorisNetworkKohya(LycorisNetwork):
                     lora.base_p = lora.base_p.to(device)
                 if hasattr(lora, 'base_lambda'):
                     lora.base_lambda = lora.base_lambda.to(device)
+
+                #tsm
+                if hasattr(lora, 'experts'):
+                    for scale_experts in lora.experts:
+                        for expert in scale_experts:
+                            expert.to(device)
+                if hasattr(lora, 'router_fc'):
+                    lora.router_fc.to(device)
+                if hasattr(lora, 'timestep_embed'):
+                    lora.timestep_embed.to(device)
 
                 #ia3
                 if hasattr(lora, 'weight'):

@@ -14,6 +14,7 @@ from .glora import GLoRAModule
 from .dylora import DyLoraModule
 from .ia3 import IA3Module
 from .tlora import TLoraModule
+from .tsm import TSMModule
 from .lora2 import LoRA2Module
 from .ortholora import OrthoLoRAModule
 
@@ -37,6 +38,7 @@ MODULE_LIST = [
     GLoRAModule,
     DyLoraModule,
     TLoraModule,
+    TSMModule,
 ]
 
 
