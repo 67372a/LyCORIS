@@ -200,7 +200,12 @@ class OrthoLoRAModule(LycorisBaseModule):
         return Q_eff, P_eff
 
     def make_weight(self, device=None):
-        """Compute ΔW = P_eff @ diag(λ) @ Q_eff as a full weight tensor."""
+        """Compute ΔW = P_eff @ diag(λ) @ Q_eff as a full weight tensor.
+
+        Returns raw diff * scalar (NO scale).  Callers (get_diff_weight,
+        _forward_rebuild_core) apply ``self.scale`` — matching the LoConModule
+        convention where ``make_weight`` omits ``scale`` so it's applied once.
+        """
         Q_eff, P_eff = self._compute_effective_bases()
         lam = self.lambda_layer.to(Q_eff.dtype)  # (1, r)
 
@@ -211,10 +216,10 @@ class OrthoLoRAModule(LycorisBaseModule):
         # ΔW = P_eff @ diag(λ) @ Q_eff
         weight = (P_eff * lam) @ Q_eff  # (out, in)
         weight = weight.view(self.shape)
-        return weight * self.scalar.to(device) * self.scale
+        return weight * self.scalar.to(device)
 
     def get_diff_weight(self, multiplier=1.0, shape=None, device=None):
-        diff = self.make_weight(device=device) * multiplier
+        diff = self.make_weight(device=device) * self.scale * multiplier
         if shape is not None:
             diff = diff.view(shape)
         return diff, None
