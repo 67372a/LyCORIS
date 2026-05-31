@@ -147,6 +147,9 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
     torch_compile_dynamic = str_bool(kwargs.get("torch_compile_dynamic", True))
     torch_compile_fullgraph = str_bool(kwargs.get("torch_compile_fullgraph", False))
     train_llm_adapter = str_bool(kwargs.get("train_llm_adapter", False))
+    use_timestep_mask = str_bool(kwargs.get("use_timestep_mask", False))
+    if use_timestep_mask:
+        logger.info("T-LoRA timestep rank masking is enabled")
 
     svd_segment = kwargs.get("svd_segment", None)
 
@@ -453,6 +456,7 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
         lora2_quantile=lora2_quantile,
         lora2_lambda_r=lora2_lambda_r,
         lora2_lambda_e=lora2_lambda_e,
+        use_timestep_mask=use_timestep_mask,
     )
 
     if torch_compile:
@@ -628,6 +632,13 @@ class LycorisNetwork(torch.nn.Module):
         self.weight_noise_dynamic_sigma = kwargs.get("weight_noise_dynamic_sigma", False)
         if self.weight_noise_sigma is not None:
             self.weight_noise_sigma = float(self.weight_noise_sigma)
+
+        # T-LoRA: timestep rank masking configuration
+        self.use_timestep_mask = str_bool(kwargs.get("use_timestep_mask", False))
+        self._tlora_min_rank = int(kwargs.get("tlora_min_rank", 1))
+        self._tlora_alpha = float(kwargs.get("tlora_alpha", 1.0))
+        self._shared_timestep_mask = None
+        self._timestep_mask_arange = None
 
         # GoRA configuration (extracted from root_kwargs for prepare_gora)
         self._gora_needs_init = (
@@ -1183,6 +1194,88 @@ class LycorisNetwork(torch.nn.Module):
         for module in self.modules():
             if isinstance(module, LoConModule) and module.olora:
                 module.merge_old_tasks_to_base()
+
+    # ------------------------------------------------------------------
+    # T-LoRA: timestep-dependent rank masking
+    # ------------------------------------------------------------------
+
+    def set_timestep_mask(self, timesteps, max_timestep=1.0):
+        """Compute and set timestep-dependent rank mask on all T-LoRA modules.
+
+        The mask zeros out high-rank dimensions at high noise (early denoising),
+        forcing the adapter to learn coarse structure first.  At low noise, all
+        ranks are active for fine detail.
+
+        Mask schedule: ``r = clamp(((max_t - t) / max_t)^α × (max_rank - min_rank)
+        + min_rank, max=max_rank)``
+
+        Args:
+            timesteps: Current timestep tensor (scalar or batch).
+            max_timestep: Maximum timestep value (e.g. 1000 or 1.0).
+        """
+        if not self.use_timestep_mask:
+            return
+
+        max_rank = self.lora_dim
+        # Reuse a single GPU-resident mask to avoid per-module transfers.
+        mask = self._shared_timestep_mask
+        if mask is None or mask.device != timesteps.device:
+            mask = torch.ones(1, max_rank, device=timesteps.device)
+            self._shared_timestep_mask = mask
+            self._timestep_mask_arange = torch.arange(max_rank, device=timesteps.device)
+            # Point all T-LoRA-aware modules to the shared buffer
+            for lora in self.loras:
+                if getattr(lora, 'use_timestep_mask', False):
+                    lora._timestep_mask = mask
+
+        t = timesteps.float().mean()
+        frac = ((max_timestep - t) / max_timestep).clamp(min=0.0, max=1.0)
+        r = (
+            frac.pow(self._tlora_alpha)
+            * (max_rank - self._tlora_min_rank)
+            + self._tlora_min_rank
+        )
+        r = r.clamp(max=float(max_rank))
+        mask.copy_((self._timestep_mask_arange < r).to(mask.dtype).unsqueeze(0))
+
+    def clear_timestep_mask(self):
+        """Restore full-rank masks on every T-LoRA module.
+
+        Each module's ``_timestep_mask`` is a Tensor by construction (default
+        all-ones buffer at init, rebound to the shared live-updated mask when
+        ``set_timestep_mask`` runs).  Clearing fills the shared mask with ones
+        in place — modules that were rebound immediately see the neutral mask
+        via the shared reference.
+        """
+        shared = self._shared_timestep_mask
+        if shared is not None:
+            shared.fill_(1.0)
+
+    @staticmethod
+    def compute_timestep_mask(
+        timestep: float,
+        max_timestep: float,
+        max_rank: int,
+        min_rank: int = 1,
+        alpha: float = 1.0,
+    ) -> "torch.Tensor":
+        """Compute a binary rank mask for a single timestep.
+
+        Convenience helper for external callers that want to inspect the mask
+        without going through the network.
+
+        Returns:
+            Binary mask of shape ``(1, max_rank)``.
+        """
+        r = int(
+            ((max_timestep - timestep) / max_timestep) ** alpha
+            * (max_rank - min_rank)
+            + min_rank
+        )
+        r = min(r, max_rank)
+        mask = torch.zeros(1, max_rank)
+        mask[:, :r] = 1.0
+        return mask
 
     def apply_to(self):
         """

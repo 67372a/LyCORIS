@@ -71,6 +71,7 @@ class LoConModule(LycorisBaseModule):
         olora: bool = False,
         olora_lambda: float = 0.5,
         olora_task_id: int = 0,
+        use_timestep_mask: bool = False,
         **kwargs,
     ):
         """if alpha == 0 or None, alpha is rank (no scaling)."""
@@ -235,6 +236,19 @@ class LoConModule(LycorisBaseModule):
                 torch.nn.init.kaiming_uniform_(self.lora_mid.weight, a=math.sqrt(5))
 
         self.init_ggpo()
+
+        # T-LoRA: timestep-dependent rank masking (anima_lora port).
+        # All-ones default → identity multiply; the training loop rebinds
+        # _timestep_mask to a shared live-updated buffer via
+        # LycorisNetwork.set_timestep_mask.  persistent=False so the mask
+        # never appears in checkpoints — trained weights are full-rank.
+        self.use_timestep_mask = use_timestep_mask
+        if use_timestep_mask:
+            self.register_buffer(
+                "_timestep_mask",
+                torch.ones(1, lora_dim, dtype=torch.float32),
+                persistent=False,
+            )
 
         # Cache _scale_in_diff: determines which weight-construction path
         # is taken in _forward_rebuild_core.  All values are init-time
@@ -528,6 +542,11 @@ class LoConModule(LycorisBaseModule):
         """Original single-task weight computation (used when olora=False)."""
         wa = self._maybe_orthogonalize(self.lora_up.weight.to(device))
         wb = self._maybe_orthogonalize(self.lora_down.weight.to(device))
+        # T-LoRA: zero out masked rank dimensions in the down weight so the
+        # up×down product has those rank components zeroed.  Equivalent to
+        # masking the bottleneck activation but works in rebuild mode.
+        if self.use_timestep_mask and self.training:
+            wb = wb * self._timestep_mask.to(wb).view(-1, *([1] * (wb.dim() - 1)))
         if self.tucker:
             t = self._maybe_orthogonalize(self.lora_mid.weight.to(device))
             wa = wa.view(wa.size(0), -1).transpose(0, 1)
@@ -569,6 +588,9 @@ class LoConModule(LycorisBaseModule):
         """Single-task diff_weight for non-bypass forward (tucker or rank_dropout case)."""
         wa = self._maybe_orthogonalize(self.lora_up.weight).to(device=device, dtype=dtype)
         wb = self._maybe_orthogonalize(self.lora_down.weight).to(device=device, dtype=dtype)
+        # T-LoRA: mask rank dimensions in the down weight (rebuild-mode path).
+        if self.use_timestep_mask and self.training:
+            wb = wb * self._timestep_mask.to(device=device, dtype=dtype).view(-1, *([1] * (wb.dim() - 1)))
 
         if self.tucker:
             t = self._maybe_orthogonalize(self.lora_mid.weight).to(device=device, dtype=dtype)
@@ -1156,6 +1178,11 @@ class LoConModule(LycorisBaseModule):
         # Optional Tucker mid (has org kernel/stride/padding)
         if self.tucker:
             mid = self._call_op(mid, mid_weight)
+
+        # T-LoRA: mask rank dimensions in the bottleneck activation.
+        # Applied after down (+ optional tucker mid), before rank dropout.
+        if self.use_timestep_mask and self.training:
+            mid = mid * self._timestep_mask.to(mid)
 
         # Rank dropout — uses pre-computed view shape to avoid
         # len(x.shape) graph breaks in compiled region.
