@@ -28,6 +28,7 @@ from .modules.diag_oft import DiagOFTModule
 from .modules.boft import ButterflyOFTModule
 from .modules.tlora import TLoraModule
 from .modules.lora2 import LoRA2Module
+from .modules.ortholora import OrthoLoRAModule
 from .modules import get_module, make_module
 
 from .config import PRESET
@@ -67,6 +68,7 @@ network_module_dict = {
     "abba": AbbaModule,
     "lora": LoConModule,
     "locon": LoConModule,
+    "ortholora": OrthoLoRAModule,
     "gora": GoRAModule,
     "ralora": RaLoRAModule,
     "ia3": IA3Module,

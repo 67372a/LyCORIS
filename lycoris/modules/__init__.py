@@ -15,11 +15,13 @@ from .dylora import DyLoraModule
 from .ia3 import IA3Module
 from .tlora import TLoraModule
 from .lora2 import LoRA2Module
+from .ortholora import OrthoLoRAModule
 
 from ..functional.general import factorization
 
 
 MODULE_LIST = [
+    OrthoLoRAModule,  # Before LoConModule: algo_check uses S_p (unique key)
     AbbaModule,
     LoRA2Module,  # Before LoConModule: algo_check uses lora2_nu (unique key)
     LoConModule,

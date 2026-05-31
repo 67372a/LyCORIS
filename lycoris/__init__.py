@@ -15,6 +15,7 @@ from .modules.glora import GLoRAModule
 from .modules.norms import NormModule
 from .modules.full import FullModule
 from .modules.diag_oft import DiagOFTModule
+from .modules.ortholora import OrthoLoRAModule
 from .modules.tlora import (
     TLoraModule,
     set_timestep_mask,
