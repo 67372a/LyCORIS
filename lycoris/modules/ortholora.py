@@ -49,6 +49,7 @@ class OrthoLoRAModule(LycorisBaseModule):
         "Q_basis",
         "lambda_layer",
         "alpha",
+        "dora_scale",
         # Distilled form (after custom_state_dict distill mode)
         "lora_up.weight",
         "lora_down.weight",
@@ -128,6 +129,25 @@ class OrthoLoRAModule(LycorisBaseModule):
             persistent=False,
         )
 
+        # DoRA (weight decomposition): magnitude-direction normalization.
+        self.wd = weight_decompose
+        if self.wd:
+            org_weight = org_module.weight.data.float()
+            ndim = org_weight.dim()
+            self._dora_norm_dims = tuple(range(1, ndim))  # norm along all dims except output
+            self.register_buffer(
+                "_dora_eps",
+                torch.tensor(torch.finfo(torch.float32).eps),
+                persistent=False,
+            )
+            self.dora_scale = nn.Parameter(
+                torch.linalg.vector_norm(
+                    org_weight, dim=self._dora_norm_dims, keepdim=True
+                )
+            ).float()
+            # DoRA forces rebuild mode (bypass can't normalize the merged weight)
+            self.bypass_mode = False
+
         # Alpha scaling
         if isinstance(alpha, torch.Tensor):
             alpha = alpha.detach().float().item()
@@ -204,7 +224,26 @@ class OrthoLoRAModule(LycorisBaseModule):
         weight = self.get_org_weight_for_compute(diff.device)
         if weight.dtype != diff.dtype:
             weight = weight.to(diff.dtype)
+        if self.wd:
+            return self.apply_weight_decompose(weight + diff, multiplier), None
         return weight + diff * multiplier, None
+
+    def apply_weight_decompose(self, weight, multiplier=1):
+        """DoRA: normalize merged weight to preserve pretrained magnitude.
+
+        output = x @ (merged * ||W₀|| / ||merged||)
+        where multiplier interpolation: scale = m * (s-1) + 1
+        """
+        if weight.dtype != self.dora_scale.dtype:
+            weight = weight.to(self.dora_scale.dtype)
+        weight_norm = (
+            torch.linalg.vector_norm(
+                weight, dim=self._dora_norm_dims, keepdim=True
+            ) + self._dora_eps
+        )
+        scale = self.dora_scale.to(weight.device, non_blocking=True) / weight_norm
+        scale = multiplier * (scale - 1) + 1
+        return weight * scale
 
     def bypass_forward_diff(self, x, scale=1):
         """Bypass-mode diff: x → Q_eff → λ → P_eff."""
@@ -229,7 +268,14 @@ class OrthoLoRAModule(LycorisBaseModule):
     def _forward_rebuild_core(self, x, org_weight, bias):
         """Rebuild-mode forward — torch.compile target."""
         diff_weight = self.make_weight(device=x.device).to(x.dtype)
-        weight = org_weight + diff_weight * self.multiplier
+        if self.wd:
+            # DoRA: magnitude-direction normalization
+            weight = self.apply_weight_decompose(
+                org_weight + diff_weight * self.scale, self.multiplier
+            )
+            x = self.drop(x)  # Input dropout for DoRA (per paper)
+        else:
+            weight = org_weight + diff_weight * self.scale * self.multiplier
         return self._call_op(x, weight, bias)
 
     def forward(self, x, *args, **kwargs):
@@ -257,7 +303,7 @@ class OrthoLoRAModule(LycorisBaseModule):
           lambda_layer for checkpoint resume with full fidelity.
         """
         if self.native_save:
-            return {
+            destination = {
                 "S_p": self.S_p,
                 "S_q": self.S_q,
                 "P_basis": self.P_basis,
@@ -265,6 +311,9 @@ class OrthoLoRAModule(LycorisBaseModule):
                 "lambda_layer": self.lambda_layer,
                 "alpha": self.alpha,
             }
+            if self.wd:
+                destination["dora_scale"] = self.dora_scale
+            return destination
 
         # Distill mode: Cayley + frozen SVD → lora_down/lora_up
         R_p = self._cayley(self.S_p.float())
@@ -340,7 +389,7 @@ class OrthoLoRAModule(LycorisBaseModule):
     def load_weight_hook(self, module: nn.Module, incompatible_keys):
         missing_keys = incompatible_keys.missing_keys
         for key in missing_keys[:]:
-            if "scalar" in key or "timestep_mask" in key:
+            if "scalar" in key or "timestep_mask" in key or "dora_scale" in key:
                 missing_keys.remove(key)
         if isinstance(self.scalar, nn.Parameter):
             self.scalar.data.copy_(torch.ones_like(self.scalar))
