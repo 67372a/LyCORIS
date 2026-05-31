@@ -122,6 +122,9 @@ def create_network(
     torch_compile_dynamic = str_bool(kwargs.get("torch_compile_dynamic", True))
     torch_compile_fullgraph = str_bool(kwargs.get("torch_compile_fullgraph", False))
     train_llm_adapter = str_bool(kwargs.get("train_llm_adapter", False))
+    use_timestep_mask = str_bool(kwargs.get("use_timestep_mask", False))
+    if use_timestep_mask:
+        logger.info("T-LoRA timestep rank masking is enabled")
 
     svd_segment = kwargs.get("svd_segment", None)
 
@@ -463,6 +466,7 @@ def create_network(
         lora2_quantile=lora2_quantile,
         lora2_lambda_r=lora2_lambda_r,
         lora2_lambda_e=lora2_lambda_e,
+        use_timestep_mask=use_timestep_mask,
     )
     if (
         loraplus_lr_ratio is not None
@@ -728,6 +732,13 @@ class LycorisNetworkKohya(LycorisNetwork):
         self.weight_noise_dynamic_sigma = kwargs.get("weight_noise_dynamic_sigma", False)
         if self.weight_noise_sigma is not None:
             self.weight_noise_sigma = float(self.weight_noise_sigma)
+
+        # T-LoRA: timestep rank masking configuration
+        self.use_timestep_mask = str_bool(kwargs.get("use_timestep_mask", False))
+        self._tlora_min_rank = int(kwargs.get("tlora_min_rank", 1))
+        self._tlora_alpha = float(kwargs.get("tlora_alpha", 1.0))
+        self._shared_timestep_mask = None
+        self._timestep_mask_arange = None
 
         # GoRA configuration — matches LycorisNetwork pattern
         self._gora_needs_init = (
