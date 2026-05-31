@@ -290,7 +290,10 @@ class ButterflyOFTModule(LycorisBaseModule):
                 .flatten(-3)
                 .unflatten(-1, (-1, b))
             )
-            inp = torch.einsum("b i j, b j ... -> b i ...", bi, inp)
+            # Use "m i j, ... m j -> ... m i" so the einsum applies butterfly
+            # blocks (m) to the last two dims regardless of leading
+            # batch/spatial dimensions.
+            inp = torch.einsum("m i j, ... m j -> ... m i", bi, inp)
             inp = (
                 inp.flatten(-2).unflatten(-1, (-1, k, g)).transpose(-2, -1).flatten(-3)
             )

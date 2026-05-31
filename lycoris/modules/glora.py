@@ -273,11 +273,20 @@ class GLoRAModule(LycorisBaseModule):
         wb1 = self._orthogonalize(self.b1.weight).to(x.device, dtype=x.dtype)
         wb2 = self._orthogonalize(self.b2.weight).to(x.device, dtype=x.dtype)
         
-        # Branch A calculation
+        # Branch A: a2 is always 1x1 conv, so default stride/padding is fine
         ax_mid = self.down_op(x, wa2) * scale
         
-        # Branch B calculation
-        bx_mid = self.down_op(x, wb2) * scale
+        # Branch B: b2 may have a non-1x1 kernel, so pass correct conv params
+        if self.isconv:
+            bx_mid = self.op(
+                x, wb2, bias=None,
+                stride=self.b2.stride,
+                padding=self.b2.padding,
+                dilation=self.b2.dilation,
+                groups=self.b2.groups,
+            ) * scale
+        else:
+            bx_mid = self.down_op(x, wb2) * scale
 
         if self.rank_dropout and self.training:
             drop_a = (
