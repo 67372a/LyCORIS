@@ -135,11 +135,11 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
         if not orthogonal_init:
             logger.info("Forcing orthogonal_init as orthogonalize is enabled")
             orthogonal_init = True
+        if not use_scalar:
+            logger.info("Forcing usage of use_scalar as orthogonalize is enabled")
+            use_scalar = True
     if orthogonal_init:
         logger.info("Orthogonal weight initialization for Lycoris is enabled")
-        if not use_scalar:
-            logger.info("Forcing usage of use_scalar as orthogonal_init is enabled")
-            use_scalar = True
     olora = str_bool(kwargs.get("olora", False))
     olora_lambda = float(kwargs.get("olora_lambda", 0.5))
     olora_task_id = int(kwargs.get("olora_task_id", 0))

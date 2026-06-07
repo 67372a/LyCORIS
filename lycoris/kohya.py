@@ -111,11 +111,11 @@ def create_network(
         if not orthogonal_init:
             logger.info("Forcing orthogonal_init as orthogonalize is enabled")
             orthogonal_init = True
+        if not use_scalar:
+            logger.info("Forcing usage of use_scalar as orthogonalize is enabled")
+            use_scalar = True
     if orthogonal_init:
         logger.info("Orthogonal weight initialization for Lycoris is enabled")
-        if not use_scalar:
-            logger.info("Forcing usage of use_scalar as orthogonal_init is enabled")
-            use_scalar = True
 
     train_t5xxl = str_bool(kwargs.get("train_t5xxl", False))
     torch_compile = str_bool(kwargs.get("torch_compile", False))

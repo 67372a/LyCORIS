@@ -188,26 +188,6 @@ class LycorisModuleTests(unittest.TestCase):
     # --- Orthogonal init / runtime orthogonalization tests ---
     _orthogonal_modules = [LoConModule, LokrModule, GLoRAModule, LohaModule]
 
-    def test_orthogonal_forces_scalar(self):
-        """orthogonal=True should force use_scalar=True."""
-        base = nn.Linear(16, 16)
-        for module_cls in self._orthogonal_modules:
-            net = module_cls(
-                "test",
-                base,
-                multiplier=1,
-                lora_dim=4,
-                alpha=1,
-                orthogonalize=True,
-                use_scalar=False,
-            )
-            self.assertIsInstance(
-                net.scalar,
-                nn.Parameter,
-                f"{module_cls.__name__}: orthogonalize should force scalar to be nn.Parameter",
-            )
-            net.restore()
-
     def test_orthogonalize_forces_init_and_scalar(self):
         """orthogonalize=True should force orthogonal_init=True and use_scalar=True."""
         base = nn.Linear(16, 16)
@@ -227,7 +207,50 @@ class LycorisModuleTests(unittest.TestCase):
             )
             self.assertTrue(
                 isinstance(net.scalar, nn.Parameter),
-                f"{module_cls.__name__}: orthogonalize should force scalar via orthogonal_init",
+                f"{module_cls.__name__}: orthogonalize should force scalar via orthogonalize",
+            )
+            net.restore()
+
+    def test_orthogonal_forces_scalar(self):
+        """orthogonalize=True should force use_scalar=True."""
+        base = nn.Linear(16, 16)
+        for module_cls in self._orthogonal_modules:
+            net = module_cls(
+                "test",
+                base,
+                multiplier=1,
+                lora_dim=4,
+                alpha=1,
+                orthogonalize=True,
+                use_scalar=False,
+            )
+            self.assertIsInstance(
+                net.scalar,
+                nn.Parameter,
+                f"{module_cls.__name__}: orthogonalize should force scalar to be nn.Parameter",
+            )
+            net.restore()
+
+    def test_orthogonal_init_does_not_force_scalar(self):
+        """orthogonal_init=True should NOT force use_scalar=True."""
+        base = nn.Linear(16, 16)
+        for module_cls in self._orthogonal_modules:
+            net = module_cls(
+                "test",
+                base,
+                multiplier=1,
+                lora_dim=4,
+                alpha=1,
+                orthogonal_init=True,
+                use_scalar=False,
+            )
+            self.assertTrue(
+                net.use_orthogonal_init,
+                f"{module_cls.__name__}: orthogonal_init should be set",
+            )
+            self.assertFalse(
+                isinstance(net.scalar, nn.Parameter),
+                f"{module_cls.__name__}: orthogonal_init should NOT force use_scalar",
             )
             net.restore()
 
