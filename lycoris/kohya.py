@@ -94,6 +94,12 @@ def create_network(
     scalar_init_value = kwargs.get("scalar_init_value", None)
     if scalar_init_value is not None:
         scalar_init_value = float(scalar_init_value)
+    scalar_type = kwargs.get("scalar_type", "scalar")
+    if scalar_type not in ("scalar", "row", "column", "row_column"):
+        raise ValueError(
+            f"Invalid scalar_type='{scalar_type}', must be one of: "
+            f"scalar, row, column, row_column"
+        )
     block_size = int(kwargs.get("block_size", 4) or 4)
     train_norm = str_bool(kwargs.get("train_norm", False))
     constraint = float(kwargs.get("constraint", 0.0) or 0.0)
@@ -331,6 +337,7 @@ def create_network(
                 "use_scalar set to False."
             )
             use_scalar = False
+            scalar_type = "scalar"
 
     # RaLoRA parameters (Kohya path)
     ralora_n_max = int(kwargs.get("ralora_n_max", 32))
@@ -380,6 +387,7 @@ def create_network(
                 "use_scalar set to False."
             )
             use_scalar = False
+            scalar_type = "scalar"
 
     # LoRA² parameters (Kohya path)
     lora2_nu_init = kwargs.get("lora2_nu_init", None)
@@ -416,6 +424,7 @@ def create_network(
         use_tucker=use_tucker,
         use_scalar=use_scalar,
         scalar_init_value=scalar_init_value,
+        scalar_type=scalar_type,
         network_module=algo,
         train_norm=train_norm,
         decompose_both=kwargs.get("decompose_both", False),

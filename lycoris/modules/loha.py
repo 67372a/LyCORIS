@@ -52,6 +52,7 @@ class LohaModule(LycorisBaseModule):
         ggpo_sigma: Optional[float] = None,
         orthogonalize=False,
         orthogonal_init=False,
+        scalar_type: str = "scalar",
         **kwargs,
     ):
         super().__init__(
@@ -155,9 +156,22 @@ class LohaModule(LycorisBaseModule):
         self.register_buffer("alpha", torch.tensor(alpha * (lora_dim / r_factor)))
 
         if use_scalar:
-            init_val = scalar_init_value if scalar_init_value is not None else 0.1
-            self.scalar = nn.Parameter(torch.tensor(init_val))
+            self.scalar_type = scalar_type
+            if scalar_type == "scalar":
+                init_val = scalar_init_value if scalar_init_value is not None else 0.1
+                self.scalar = nn.Parameter(torch.tensor(init_val))
+            elif scalar_type == "row":
+                init_val = scalar_init_value if scalar_init_value is not None else 0.1
+                self.row_scalar = nn.Parameter(torch.full((self.shape[0],), init_val))
+            elif scalar_type == "column":
+                init_val = scalar_init_value if scalar_init_value is not None else 0.1
+                self.col_scalar = nn.Parameter(torch.full((self.shape[1],), init_val))
+            elif scalar_type == "row_column":
+                init_val = scalar_init_value if scalar_init_value is not None else math.sqrt(0.1)
+                self.row_scalar = nn.Parameter(torch.full((self.shape[0],), init_val))
+                self.col_scalar = nn.Parameter(torch.full((self.shape[1],), init_val))
         else:
+            self.scalar_type = "none"
             self.register_buffer("scalar", torch.tensor(1.0), persistent=False)
         # Need more experiments on init method
         if self.use_orthogonal_init:
@@ -262,14 +276,28 @@ class LohaModule(LycorisBaseModule):
         for key in missing_keys:
             if "scalar" in key:
                 del missing_keys[missing_keys.index(key)]
-        if isinstance(self.scalar, nn.Parameter):
-            self.scalar.data.copy_(torch.ones_like(self.scalar))
-        elif getattr(self, "scalar", None) is not None:
-            self.scalar.copy_(torch.ones_like(self.scalar))
-        else:
-            self.register_buffer(
-                "scalar", torch.ones_like(self.scalar), persistent=False
-            )
+        # Reset scalars to 1.0 (baked into weights during save)
+        for attr in ("scalar", "row_scalar", "col_scalar"):
+            param = getattr(self, attr, None)
+            if param is not None:
+                if isinstance(param, nn.Parameter):
+                    param.data.copy_(torch.ones_like(param))
+                else:
+                    param.copy_(torch.ones_like(param))
+
+    def _apply_row_scalar(self, weight):
+        """Bake row scalar into weight for saving. For scalar type, bakes the single scalar."""
+        if self.scalar_type == "scalar":
+            return weight * self.scalar.to(device=weight.device, non_blocking=True)
+        elif self.scalar_type in ("row", "row_column"):
+            return weight * self.row_scalar.to(device=weight.device, non_blocking=True).view(-1, *([1] * (weight.dim() - 1)))
+        return weight
+
+    def _apply_col_scalar(self, weight):
+        """Bake col scalar into weight for saving."""
+        if self.scalar_type in ("column", "row_column"):
+            return weight * self.col_scalar.to(device=weight.device, non_blocking=True).view(1, -1, *([1] * (weight.dim() - 2)))
+        return weight
 
     def get_weight(self, shape):
         scale = torch.tensor(
@@ -361,10 +389,18 @@ class LohaModule(LycorisBaseModule):
         destination["alpha"] = self.alpha
         if self.wd:
             destination["dora_scale"] = self.dora_scale
-        destination["hada_w1_a"] = self.hada_w1_a * self.scalar.to(device=self.hada_w1_a.device, non_blocking=True)
-        destination["hada_w1_b"] = self.hada_w1_b
-        destination["hada_w2_a"] = self.hada_w2_a
-        destination["hada_w2_b"] = self.hada_w2_b
+        if self.scalar_type == "scalar":
+            # Existing behavior: bake scalar into hada_w1_a
+            destination["hada_w1_a"] = self.hada_w1_a * self.scalar.to(device=self.hada_w1_a.device, non_blocking=True)
+            destination["hada_w1_b"] = self.hada_w1_b
+            destination["hada_w2_a"] = self.hada_w2_a
+            destination["hada_w2_b"] = self.hada_w2_b
+        else:
+            # Vector scalars: bake row_scalar into hada_w2_a, col_scalar into hada_w2_b
+            destination["hada_w1_a"] = self.hada_w1_a
+            destination["hada_w1_b"] = self.hada_w1_b
+            destination["hada_w2_a"] = self._apply_row_scalar(self.hada_w2_a)
+            destination["hada_w2_b"] = self._apply_col_scalar(self.hada_w2_b)
         if self.tucker:
             destination["hada_t1"] = self.hada_t1
             destination["hada_t2"] = self.hada_t2
@@ -372,14 +408,23 @@ class LohaModule(LycorisBaseModule):
 
     @torch.no_grad()
     def apply_max_norm(self, max_norm, device=None):
-        orig_norm = (self.get_weight(self.shape) * self.scalar).norm()
+        orig_norm = self.get_weight(self.shape).norm()
         norm = torch.clamp(orig_norm, max_norm / 2)
         desired = torch.clamp(norm, max=max_norm)
         ratio = desired.cpu() / norm.cpu()
 
         scaled = norm != desired
         if scaled:
-            self.scalar *= ratio
+            if self.scalar_type == "scalar":
+                self.scalar *= ratio
+            elif self.scalar_type == "row":
+                self.row_scalar *= ratio
+            elif self.scalar_type == "column":
+                self.col_scalar *= ratio
+            elif self.scalar_type == "row_column":
+                ratio_sqrt = ratio.sqrt()
+                self.row_scalar *= ratio_sqrt
+                self.col_scalar *= ratio_sqrt
             return scaled, orig_norm * ratio
         else:
             return 0, orig_norm
@@ -392,7 +437,21 @@ class LohaModule(LycorisBaseModule):
         return unscaled_norm
 
     def bypass_forward_diff(self, x, scale=1):
-        diff_weight = self.get_weight(self.shape) * self.scalar * scale
+        diff_weight = self.get_weight(self.shape)
+        if self.scalar_type == "scalar":
+            diff_weight = diff_weight * self.scalar * scale
+        elif self.scalar_type == "row":
+            rs = self.row_scalar.view(-1, *([1] * (diff_weight.dim() - 1)))
+            diff_weight = diff_weight * rs * scale
+        elif self.scalar_type == "column":
+            cs = self.col_scalar.view(1, -1, *([1] * (diff_weight.dim() - 2)))
+            diff_weight = diff_weight * cs * scale
+        elif self.scalar_type == "row_column":
+            rs = self.row_scalar.view(-1, *([1] * (diff_weight.dim() - 1)))
+            cs = self.col_scalar.view(1, -1, *([1] * (diff_weight.dim() - 2)))
+            diff_weight = diff_weight * rs * cs * scale
+        else:
+            diff_weight = diff_weight * scale
         return self.drop(self._call_op(x, diff_weight))
 
     def bypass_forward(self, x, scale=1):
@@ -405,7 +464,17 @@ class LohaModule(LycorisBaseModule):
         merges with the pre-fetched original weight, and runs the fused
         linear/conv operation.  All inputs are pre-fetched GPU tensors.
         """
-        diff_weight = self.get_weight(self.shape).to(self._cached_dtype) * self.scalar
+        diff_weight = self.get_weight(self.shape).to(self._cached_dtype)
+        if self.scalar_type == "scalar":
+            diff_weight = diff_weight * self.scalar
+        elif self.scalar_type == "row":
+            diff_weight = diff_weight * self.row_scalar.view(-1, *([1] * (diff_weight.dim() - 1)))
+        elif self.scalar_type == "column":
+            diff_weight = diff_weight * self.col_scalar.view(1, -1, *([1] * (diff_weight.dim() - 2)))
+        elif self.scalar_type == "row_column":
+            r = self.row_scalar.view(-1, *([1] * (diff_weight.dim() - 1)))
+            c = self.col_scalar.view(1, -1, *([1] * (diff_weight.dim() - 2)))
+            diff_weight = diff_weight * r * c
         weight = org_weight
         multiplier = self.multiplier_buf
         if self.wd:

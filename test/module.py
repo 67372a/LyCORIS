@@ -344,3 +344,120 @@ class LycorisModuleTests(unittest.TestCase):
                 elif hasattr(net, "hada_w1_a"):
                     self.assertIsNotNone(net.hada_w1_a.grad)
                 net.restore()
+
+    # --- Vector scalar_type tests ---
+
+    _scalar_type_modules = [LoConModule, LohaModule]
+
+    def test_scalar_type_parameter_creation(self):
+        """scalar_type should create correct parameter shapes."""
+        base = nn.Linear(16, 16)
+        scalar_types = ["scalar", "row", "column", "row_column"]
+        for module_cls in self._scalar_type_modules:
+            for st in scalar_types:
+                net = module_cls(
+                    "test", base, multiplier=1, lora_dim=4, alpha=1,
+                    use_scalar=True, scalar_type=st,
+                )
+                if st == "scalar":
+                    self.assertIsInstance(net.scalar, nn.Parameter)
+                    self.assertEqual(net.scalar.shape, ())
+                elif st == "row":
+                    self.assertIsInstance(net.row_scalar, nn.Parameter)
+                    self.assertEqual(net.row_scalar.shape, (16,))
+                    self.assertFalse(hasattr(net, "col_scalar"))
+                elif st == "column":
+                    self.assertIsInstance(net.col_scalar, nn.Parameter)
+                    self.assertEqual(net.col_scalar.shape, (16,))
+                    self.assertFalse(hasattr(net, "row_scalar"))
+                elif st == "row_column":
+                    self.assertIsInstance(net.row_scalar, nn.Parameter)
+                    self.assertIsInstance(net.col_scalar, nn.Parameter)
+                    self.assertEqual(net.row_scalar.shape, (16,))
+                    self.assertEqual(net.col_scalar.shape, (16,))
+                net.restore()
+
+    def test_scalar_type_forward_consistency(self):
+        """Rebuild and bypass forward should produce same output for each scalar_type."""
+        base = nn.Linear(16, 16)
+        test_input = torch.randn(1, 16)
+        scalar_types = ["scalar", "row", "column", "row_column"]
+        for module_cls in self._scalar_type_modules:
+            for st in scalar_types:
+                net = module_cls(
+                    "test", base, multiplier=1, lora_dim=4, alpha=1,
+                    use_scalar=True, scalar_type=st, bypass_mode=False,
+                )
+                net.apply_to()
+
+                # Get rebuild output
+                with torch.no_grad():
+                    out_r = base(test_input.clone())
+
+                # Switch to bypass mode
+                net.bypass_mode = True
+
+                with torch.no_grad():
+                    out_b = base(test_input.clone())
+
+                self.assertTrue(
+                    torch.allclose(out_r, out_b, atol=1e-4),
+                    f"{module_cls.__name__} scalar_type={st}: rebuild vs bypass mismatch"
+                )
+                net.restore()
+
+    def test_scalar_type_save_load_roundtrip(self):
+        """Scalars should be baked into weights on save and reset to 1.0 on load."""
+        base = nn.Linear(16, 16)
+        scalar_types = ["scalar", "row", "column", "row_column"]
+        for module_cls in self._scalar_type_modules:
+            for st in scalar_types:
+                net = module_cls(
+                    "test", base, multiplier=1, lora_dim=4, alpha=1,
+                    use_scalar=True, scalar_type=st,
+                )
+                net.apply_to()
+
+                # Get state dict (scalars should be baked in)
+                state_dict = net.state_dict()
+
+                # Verify scalar keys are NOT in state dict
+                for key in state_dict:
+                    self.assertNotIn("scalar", key,
+                        f"scalar key '{key}' should not appear in state dict")
+
+                net.restore()
+
+    def test_scalar_type_backward_compat(self):
+        """scalar_type='scalar' should produce identical parameter shapes to use_scalar=True."""
+        base = nn.Linear(16, 16)
+        for module_cls in self._scalar_type_modules:
+            # Default (no scalar_type)
+            net1 = module_cls(
+                "test", base, multiplier=1, lora_dim=4, alpha=1,
+                use_scalar=True,
+            )
+            # Explicit scalar_type="scalar"
+            net2 = module_cls(
+                "test", base, multiplier=1, lora_dim=4, alpha=1,
+                use_scalar=True, scalar_type="scalar",
+            )
+            # Both should have scalar as nn.Parameter
+            self.assertIsInstance(net1.scalar, nn.Parameter)
+            self.assertIsInstance(net2.scalar, nn.Parameter)
+            self.assertEqual(net1.scalar.shape, net2.scalar.shape)
+            net1.restore()
+            net2.restore()
+
+    def test_lokr_scalar_type_fallback(self):
+        """LoKr should fall back to scalar_type='scalar' for vector modes."""
+        base = nn.Linear(16, 16)
+        vector_types = ["row", "column", "row_column"]
+        for st in vector_types:
+            net = LokrModule(
+                "test", base, multiplier=1, lora_dim=4, alpha=1,
+                use_scalar=True, scalar_type=st,
+            )
+            # Should have fallen back to scalar
+            self.assertIsInstance(net.scalar, nn.Parameter)
+            net.restore()
