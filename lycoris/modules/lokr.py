@@ -70,6 +70,7 @@ class LokrModule(LycorisBaseModule):
         ggpo_sigma: Optional[float] = None,
         orthogonalize=False,
         orthogonal_init=False,
+        scalar_type: str = "scalar",
         **kwargs,
     ):
         super().__init__(
@@ -234,6 +235,14 @@ class LokrModule(LycorisBaseModule):
         self.scale = alpha / r_factor
 
         self.register_buffer("alpha", torch.tensor(alpha * (lora_dim / r_factor)))
+
+        # LoKr: vector scalar modes not supported due to Kronecker structure
+        if use_scalar and scalar_type in ("row", "column", "row_column"):
+            logger.warning(
+                f"LoKr: scalar_type='{scalar_type}' is not supported due to Kronecker structure. "
+                f"Falling back to scalar_type='scalar'."
+            )
+            scalar_type = "scalar"
 
         if use_scalar:
             init_val = scalar_init_value if scalar_init_value is not None else 0.1

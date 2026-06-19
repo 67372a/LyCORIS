@@ -72,6 +72,7 @@ class LoConModule(LycorisBaseModule):
         olora_lambda: float = 0.5,
         olora_task_id: int = 0,
         use_timestep_mask: bool = False,
+        scalar_type: str = "scalar",
         **kwargs,
     ):
         """if alpha == 0 or None, alpha is rank (no scaling)."""
@@ -208,11 +209,31 @@ class LoConModule(LycorisBaseModule):
         self.register_buffer("alpha", torch.tensor(alpha * (lora_dim / r_factor)))
 
         if use_scalar:
-            init_val = scalar_init_value if scalar_init_value is not None else 0.1
-            self.scalar = nn.Parameter(torch.tensor(init_val))
-            if self.olora:
-                self.lora_scalar_list.append(self.scalar)
+            # O-LoRA only supports scalar_type="scalar"
+            if self.olora and scalar_type != "scalar":
+                logger.warning(
+                    f"O-LoRA: scalar_type='{scalar_type}' is not supported. "
+                    f"Falling back to scalar_type='scalar'."
+                )
+                scalar_type = "scalar"
+            self.scalar_type = scalar_type
+            if scalar_type == "scalar":
+                init_val = scalar_init_value if scalar_init_value is not None else 0.1
+                self.scalar = nn.Parameter(torch.tensor(init_val))
+                if self.olora:
+                    self.lora_scalar_list.append(self.scalar)
+            elif scalar_type == "row":
+                init_val = scalar_init_value if scalar_init_value is not None else 0.1
+                self.row_scalar = nn.Parameter(torch.full((self.shape[0],), init_val))
+            elif scalar_type == "column":
+                init_val = scalar_init_value if scalar_init_value is not None else 0.1
+                self.col_scalar = nn.Parameter(torch.full((self.shape[1],), init_val))
+            elif scalar_type == "row_column":
+                init_val = scalar_init_value if scalar_init_value is not None else math.sqrt(0.1)
+                self.row_scalar = nn.Parameter(torch.full((self.shape[0],), init_val))
+                self.col_scalar = nn.Parameter(torch.full((self.shape[1],), init_val))
         else:
+            self.scalar_type = "none"
             self.register_buffer("scalar", torch.tensor(1.0), persistent=False)
 
         # Weight initialization
@@ -482,14 +503,14 @@ class LoConModule(LycorisBaseModule):
         missing_keys = incompatible_keys.missing_keys
         # Filter expected missing keys in O(n) instead of O(n²)
         missing_keys[:] = [k for k in missing_keys if not self._should_skip_missing_key(k)]
-        if isinstance(self.scalar, nn.Parameter):
-            self.scalar.data.copy_(torch.ones_like(self.scalar))
-        elif getattr(self, "scalar", None) is not None:
-            self.scalar.copy_(torch.ones_like(self.scalar))
-        else:
-            self.register_buffer(
-                "scalar", torch.ones_like(self.scalar), persistent=False
-            )
+        # Reset scalars to 1.0 (baked into weights during save)
+        for attr in ("scalar", "row_scalar", "col_scalar"):
+            param = getattr(self, attr, None)
+            if param is not None:
+                if isinstance(param, nn.Parameter):
+                    param.data.copy_(torch.ones_like(param))
+                else:
+                    param.copy_(torch.ones_like(param))
         # Initialize PiSSA buffers if not loaded from state dict
         if not hasattr(self, "pissa_A_init") or self.pissa_A_init is None:
             self.pissa_A_init = None
@@ -533,6 +554,34 @@ class LoConModule(LycorisBaseModule):
             return self._orthogonalize(weight)
         return weight
 
+    def _apply_scalar(self, weight, device=None, dtype=None):
+        """Apply the appropriate scalar (single, row, col, or row+col) to weight."""
+        if self.scalar_type == "scalar":
+            return weight * self.scalar.to(device=device, dtype=dtype)
+        elif self.scalar_type == "row":
+            return weight * self.row_scalar.to(device=device, dtype=dtype).view(-1, *([1] * (weight.dim() - 1)))
+        elif self.scalar_type == "column":
+            return weight * self.col_scalar.to(device=device, dtype=dtype).view(1, -1, *([1] * (weight.dim() - 2)))
+        elif self.scalar_type == "row_column":
+            r = self.row_scalar.to(device=device, dtype=dtype).view(-1, *([1] * (weight.dim() - 1)))
+            c = self.col_scalar.to(device=device, dtype=dtype).view(1, -1, *([1] * (weight.dim() - 2)))
+            return weight * r * c
+        return weight
+
+    def _apply_row_scalar(self, weight):
+        """Bake row scalar into weight for saving. For scalar type, bakes the single scalar."""
+        if self.scalar_type == "scalar":
+            return weight * self.scalar.to(device=weight.device, non_blocking=True)
+        elif self.scalar_type in ("row", "row_column"):
+            return weight * self.row_scalar.to(device=weight.device, non_blocking=True).view(-1, *([1] * (weight.dim() - 1)))
+        return weight
+
+    def _apply_col_scalar(self, weight):
+        """Bake col scalar into weight for saving."""
+        if self.scalar_type in ("column", "row_column"):
+            return weight * self.col_scalar.to(device=weight.device, non_blocking=True).view(1, -1, *([1] * (weight.dim() - 2)))
+        return weight
+
     def make_weight(self, device=None):
         if self.olora:
             return self._make_weight_multitask(device)
@@ -558,7 +607,7 @@ class LoConModule(LycorisBaseModule):
         weight = weight.view(self.shape)
         weight = self._apply_rank_dropout(weight, device)
 
-        return weight * self.scalar.to(device)
+        return self._apply_scalar(weight, device)
 
     def _make_weight_multitask(self, device=None):
         """Multi-task O-LoRA weight: sum of w_a @ w_b across all tasks."""
@@ -605,7 +654,7 @@ class LoConModule(LycorisBaseModule):
 
         # Cast scalar to target device+dtype once to avoid implicit fp32 upcast then
         # downcast back to dtype on every forward pass.
-        diff_weight = (diff_weight * self.scalar.to(device=device, dtype=dtype)) * self.scale
+        diff_weight = self._apply_scalar(diff_weight, device=device, dtype=dtype) * self.scale
         return diff_weight
 
     def _compute_diff_weight_multitask(self, device, dtype):
@@ -798,16 +847,15 @@ class LoConModule(LycorisBaseModule):
         if self.is_pissa and self.pissa_convert and self.pissa_A_init is not None:
             # PiSSA→LoRA conversion on save:
             # ΔW = A'B' - A₀B₀ = [A' | A₀] · [B' | -B₀]^T
-            lora_up_w = self.lora_up.weight * self.scalar.to(
-                device=self.lora_up.weight.device, non_blocking=True
-            )
+            lora_up_w = self._apply_row_scalar(self.lora_up.weight)
             # Concatenate: trained A (up) with initial A₀ (up init)
             converted_up = torch.cat(
                 [lora_up_w, self.pissa_A_init.to(lora_up_w.device)], dim=1
             )
             # Concatenate: trained B (down) with negated initial B₀ (down init)
+            lora_down_w = self._apply_col_scalar(self.lora_down.weight)
             converted_down = torch.cat(
-                [self.lora_down.weight, -self.pissa_B_init.to(self.lora_down.weight.device)], dim=0
+                [lora_down_w, -self.pissa_B_init.to(lora_down_w.device)], dim=0
             )
             destination["lora_up.weight"] = converted_up
             destination["lora_down.weight"] = converted_down
@@ -817,10 +865,8 @@ class LoConModule(LycorisBaseModule):
                 f"(rank {self.lora_dim} → {2 * self.lora_dim})"
             )
         else:
-            destination["lora_up.weight"] = self.lora_up.weight * self.scalar.to(
-                device=self.lora_up.weight.device, non_blocking=True
-            )
-            destination["lora_down.weight"] = self.lora_down.weight
+            destination["lora_up.weight"] = self._apply_row_scalar(self.lora_up.weight)
+            destination["lora_down.weight"] = self._apply_col_scalar(self.lora_down.weight)
             # Preserve PiSSA init weights in state dict for round-trip loading
             if self.is_pissa and self.pissa_A_init is not None:
                 destination["pissa_A_init"] = self.pissa_A_init
@@ -854,11 +900,8 @@ class LoConModule(LycorisBaseModule):
         # Compute portable LoRA weights.
         # Bake scalar into lora_up before concatenation so the converted
         # adapter produces  scalar*A'B' - A₀B₀  (matching custom_state_dict).
-        scalar_val = self.scalar.to(
-            device=self.lora_up.weight.device, non_blocking=True
-        )
-        lora_up_curr = self.lora_up.weight.data.clone() * scalar_val
-        lora_down_curr = self.lora_down.weight.data.clone()
+        lora_up_curr = self._apply_row_scalar(self.lora_up.weight.data.clone())
+        lora_down_curr = self._apply_col_scalar(self.lora_down.weight.data.clone())
         pissa_up_init = self.pissa_A_init.to(lora_up_curr.device)
         pissa_down_init = self.pissa_B_init.to(lora_down_curr.device)
 
@@ -872,11 +915,14 @@ class LoConModule(LycorisBaseModule):
         self.lora_down.weight.data = delta_down
         self.lora_dim = 2 * self.lora_dim
 
-        # Reset scalar to 1.0 since it has been absorbed into lora_up
-        if isinstance(self.scalar, nn.Parameter):
-            self.scalar.data.fill_(1.0)
-        else:
-            self.scalar.fill_(1.0)
+        # Reset scalars to 1.0 since they have been absorbed into weights
+        for attr in ("scalar", "row_scalar", "col_scalar"):
+            param = getattr(self, attr, None)
+            if param is not None:
+                if isinstance(param, nn.Parameter):
+                    param.data.fill_(1.0)
+                else:
+                    param.fill_(1.0)
 
         # Restore original weight: W = W^res + A₀B₀
         # The base weight currently holds W^res, so we add back A₀B₀
@@ -904,7 +950,16 @@ class LoConModule(LycorisBaseModule):
 
         scaled = norm != desired
         if scaled:
-            self.scalar *= ratio
+            if self.scalar_type == "scalar":
+                self.scalar *= ratio
+            elif self.scalar_type == "row":
+                self.row_scalar *= ratio
+            elif self.scalar_type == "column":
+                self.col_scalar *= ratio
+            elif self.scalar_type == "row_column":
+                ratio_sqrt = ratio.sqrt()
+                self.row_scalar *= ratio_sqrt
+                self.col_scalar *= ratio_sqrt
             return scaled, orig_norm * ratio
         else:
             return 0, orig_norm
@@ -1039,10 +1094,27 @@ class LoConModule(LycorisBaseModule):
         if self.tucker:
             wc = self._maybe_orthogonalize(self.lora_mid.weight).to(x.device, dtype=x.dtype)
 
-        # Pre-combined scalar to avoid triple multiply inside compiled region
-        combined_scale = self.scalar.to(device=x.device, dtype=x.dtype) * self.scale * scale
-
-        return self._forward_bypass_core(x, wb, wa, wc, combined_scale)
+        if self.scalar_type == "scalar":
+            # Pre-combined scalar to avoid triple multiply inside compiled region
+            combined_scale = self.scalar.to(device=x.device, dtype=x.dtype) * self.scale * scale
+            return self._forward_bypass_core(x, wb, wa, wc, combined_scale)
+        else:
+            # Apply col_scalar to input, row_scalar to output.
+            # Linear features live on the last dim; Conv channels live on dim 1.
+            if self.scalar_type in ("column", "row_column"):
+                cs = self.col_scalar.to(device=x.device, dtype=x.dtype)
+                if self.module_type == "linear":
+                    x = x * cs.view(*([1] * (x.dim() - 1)), -1)
+                else:
+                    x = x * cs.view(1, -1, *([1] * (x.dim() - 2)))
+            out = self._forward_bypass_core(x, wb, wa, wc, self.scale * scale)
+            if self.scalar_type in ("row", "row_column"):
+                rs = self.row_scalar.to(device=out.device, dtype=out.dtype)
+                if self.module_type == "linear":
+                    out = out * rs.view(*([1] * (out.dim() - 1)), -1)
+                else:
+                    out = out * rs.view(1, -1, *([1] * (out.dim() - 2)))
+            return out
 
     def _bypass_forward_diff_multitask(self, x, scale=1):
         """Multi-task O-LoRA bypass forward diff: sum over all task LoRA pairs."""
