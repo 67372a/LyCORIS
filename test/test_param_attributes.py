@@ -277,5 +277,76 @@ class TestAllParamsTagged:
                     )
 
 
+# ---------------------------------------------------------------------------
+# 9. is_hidden heuristic via original_name
+# ---------------------------------------------------------------------------
+
+class TestIsHiddenHeuristic:
+    def test_hidden_layer_defaults_true(self):
+        """Modules with no original_name default to is_hidden=True."""
+        net = _make_kohya_network(algo="locon")
+        _prepare_optimizer_params(net)
+        mod = _first_module_of_type(net, "LoConModule")
+        assert mod is not None
+        # The mock model uses Transformer2DModel → original_name contains
+        # 'block1.linear' or similar → not a non-hidden prefix → is_hidden=True.
+        assert getattr(mod.lora_down.weight, "is_hidden", False) is True
+
+    def test_non_hidden_time_embedding(self):
+        """A module whose original_name starts with 'time_embedding' should
+        have is_hidden=False."""
+        from lycoris.modules.locon import LoConModule
+
+        net = _make_kohya_network(algo="locon")
+        _prepare_optimizer_params(net)
+        mod = _first_module_of_type(net, "LoConModule")
+        assert mod is not None
+        # Simulate a non-hidden layer by setting original_name
+        mod.original_name = "time_embedding.linear_1"
+        mod.tag_parameters()
+        assert getattr(mod.lora_down.weight, "is_hidden", True) is False
+
+    def test_non_hidden_conv_in(self):
+        from lycoris.modules.locon import LoConModule
+
+        net = _make_kohya_network(algo="locon")
+        _prepare_optimizer_params(net)
+        mod = _first_module_of_type(net, "LoConModule")
+        mod.original_name = "conv_in"
+        mod.tag_parameters()
+        assert getattr(mod.lora_down.weight, "is_hidden", True) is False
+
+    def test_non_hidden_final_layer(self):
+        from lycoris.modules.locon import LoConModule
+
+        net = _make_kohya_network(algo="locon")
+        _prepare_optimizer_params(net)
+        mod = _first_module_of_type(net, "LoConModule")
+        mod.original_name = "final_layer.linear"
+        mod.tag_parameters()
+        assert getattr(mod.lora_down.weight, "is_hidden", True) is False
+
+    def test_hidden_layer_nested_path(self):
+        """A nested path like 'down_blocks.0.attentions.0...' is hidden."""
+        from lycoris.modules.locon import LoConModule
+
+        net = _make_kohya_network(algo="locon")
+        _prepare_optimizer_params(net)
+        mod = _first_module_of_type(net, "LoConModule")
+        mod.original_name = "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q"
+        mod.tag_parameters()
+        assert getattr(mod.lora_down.weight, "is_hidden", False) is True
+
+    def test_non_hidden_img_in(self):
+        from lycoris.modules.locon import LoConModule
+
+        net = _make_kohya_network(algo="locon")
+        _prepare_optimizer_params(net)
+        mod = _first_module_of_type(net, "LoConModule")
+        mod.original_name = "img_in"
+        mod.tag_parameters()
+        assert getattr(mod.lora_down.weight, "is_hidden", True) is False
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

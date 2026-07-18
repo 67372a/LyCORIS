@@ -532,6 +532,19 @@ class LycorisBaseModule(ModuleCustomSD):
             self._multiplier = float(self.multiplier_buf.item())
         return result
 
+    # Top-level model component prefixes whose parameters are NOT "hidden"
+    # layers (embeddings, input/output projections, timestep conditioning).
+    # Checked against ``original_name`` which is the dotted path into the
+    # root model (e.g. ``time_embedding.linear_1``).
+    _NON_HIDDEN_NAME_PREFIXES = (
+        'time_embedding', 'time_in', 'timestep_embedding',
+        'vector_in', 'guidance_in',
+        'img_in', 'txt_in',
+        'conv_in', 'conv_out',
+        'final_layer',
+        'x_embedder', 'pos_embedder', 'patch_embed', 'context_embedder',
+    )
+
     def tag_parameters(self):
         """Tag nn.Parameter objects with optimizer-relevant attributes.
 
@@ -539,6 +552,10 @@ class LycorisBaseModule(ModuleCustomSD):
         ``is_hidden`` and ``is_vector`` so that Advanced_Optimizers can identify
         each parameter's role (DoRA scale, OFT block, LoRA A/B factor, generic
         hidden weight, or logical vector).
+
+        ``is_hidden`` is determined by checking ``original_name`` (the dotted
+        path into the root model) against a set of known non-hidden prefixes
+        (embeddings, input/output projections, timestep conditioning layers).
 
         Only attributes that can be *accurately* determined from the module's
         parameter structure are set. Notably:
@@ -550,7 +567,7 @@ class LycorisBaseModule(ModuleCustomSD):
         * LoHa / LoKr / GLoRA multi-factor parameters are **not** tagged as
           ``_is_lora_A`` / ``_is_lora_B`` because they do not follow the
           sequential ``B @ A`` LoRA geometry that the optimizer's spectral
-          ``target_scale`` assumes. They receive ``is_hidden=True`` only.
+          ``target_scale`` assumes.
 
         .. note::
             Must be called **after** any device moves (``.to()`` / ``.cuda()``)
@@ -558,6 +575,12 @@ class LycorisBaseModule(ModuleCustomSD):
             drop custom tensor attributes. The network calls this from
             ``prepare_optimizer_params()`` / ``prepare_grad_etc()``.
         """
+        # Determine if this module targets a hidden layer by checking
+        # original_name against known non-hidden top-level components.
+        original_name = getattr(self, 'original_name', None) or ''
+        is_hidden = not any(original_name.startswith(pfx)
+                           for pfx in self._NON_HIDDEN_NAME_PREFIXES)
+
         # --- OFT blocks (DiagOFT / BOFT) ---
         oft_blocks = getattr(self, 'oft_blocks', None)
         if isinstance(oft_blocks, nn.Parameter):
@@ -590,7 +613,7 @@ class LycorisBaseModule(ModuleCustomSD):
                 w = sub.weight
                 if isinstance(w, nn.Parameter):
                     setattr(w, tag, True)
-                    w.is_hidden = True
+                    w.is_hidden = is_hidden
 
         # --- DyLora ModuleList factors ---
         for list_attr, tag in (
@@ -602,7 +625,7 @@ class LycorisBaseModule(ModuleCustomSD):
                 for mod in lst:
                     if hasattr(mod, 'weight') and isinstance(mod.weight, nn.Parameter):
                         setattr(mod.weight, tag, True)
-                        mod.weight.is_hidden = True
+                        mod.weight.is_hidden = is_hidden
 
         # --- Block-split mini LoRA factors (lists / ParameterList of raw tensors) ---
         for list_attr, tag in (
@@ -614,9 +637,9 @@ class LycorisBaseModule(ModuleCustomSD):
                 for p in lst:
                     if isinstance(p, nn.Parameter):
                         setattr(p, tag, True)
-                        p.is_hidden = True
+                        p.is_hidden = is_hidden
 
-        # --- Fallback: tag all remaining 2D trainable params as is_hidden ---
+        # --- Fallback: tag all remaining 2D trainable params ---
         # Covers Full diff, LoHa hada_*, LoKr lokr_*, GLoRA a/b, Norm weight,
         # IA3, TLoRA, TSM, OrthoLoRA S_p/S_q/P/Q/lambda, etc.
         # Skip params already tagged as OFT / LoRA-A / LoRA-B above.
@@ -629,7 +652,7 @@ class LycorisBaseModule(ModuleCustomSD):
                 continue
             if getattr(p, '_is_lora_A', False) or getattr(p, '_is_lora_B', False):
                 continue
-            p.is_hidden = True
+            p.is_hidden = is_hidden
 
     @property
     def multiplier(self):
