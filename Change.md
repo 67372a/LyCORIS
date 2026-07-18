@@ -8,6 +8,7 @@
   * `LycorisBaseModule.tag_parameters()` detects known parameter structures via `hasattr` / `isinstance` and sets the appropriate attributes.
   * `LycorisNetwork._tag_all_parameters()` iterates all lora modules and calls `tag_parameters()`. Called from `prepare_optimizer_params()` and `prepare_grad_etc()` to ensure attributes survive device moves (`.to()` / `.cuda()`).
   * LoHa / LoKr / GLoRA factors are **not** tagged as `_is_lora_A` / `_is_lora_B` because they use different factorization geometry.
+  * `is_hidden` is determined via an `original_name` heuristic: the module's path into the root model is checked against known non-hidden top-level component prefixes (`time_embedding`, `conv_in`, `conv_out`, `img_in`, `txt_in`, `final_layer`, `x_embedder`, `pos_embedder`, `patch_embed`, `context_embedder`, etc.). Modules targeting these prefixes are marked `is_hidden=False`; all others (transformer/resnet block internals) are `is_hidden=True`. Covers all 7 architectures (SD1/SDXL UNet, Flux, SD3, Anima, Lumina, Hunyuan Image, Chroma).
 
 ## 2026/05/16 (dev branch)
 
