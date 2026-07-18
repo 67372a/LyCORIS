@@ -1442,6 +1442,9 @@ class LycorisNetworkKohya(LycorisNetwork):
         found_te_ids = set()
 
         self.requires_grad_(True) # Ensure grads are enabled
+        # (Re)apply optimizer-relevant parameter attributes after any device
+        # moves, so Advanced_Optimizers can identify each parameter's role.
+        self._tag_all_parameters()
 
         # Temporary storage: key=(component_type, component_index, is_ortho_target)
         # component_type = 'unet' or 'te'
@@ -1614,6 +1617,7 @@ class LycorisNetworkKohya(LycorisNetwork):
 
     def prepare_grad_etc(self, *args):
         self.requires_grad_(True)
+        self._tag_all_parameters()
 
     def on_epoch_start(self, *args):
         self.train()

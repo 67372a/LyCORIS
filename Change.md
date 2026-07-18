@@ -1,5 +1,14 @@
 # Change Log
 
+## 2026/07/18 (dev branch)
+
+#### Improvements
+
+* **Optimizer parameter attribute tagging**: LyCORIS modules now set optimizer-relevant attributes (`_is_dora_scale`, `_is_oft`, `_is_lora_A`, `_is_lora_B`, `is_hidden`, `is_vector`) on their `nn.Parameter` objects during `prepare_optimizer_params()` / `prepare_grad_etc()`. This allows Advanced_Optimizers (and compatible optimizers) to accurately identify each parameter's role (DoRA scale, OFT block, LoRA A/B factor, hidden weight, or logical vector) and apply correct spectral normalization, weight decay, and Kourkoutas-β bucketing.
+  * `LycorisBaseModule.tag_parameters()` detects known parameter structures via `hasattr` / `isinstance` and sets the appropriate attributes.
+  * `LycorisNetwork._tag_all_parameters()` iterates all lora modules and calls `tag_parameters()`. Called from `prepare_optimizer_params()` and `prepare_grad_etc()` to ensure attributes survive device moves (`.to()` / `.cuda()`).
+  * LoHa / LoKr / GLoRA factors are **not** tagged as `_is_lora_A` / `_is_lora_B` because they use different factorization geometry.
+
 ## 2026/05/16 (dev branch)
 
 #### New Features

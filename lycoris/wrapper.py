@@ -1459,6 +1459,21 @@ class LycorisNetwork(torch.nn.Module):
         self.apply(make_ckpt)
         pass
 
+    def _tag_all_parameters(self):
+        """Tag every LyCORIS module's parameters with optimizer-relevant
+        attributes (``_is_dora_scale``, ``_is_oft``, ``_is_lora_A``,
+        ``_is_lora_B``, ``is_hidden``, ``is_vector``).
+
+        This must run *after* any device moves (``.to()`` / ``.cuda()``)
+        because those replace ``nn.Parameter`` objects and drop the custom
+        attributes set here. It is invoked from ``prepare_optimizer_params()``
+        and ``prepare_grad_etc()`` so the attributes are (re)applied on the
+        exact ``Parameter`` objects handed to the optimizer.
+        """
+        for lora in self.loras:
+            if hasattr(lora, "tag_parameters"):
+                lora.tag_parameters()
+
     def prepare_optimizer_params(self, lr):
         def enumerate_params(loras):
             params = []
@@ -1467,6 +1482,9 @@ class LycorisNetwork(torch.nn.Module):
             return params
 
         self.requires_grad_(True)
+        # (Re)apply optimizer-relevant parameter attributes after any device
+        # moves, so Advanced_Optimizers can identify each parameter's role.
+        self._tag_all_parameters()
         all_params = []
 
         param_data = {"params": enumerate_params(self.loras)}
@@ -1477,6 +1495,7 @@ class LycorisNetwork(torch.nn.Module):
 
     def prepare_grad_etc(self, *args):
         self.requires_grad_(True)
+        self._tag_all_parameters()
 
     def on_epoch_start(self, *args):
         self.train()

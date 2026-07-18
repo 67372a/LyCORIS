@@ -532,6 +532,105 @@ class LycorisBaseModule(ModuleCustomSD):
             self._multiplier = float(self.multiplier_buf.item())
         return result
 
+    def tag_parameters(self):
+        """Tag nn.Parameter objects with optimizer-relevant attributes.
+
+        Sets ``_is_dora_scale``, ``_is_oft``, ``_is_lora_A``, ``_is_lora_B``,
+        ``is_hidden`` and ``is_vector`` so that Advanced_Optimizers can identify
+        each parameter's role (DoRA scale, OFT block, LoRA A/B factor, generic
+        hidden weight, or logical vector).
+
+        Only attributes that can be *accurately* determined from the module's
+        parameter structure are set. Notably:
+
+        * ``is_vector`` is **not** set on simple 1D parameters (``scalar``,
+          ``lora2_nu``) because the optimizer already derives ``is_vector``
+          from ``len(p.shape) == 1 and not vector_reshape``; setting it here
+          would conflict with the ``vector_reshape`` group option.
+        * LoHa / LoKr / GLoRA multi-factor parameters are **not** tagged as
+          ``_is_lora_A`` / ``_is_lora_B`` because they do not follow the
+          sequential ``B @ A`` LoRA geometry that the optimizer's spectral
+          ``target_scale`` assumes. They receive ``is_hidden=True`` only.
+
+        .. note::
+            Must be called **after** any device moves (``.to()`` / ``.cuda()``)
+            since those replace ``nn.Parameter`` objects via ``_apply`` and
+            drop custom tensor attributes. The network calls this from
+            ``prepare_optimizer_params()`` / ``prepare_grad_etc()``.
+        """
+        # --- OFT blocks (DiagOFT / BOFT) ---
+        oft_blocks = getattr(self, 'oft_blocks', None)
+        if isinstance(oft_blocks, nn.Parameter):
+            oft_blocks._is_oft = True
+
+        # --- DoRA magnitude scale ---
+        dora_scale = getattr(self, 'dora_scale', None)
+        if isinstance(dora_scale, nn.Parameter):
+            dora_scale._is_dora_scale = True
+            dora_scale.is_vector = True
+
+        # --- OFT per-channel rescale (multi-dim vector) ---
+        rescale = getattr(self, 'rescale', None)
+        if isinstance(rescale, nn.Parameter):
+            rescale.is_vector = True
+
+        # --- Standard / ABBA LoRA down(up) sub-modules ---
+        # lora_down -> A, lora_up -> B (and the ABBA 1/2 variants)
+        _lora_factor_attrs = (
+            ('lora_down', '_is_lora_A'),
+            ('lora_up', '_is_lora_B'),
+            ('lora_down1', '_is_lora_A'),
+            ('lora_up1', '_is_lora_B'),
+            ('lora_down2', '_is_lora_A'),
+            ('lora_up2', '_is_lora_B'),
+        )
+        for attr, tag in _lora_factor_attrs:
+            sub = getattr(self, attr, None)
+            if isinstance(sub, nn.Module) and hasattr(sub, 'weight'):
+                w = sub.weight
+                if isinstance(w, nn.Parameter):
+                    setattr(w, tag, True)
+                    w.is_hidden = True
+
+        # --- DyLora ModuleList factors ---
+        for list_attr, tag in (
+            ('down_list', '_is_lora_A'),
+            ('up_list', '_is_lora_B'),
+        ):
+            lst = getattr(self, list_attr, None)
+            if isinstance(lst, nn.ModuleList):
+                for mod in lst:
+                    if hasattr(mod, 'weight') and isinstance(mod.weight, nn.Parameter):
+                        setattr(mod.weight, tag, True)
+                        mod.weight.is_hidden = True
+
+        # --- Block-split mini LoRA factors (lists / ParameterList of raw tensors) ---
+        for list_attr, tag in (
+            ('_mini_lora_A', '_is_lora_A'),
+            ('_mini_lora_B', '_is_lora_B'),
+        ):
+            lst = getattr(self, list_attr, None)
+            if isinstance(lst, (list, nn.ParameterList)):
+                for p in lst:
+                    if isinstance(p, nn.Parameter):
+                        setattr(p, tag, True)
+                        p.is_hidden = True
+
+        # --- Fallback: tag all remaining 2D trainable params as is_hidden ---
+        # Covers Full diff, LoHa hada_*, LoKr lokr_*, GLoRA a/b, Norm weight,
+        # IA3, TLoRA, TSM, OrthoLoRA S_p/S_q/P/Q/lambda, etc.
+        # Skip params already tagged as OFT / LoRA-A / LoRA-B above.
+        for p in self.parameters(recurse=False):
+            if not isinstance(p, nn.Parameter):
+                continue
+            if p.ndim < 2:
+                continue
+            if getattr(p, '_is_oft', False):
+                continue
+            if getattr(p, '_is_lora_A', False) or getattr(p, '_is_lora_B', False):
+                continue
+            p.is_hidden = True
+
     @property
     def multiplier(self):
         return self._multiplier
