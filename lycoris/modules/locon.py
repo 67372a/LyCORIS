@@ -242,13 +242,13 @@ class LoConModule(LycorisBaseModule):
         else:
             torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
 
-        if self.use_orthogonal_init:
-            torch.nn.init.orthogonal_(self.lora_up.weight)
-        else:
-            if use_scalar:
-                torch.nn.init.kaiming_uniform_(self.lora_up.weight, a=math.sqrt(5))
+        if use_scalar:
+            if self.use_orthogonal_init:
+                torch.nn.init.orthogonal_(self.lora_up.weight)
             else:
-                torch.nn.init.constant_(self.lora_up.weight, 0)
+                torch.nn.init.kaiming_uniform_(self.lora_up.weight, a=math.sqrt(5))
+        else:
+            torch.nn.init.constant_(self.lora_up.weight, 0)
 
         if self.tucker:
             if self.use_orthogonal_init:

@@ -161,12 +161,13 @@ class GLoRAModule(LycorisBaseModule):
             torch.nn.init.kaiming_uniform_(self.a1.weight, a=math.sqrt(5))
             torch.nn.init.kaiming_uniform_(self.b1.weight, a=math.sqrt(5))
 
-        if self.use_orthogonal_init:
-            torch.nn.init.orthogonal_(self.a2.weight)
-            torch.nn.init.orthogonal_(self.b2.weight)
-        elif use_scalar:
-            torch.nn.init.kaiming_uniform_(self.a2.weight, a=math.sqrt(5))
-            torch.nn.init.kaiming_uniform_(self.b2.weight, a=math.sqrt(5))
+        if use_scalar:
+            if self.use_orthogonal_init:
+                torch.nn.init.orthogonal_(self.a2.weight)
+                torch.nn.init.orthogonal_(self.b2.weight)
+            else:
+                torch.nn.init.kaiming_uniform_(self.a2.weight, a=math.sqrt(5))
+                torch.nn.init.kaiming_uniform_(self.b2.weight, a=math.sqrt(5))
         else:
             torch.nn.init.zeros_(self.a2.weight)
             torch.nn.init.zeros_(self.b2.weight)

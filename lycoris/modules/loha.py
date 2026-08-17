@@ -181,7 +181,10 @@ class LohaModule(LycorisBaseModule):
             torch.nn.init.orthogonal_(self.hada_w1_b)
             torch.nn.init.orthogonal_(self.hada_w1_a)
             torch.nn.init.orthogonal_(self.hada_w2_b)
-            torch.nn.init.orthogonal_(self.hada_w2_a)
+            if use_scalar:
+                torch.nn.init.orthogonal_(self.hada_w2_a)
+            else:
+                torch.nn.init.constant_(self.hada_w2_a, 0)
         else:
             if self.tucker:
                 torch.nn.init.normal_(self.hada_t1, std=0.1)
