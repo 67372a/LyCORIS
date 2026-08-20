@@ -348,5 +348,174 @@ class TestIsHiddenHeuristic:
         assert getattr(mod.lora_down.weight, "is_hidden", True) is False
 
 
+# ---------------------------------------------------------------------------
+# 10. is_norm, is_scalar, is_bias, and weight_decay_ratio tags
+# ---------------------------------------------------------------------------
+
+class TestNormScalarBiasAndWeightDecayTags:
+    def test_norm_module_tagged(self):
+        """NormModule w_norm and b_norm should have is_norm=True, weight_decay_ratio=0.0."""
+        from lycoris.modules.norms import NormModule
+
+        ln = nn.LayerNorm(32).to(DEVICE)
+        mod = NormModule("test_norm", ln, multiplier=1.0).to(DEVICE)
+        mod.tag_parameters()
+
+        assert getattr(mod.w_norm, "is_norm", False) is True
+        assert getattr(mod.w_norm, "is_bias", True) is False
+        assert getattr(mod.w_norm, "weight_decay_ratio", None) == 0.0
+
+        assert getattr(mod.b_norm, "is_norm", False) is True
+        assert getattr(mod.b_norm, "is_bias", False) is True
+        assert getattr(mod.b_norm, "weight_decay_ratio", None) == 0.0
+
+    def test_adaln_modulation_tagged_as_norm(self):
+        """Modules targeting AdaLN / modulation projections should have is_norm=True and weight_decay_ratio=0.0."""
+        net = _make_kohya_network(algo="locon")
+        _prepare_optimizer_params(net)
+        mod = _first_module_of_type(net, "LoConModule")
+        assert mod is not None
+
+        # Simulate AdaLN modulation layer in DiT
+        mod.original_name = "blocks.0.adaLN_modulation.1"
+        mod.tag_parameters()
+
+        assert getattr(mod.lora_down.weight, "is_norm", False) is True
+        assert getattr(mod.lora_up.weight, "is_norm", False) is True
+        assert getattr(mod.lora_down.weight, "weight_decay_ratio", None) == 0.0
+        assert getattr(mod.lora_up.weight, "weight_decay_ratio", None) == 0.0
+
+    def test_scalar_tagged(self):
+        """Scalar parameters (like use_scalar or lora2_nu) should have is_scalar=True, weight_decay_ratio=0.0."""
+        from lycoris.modules.locon import LoConModule
+
+        linear = nn.Linear(64, 32, bias=False).to(DEVICE)
+        mod = LoConModule("test_scalar", linear, lora_dim=4, alpha=4, use_scalar=True).to(DEVICE)
+        mod.tag_parameters()
+
+        assert isinstance(mod.scalar, nn.Parameter)
+        assert getattr(mod.scalar, "is_scalar", False) is True
+        assert getattr(mod.scalar, "is_bias", True) is False
+        assert getattr(mod.scalar, "weight_decay_ratio", None) == 0.0
+
+        # LoRA A and B should have is_scalar=False and weight_decay_ratio=1.0
+        assert getattr(mod.lora_down.weight, "is_scalar", True) is False
+        assert getattr(mod.lora_down.weight, "weight_decay_ratio", None) == 1.0
+        assert getattr(mod.lora_up.weight, "is_scalar", True) is False
+        assert getattr(mod.lora_up.weight, "weight_decay_ratio", None) == 1.0
+
+    def test_full_diff_bias_tagged(self):
+        """FullModule bias parameter should have is_bias=True, weight_decay_ratio=0.0."""
+        from lycoris.modules.full import FullModule
+
+        linear_with_bias = nn.Linear(64, 32, bias=True).to(DEVICE)
+        mod = FullModule("test_full", linear_with_bias, multiplier=1.0).to(DEVICE)
+        mod.tag_parameters()
+
+        assert isinstance(mod.bias, nn.Parameter)
+        assert getattr(mod.bias, "is_bias", False) is True
+        assert getattr(mod.bias, "weight_decay_ratio", None) == 0.0
+
+        assert isinstance(mod.weight, nn.Parameter)
+        assert getattr(mod.weight, "is_bias", True) is False
+        assert getattr(mod.weight, "weight_decay_ratio", None) == 1.0
+
+    def test_dora_scale_weight_decay_ratio(self):
+        """DoRA scale vector should have weight_decay_ratio=0.0."""
+        net = _make_kohya_network(algo="locon", weight_decompose=True)
+        _prepare_optimizer_params(net)
+        mod = _first_module_of_type(net, "LoConModule")
+        assert mod is not None
+
+        assert getattr(mod.dora_scale, "weight_decay_ratio", None) == 0.0
+        assert getattr(mod.lora_down.weight, "weight_decay_ratio", None) == 1.0
+        assert getattr(mod.lora_up.weight, "weight_decay_ratio", None) == 1.0
+
+    def test_custom_weight_decay_ratio_override(self):
+        """Custom weight_decay_ratio on module or parameter should override default."""
+        net = _make_kohya_network(algo="locon")
+        _prepare_optimizer_params(net)
+        mod = _first_module_of_type(net, "LoConModule")
+        assert mod is not None
+
+        # Module-level override
+        mod.weight_decay_ratio = 0.5
+        mod.tag_parameters()
+        assert getattr(mod.lora_down.weight, "weight_decay_ratio", None) == 0.5
+        assert getattr(mod.lora_up.weight, "weight_decay_ratio", None) == 0.5
+
+        # Parameter-level override
+        mod.lora_down.weight.custom_weight_decay_ratio = 0.25
+        mod.tag_parameters()
+        assert getattr(mod.lora_down.weight, "weight_decay_ratio", None) == 0.25
+
+
+# ---------------------------------------------------------------------------
+# 11. Test tag_lora_module_params from network_base.py
+# ---------------------------------------------------------------------------
+
+class TestNetworkBaseTagLoraModuleParams:
+    def _get_tag_fn(self):
+        import importlib.util
+        import sys
+        from pathlib import Path
+        sd_scripts_dir = Path(__file__).parent.parent.parent / "LoRA_Easy_Training_Scripts" / "backend" / "sd_scripts"
+        path = sd_scripts_dir / "networks" / "network_base.py"
+        if not path.exists():
+            pytest.skip("network_base.py not found at expected path")
+        if str(sd_scripts_dir) not in sys.path:
+            sys.path.insert(0, str(sd_scripts_dir))
+        spec = importlib.util.spec_from_file_location("network_base", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.tag_lora_module_params
+
+    def test_network_base_tagging_lora(self):
+        tag_lora_module_params = self._get_tag_fn()
+
+        class MockLoRA(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lora_down = nn.Linear(64, 4, bias=False)
+                self.lora_up = nn.Linear(4, 32, bias=False)
+                self.dora_scale = nn.Parameter(torch.ones(32))
+                self.original_name = "blocks.0.attn1.to_q"
+
+        mod = MockLoRA().to(DEVICE)
+        tag_lora_module_params(mod)
+
+        assert getattr(mod.lora_down.weight, "_is_lora_A", False) is True
+        assert getattr(mod.lora_down.weight, "is_hidden", False) is True
+        assert getattr(mod.lora_down.weight, "is_norm", True) is False
+        assert getattr(mod.lora_down.weight, "is_scalar", True) is False
+        assert getattr(mod.lora_down.weight, "is_bias", True) is False
+        assert getattr(mod.lora_down.weight, "weight_decay_ratio", None) == 1.0
+
+        assert getattr(mod.lora_up.weight, "_is_lora_B", False) is True
+        assert getattr(mod.lora_up.weight, "weight_decay_ratio", None) == 1.0
+
+        assert getattr(mod.dora_scale, "_is_dora_scale", False) is True
+        assert getattr(mod.dora_scale, "is_vector", False) is True
+        assert getattr(mod.dora_scale, "weight_decay_ratio", None) == 0.0
+
+    def test_network_base_tagging_adaln_norm(self):
+        tag_lora_module_params = self._get_tag_fn()
+
+        class MockAdaLN(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lora_down = nn.Linear(64, 4, bias=False)
+                self.lora_up = nn.Linear(4, 32, bias=False)
+                self.original_name = "blocks.0.adaLN_modulation.1"
+
+        mod = MockAdaLN().to(DEVICE)
+        tag_lora_module_params(mod)
+
+        assert getattr(mod.lora_down.weight, "is_norm", False) is True
+        assert getattr(mod.lora_up.weight, "is_norm", False) is True
+        assert getattr(mod.lora_down.weight, "weight_decay_ratio", None) == 0.0
+        assert getattr(mod.lora_up.weight, "weight_decay_ratio", None) == 0.0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

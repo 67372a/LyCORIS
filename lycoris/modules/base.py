@@ -1,4 +1,5 @@
 from collections import OrderedDict
+import re
 
 import torch
 import torch.nn as nn
@@ -545,29 +546,73 @@ class LycorisBaseModule(ModuleCustomSD):
         'x_embedder', 'pos_embedder', 'patch_embed', 'context_embedder',
     )
 
+    # Patterns matching normalization & AdaLN / modulation components across
+    # DiT, Flux, SD3, PixArt, Lumina, Anima, and other transformer models.
+    _ADALN_NAME_PATTERN = re.compile(
+        r'(?:ada_?ln|modulation|norm\d*_linear|norm\d*_context_linear|norm_linear|_modulation)',
+        re.IGNORECASE
+    )
+
+    def _is_norm_module(self) -> bool:
+        """Determine if this module targets a normalization layer or AdaLN modulation."""
+        if self.module_type in ("layernorm", "groupnorm"):
+            return True
+
+        if self.__class__.__name__ == "NormModule":
+            return True
+
+        mod_cls = getattr(self, "module", None)
+        if mod_cls is not None:
+            mod_cls_name = getattr(mod_cls, "__name__", "")
+            if any(norm_term in mod_cls_name.lower() for norm_term in ("norm", "rmsnorm", "layernorm", "groupnorm")):
+                return True
+
+        if len(self.org_module) > 0 and self.org_module[0] is not None:
+            org = self.org_module[0]
+            org_cls_name = org.__class__.__name__.lower()
+            if any(norm_term in org_cls_name for norm_term in ("norm", "rmsnorm", "layernorm", "groupnorm")):
+                return True
+
+        original_name = getattr(self, "original_name", "") or ""
+        if self._ADALN_NAME_PATTERN.search(original_name):
+            return True
+
+        lora_name = getattr(self, "lora_name", "") or ""
+        if self._ADALN_NAME_PATTERN.search(lora_name):
+            return True
+
+        return False
+
     def tag_parameters(self):
         """Tag nn.Parameter objects with optimizer-relevant attributes.
 
         Sets ``_is_dora_scale``, ``_is_oft``, ``_is_lora_A``, ``_is_lora_B``,
-        ``is_hidden`` and ``is_vector`` so that Advanced_Optimizers can identify
-        each parameter's role (DoRA scale, OFT block, LoRA A/B factor, generic
-        hidden weight, or logical vector).
+        ``is_hidden``, ``is_vector``, ``is_norm``, ``is_scalar``, ``is_bias``,
+        and ``weight_decay_ratio`` so that Advanced_Optimizers and parameter
+        group builders can identify each parameter's role and apply appropriate
+        learning rates, weight decays, and algorithmic adjustments.
 
         ``is_hidden`` is determined by checking ``original_name`` (the dotted
         path into the root model) against a set of known non-hidden prefixes
         (embeddings, input/output projections, timestep conditioning layers).
 
-        Only attributes that can be *accurately* determined from the module's
-        parameter structure are set. Notably:
+        ``is_norm`` is tagged for normalization layers (LayerNorm, RMSNorm,
+        GroupNorm, NormModule) and AdaLN / modulation projections.
 
-        * ``is_vector`` is **not** set on simple 1D parameters (``scalar``,
-          ``lora2_nu``) because the optimizer already derives ``is_vector``
-          from ``len(p.shape) == 1 and not vector_reshape``; setting it here
-          would conflict with the ``vector_reshape`` group option.
-        * LoHa / LoKr / GLoRA multi-factor parameters are **not** tagged as
-          ``_is_lora_A`` / ``_is_lora_B`` because they do not follow the
-          sequential ``B @ A`` LoRA geometry that the optimizer's spectral
-          ``target_scale`` assumes.
+        ``is_scalar`` is tagged for single-scalar parameters (e.g. ``scalar``,
+        ``lora2_nu``, or single-element tensors).
+
+        ``is_bias`` is tagged for additive bias terms (e.g. ``bias``, ``b_norm``,
+        ``diff_b``).
+
+        ``weight_decay_ratio`` indicates the multiplier relative to the base
+        optimizer's configured weight decay:
+        * ``0.0``: No weight decay (biases, normalization weights, scalars,
+          DoRA scales, 1D vectors).
+        * ``1.0``: Full weight decay (2D+ adapter weight matrices, OFT blocks,
+          full diff weights).
+        * Custom float: Any pre-existing ``weight_decay_ratio`` set on the
+          parameter or module is respected.
 
         .. note::
             Must be called **after** any device moves (``.to()`` / ``.cuda()``)
@@ -580,6 +625,7 @@ class LycorisBaseModule(ModuleCustomSD):
         original_name = getattr(self, 'original_name', None) or ''
         is_hidden = not any(original_name.startswith(pfx)
                            for pfx in self._NON_HIDDEN_NAME_PREFIXES)
+        is_norm = self._is_norm_module()
 
         # --- OFT blocks (DiagOFT / BOFT) ---
         oft_blocks = getattr(self, 'oft_blocks', None)
@@ -639,20 +685,60 @@ class LycorisBaseModule(ModuleCustomSD):
                         setattr(p, tag, True)
                         p.is_hidden = is_hidden
 
-        # --- Fallback: tag all remaining 2D trainable params ---
-        # Covers Full diff, LoHa hada_*, LoKr lokr_*, GLoRA a/b, Norm weight,
-        # IA3, TLoRA, TSM, OrthoLoRA S_p/S_q/P/Q/lambda, etc.
-        # Skip params already tagged as OFT / LoRA-A / LoRA-B above.
-        for p in self.parameters(recurse=False):
+        # --- Tag all trainable parameters with is_norm, is_scalar, is_bias, and weight_decay_ratio ---
+        for name, p in self.named_parameters():
             if not isinstance(p, nn.Parameter):
                 continue
-            if p.ndim < 2:
-                continue
-            if getattr(p, '_is_oft', False):
-                continue
-            if getattr(p, '_is_lora_A', False) or getattr(p, '_is_lora_B', False):
-                continue
-            p.is_hidden = is_hidden
+
+            # 1. Bias Tagging
+            p_is_bias = (
+                name.endswith('bias')
+                or name.endswith('b_norm')
+                or name.endswith('diff_b')
+                or getattr(p, '_is_bias', False)
+                or getattr(p, 'is_bias', False)
+            )
+            p.is_bias = p_is_bias
+
+            # 2. Scalar Tagging
+            p_is_scalar = (
+                p.numel() == 1
+                or name.endswith('scalar')
+                or name.endswith('lora2_nu')
+                or getattr(p, '_is_scalar', False)
+                or getattr(p, 'is_scalar', False)
+            )
+            p.is_scalar = p_is_scalar
+
+            # 3. Norm Tagging
+            p_is_norm = is_norm or name.endswith('w_norm') or name.endswith('b_norm') or getattr(p, 'is_norm', False)
+            p.is_norm = p_is_norm
+
+            # 4. Hidden Layer Fallback for 2D+ trainable params
+            if (
+                p.ndim >= 2
+                and not getattr(p, '_is_oft', False)
+                and not getattr(p, '_is_lora_A', False)
+                and not getattr(p, '_is_lora_B', False)
+            ):
+                p.is_hidden = is_hidden
+
+            # 5. Weight Decay Ratio Assignment
+            if p_is_bias or p_is_norm or p_is_scalar or getattr(p, '_is_dora_scale', False) or getattr(p, 'is_vector', False) or p.ndim <= 1:
+                default_wd_ratio = 0.0
+            else:
+                default_wd_ratio = 1.0
+
+            custom_wd_ratio = getattr(p, '_custom_weight_decay_ratio', None)
+            if custom_wd_ratio is None:
+                custom_wd_ratio = getattr(p, 'custom_weight_decay_ratio', None)
+            if custom_wd_ratio is None:
+                custom_wd_ratio = getattr(self, 'weight_decay_ratio', None)
+
+            if custom_wd_ratio is not None:
+                p.weight_decay_ratio = float(custom_wd_ratio)
+            else:
+                p.weight_decay_ratio = default_wd_ratio
 
     @property
     def multiplier(self):
