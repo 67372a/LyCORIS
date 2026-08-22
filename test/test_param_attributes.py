@@ -517,5 +517,166 @@ class TestNetworkBaseTagLoraModuleParams:
         assert getattr(mod.lora_up.weight, "weight_decay_ratio", None) == 0.0
 
 
+# ---------------------------------------------------------------------------
+# 12. Test WarpAINO with weight_decay_ratio
+# ---------------------------------------------------------------------------
+
+class TestWarpAINOWeightDecayRatio:
+    def _get_warpaino_cls(self):
+        import importlib.util
+        from pathlib import Path
+        path = Path(__file__).parent.parent.parent / "LoRA_Easy_Training_Scripts" / "backend" / "custom_scheduler" / "LoraEasyCustomOptimizer" / "warpaino.py"
+        if not path.exists():
+            pytest.skip("warpaino.py not found at expected path")
+        spec = importlib.util.spec_from_file_location("warpaino", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.WarpAINO
+
+    def test_warpaino_weight_decay_ratio_native(self):
+        WarpAINO = self._get_warpaino_cls()
+
+        # Create three identical 2D parameters on CUDA
+        p_full = nn.Parameter(torch.ones(16, 16, device=DEVICE) * 2.0)
+        p_zero = nn.Parameter(torch.ones(16, 16, device=DEVICE) * 2.0)
+        p_half = nn.Parameter(torch.ones(16, 16, device=DEVICE) * 2.0)
+
+        p_full.weight_decay_ratio = 1.0
+        p_zero.weight_decay_ratio = 0.0
+        p_half.weight_decay_ratio = 0.5
+
+        # Provide zero gradients so only weight decay drives parameter changes
+        p_full.grad = torch.zeros_like(p_full)
+        p_zero.grad = torch.zeros_like(p_zero)
+        p_half.grad = torch.zeros_like(p_half)
+
+        opt = WarpAINO(
+            [p_full, p_zero, p_half],
+            lr=0.01,
+            weight_decay=0.1,
+            cautious_wd=False,
+            foreach=False,
+        )
+
+        opt.step()
+
+        # p_zero should not have decayed (stayed at 2.0)
+        assert torch.allclose(p_zero.data, torch.ones(16, 16, device=DEVICE) * 2.0)
+
+        # p_full should have decayed: p - lr * wd * p = 2.0 - 0.01 * 0.1 * 2.0 = 1.998
+        decay_full = 2.0 - p_full.data.mean().item()
+        decay_half = 2.0 - p_half.data.mean().item()
+
+        assert decay_full > 0.001
+        assert abs(decay_half - decay_full * 0.5) < 1e-4
+
+    def test_warpaino_weight_decay_ratio_foreach(self):
+        WarpAINO = self._get_warpaino_cls()
+
+        p_full = nn.Parameter(torch.ones(16, 16, device=DEVICE) * 2.0)
+        p_zero = nn.Parameter(torch.ones(16, 16, device=DEVICE) * 2.0)
+        p_zero_1d = nn.Parameter(torch.ones(16, device=DEVICE) * 2.0)
+
+        p_full.weight_decay_ratio = 1.0
+        p_zero.weight_decay_ratio = 0.0
+        p_zero_1d.weight_decay_ratio = 0.0
+
+        p_full.grad = torch.zeros_like(p_full)
+        p_zero.grad = torch.zeros_like(p_zero)
+        p_zero_1d.grad = torch.zeros_like(p_zero_1d)
+
+        opt = WarpAINO(
+            [p_full, p_zero, p_zero_1d],
+            lr=0.01,
+            weight_decay=0.1,
+            cautious_wd=False,
+            foreach=True,
+        )
+
+        opt.step()
+
+        assert torch.allclose(p_zero.data, torch.ones(16, 16, device=DEVICE) * 2.0)
+        assert torch.allclose(p_zero_1d.data, torch.ones(16, device=DEVICE) * 2.0)
+        assert p_full.data.mean().item() < 2.0
+
+    def test_warpaino_skips_warp_on_1d_and_scalars(self):
+        WarpAINO = self._get_warpaino_cls()
+
+        p_bias = nn.Parameter(torch.ones(16, device=DEVICE))
+        p_bias.is_bias = True
+        p_bias.grad = torch.randn_like(p_bias)
+
+        p_scalar = nn.Parameter(torch.tensor(1.0, device=DEVICE))
+        p_scalar.is_scalar = True
+        p_scalar.grad = torch.randn_like(p_scalar)
+
+        p_2d = nn.Parameter(torch.ones(16, 16, device=DEVICE))
+        p_2d.grad = torch.randn_like(p_2d)
+
+        opt = WarpAINO([p_bias, p_scalar, p_2d], lr=0.01, warp_mode="dense")
+        opt.step()
+
+        # Warp matrix should not be allocated for 1D bias or scalar
+        assert "warp" not in opt.state[p_bias]
+        assert "warp" not in opt.state[p_scalar]
+        # Warp matrix should be allocated for 2D matrix
+        assert "warp" in opt.state[p_2d]
+
+    def test_warpaino_unilateral_spectral_on_non_hidden(self):
+        WarpAINO = self._get_warpaino_cls()
+
+        p_hidden = nn.Parameter(torch.ones(32, 16, device=DEVICE))
+        p_hidden.is_hidden = True
+        p_hidden.grad = torch.randn_like(p_hidden)
+
+        p_non_hidden = nn.Parameter(torch.ones(32, 16, device=DEVICE))
+        p_non_hidden.is_hidden = False
+        p_non_hidden.grad = torch.randn_like(p_non_hidden)
+
+        opt = WarpAINO(
+            [p_hidden, p_non_hidden],
+            lr=0.01,
+            warp_mode="spectral",
+            spectral_bilateral=True,
+        )
+        opt.step()
+
+        # Hidden layer should have bilateral spectral warp (left and right)
+        assert "spectral_log_left" in opt.state[p_hidden]
+        assert "spectral_log_right" in opt.state[p_hidden]
+
+        # Non-hidden layer (e.g. embeddings / output heads) should only have unilateral left warp
+        assert "spectral_log_left" in opt.state[p_non_hidden]
+        assert "spectral_log_right" not in opt.state[p_non_hidden]
+
+
+# ---------------------------------------------------------------------------
+# 13. Test Advanced_Optimizers adjust_wds with weight_decay_ratio
+# ---------------------------------------------------------------------------
+
+class TestAdjustWDsWeightDecayRatio:
+    def test_adjust_wds_ratio(self):
+        import importlib.util
+        import sys
+        from pathlib import Path
+        adv_optm_root = Path(__file__).parent.parent.parent / "Advanced_Optimizers"
+        if not adv_optm_root.exists():
+            pytest.skip("Advanced_Optimizers not found at expected path")
+        if str(adv_optm_root) not in sys.path:
+            sys.path.insert(0, str(adv_optm_root))
+        from adv_optm.util.scaled_optm import adjust_wds
+
+        p = nn.Parameter(torch.ones(16, 16, device=DEVICE))
+        p.weight_decay_ratio = 0.5
+
+        wd, cwd = adjust_wds(0.1, 0.05, p)
+        assert abs(wd - 0.05) < 1e-6
+        assert abs(cwd - 0.05) < 1e-6
+
+        p.weight_decay_ratio = 0.0
+        wd0, cwd0 = adjust_wds(0.1, 0.05, p)
+        assert abs(wd0 - 0.0) < 1e-6
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
