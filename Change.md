@@ -1,5 +1,17 @@
 # Change Log
 
+## 2026/08/23 (dev branch)
+
+#### Bug fixes
+
+* Harden LoKr reconstruction across rebuild, bypass, merge, parametrization, and state-dict loading.
+  * Apply alpha/rank scaling and scalar baking exactly once.
+  * Fix low-rank Conv1d/Conv2d/Conv3d bypass factor views and 1×1 projection parameters.
+  * Repair kernel-aware SVD segment initialization, including scalar and unbalanced factorization modes.
+  * Preserve mixed decomposition and unbalanced-factorization metadata during checkpoint round trips.
+  * Enforce the documented DoRA/bypass incompatibility and align rank-dropout behavior.
+  * Add CUDA regression coverage for numerical parity, convolution bypass, SVD initialization, and serialization.
+
 ## 2026/07/18 (dev branch)
 
 #### Improvements

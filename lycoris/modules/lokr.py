@@ -41,6 +41,11 @@ class LokrModule(LycorisBaseModule):
         "lokr_t2",
         "alpha",
         "dora_scale",
+        # These are optional compatibility metadata.  They are emitted only
+        # for configurations whose orientation cannot be recovered from the
+        # factor shapes (currently unbalanced factorization).
+        "lokr_factor",
+        "lokr_unbalanced",
     ]
     weight_list_det = ["lokr_w1", "lokr_w1_a"]
 
@@ -85,6 +90,15 @@ class LokrModule(LycorisBaseModule):
             ggpo_beta,
             ggpo_sigma
         )
+        # DoRA is a weight-space operation.  Applying it to a direct-factor
+        # bypass would omit the magnitude normalization, so keep the same
+        # invariant here as the network wrappers do.
+        if weight_decompose and self.bypass_mode:
+            self.bypass_mode = False
+            logger.info(
+                "Because weight decomposition (DoRA) is enabled, bypass mode "
+                "has been disabled"
+            )
         if self.module_type not in self.support_module:
             raise ValueError(f"{self.module_type} is not supported in LoKr algo.")
 
@@ -96,6 +110,7 @@ class LokrModule(LycorisBaseModule):
         self.use_w2 = False
         self.full_matrix = full_matrix
         self.rs_lora = rs_lora
+        self.unbalanced_factorization = bool(unbalanced_factorization)
         self.use_orthogonal_weights = orthogonalize
         if orthogonalize and not orthogonal_init:
             orthogonal_init = True
@@ -148,7 +163,7 @@ class LokrModule(LycorisBaseModule):
                 self.lokr_w2_a = nn.Parameter(torch.empty(shape[0][1], lora_dim))
                 self.lokr_w2_b = nn.Parameter(
                     torch.empty(
-                        lora_dim, shape[1][1] * torch.tensor(shape[2:]).prod().item()
+                        lora_dim, shape[1][1] * math.prod(shape[2:])
                     )
                 )
                 # w1 ⊗ (w2_a x w2_b) = (a, b)⊗((c, dim)x(dim, d*k1*k2)) = (a, b)⊗(c, d*k1*k2) = (ac, bd*k1*k2)
@@ -339,21 +354,23 @@ class LokrModule(LycorisBaseModule):
         from ..functional import factorization
         in_m, in_n = factorization(in_dim, factor)
         out_l, out_k = factorization(out_dim, factor)
+        if self.unbalanced_factorization:
+            out_l, out_k = out_k, out_l
 
-        if k:
-            # Conv: reshape M to (out_l, out_k, in_m, in_n, *k) for kron structure
-            # For conv, the Kronecker is only over channel dims
-            M_reshaped = M.reshape(out_l, out_k, in_m, in_n)
-        else:
-            M_reshaped = M.reshape(out_l, out_k, in_m, in_n)
-
-        # Kronecker-SVD: permute to (out_l, in_m, out_k, in_n) → rank-1 SVD
-        M_perm = M_reshaped.permute(0, 2, 1, 3).reshape(out_l * in_m, out_k * in_n)
+        # Keep convolution kernel elements in the second Kronecker factor.
+        # The old implementation discarded them while reshaping M, which
+        # both changed the element count and made ordinary k×k convolutions
+        # fail before the factors were initialized.
+        M_reshaped = M.reshape(out_l, out_k, in_m, in_n, *k)
+        permute_order = (0, 2, 1, 3, *range(4, 4 + len(k)))
+        M_perm = M_reshaped.permute(*permute_order).reshape(
+            out_l * in_m, out_k * in_n * (math.prod(k) if k else 1)
+        )
         U_k, S_k, Vh_k = torch.linalg.svd(M_perm.float(), full_matrices=False)
 
         sqrt_S0 = torch.sqrt(S_k[0])
         w1_init = (U_k[:, 0] * sqrt_S0).reshape(out_l, in_m)
-        w2_init = (Vh_k[0, :] * sqrt_S0).reshape(out_k, in_n)
+        w2_init = (Vh_k[0, :] * sqrt_S0).reshape(out_k, in_n, *k)
 
         # Apply to the appropriate weight parameters
         if self.use_w1:
@@ -362,42 +379,53 @@ class LokrModule(LycorisBaseModule):
             # Factor w1 into w1_a @ w1_b via SVD
             U1, S1, Vh1 = torch.linalg.svd(w1_init, full_matrices=False)
             r1 = min(self.lokr_w1_a.shape[1], len(S1))
-            self.lokr_w1_a.data.copy_((U1[:, :r1] @ torch.diag(torch.sqrt(S1[:r1]))).to(self.lokr_w1_a.dtype))
-            self.lokr_w1_b.data.copy_((torch.diag(torch.sqrt(S1[:r1])) @ Vh1[:r1, :]).to(self.lokr_w1_b.dtype))
+            self.lokr_w1_a.data.zero_()
+            self.lokr_w1_b.data.zero_()
+            self.lokr_w1_a.data[:, :r1].copy_(
+                (U1[:, :r1] @ torch.diag(torch.sqrt(S1[:r1]))).to(self.lokr_w1_a.dtype)
+            )
+            self.lokr_w1_b.data[:r1].copy_(
+                (torch.diag(torch.sqrt(S1[:r1])) @ Vh1[:r1, :]).to(self.lokr_w1_b.dtype)
+            )
 
         if self.use_w2:
-            if k:
-                w2_expanded = w2_init.reshape(out_k, in_n, 1, 1).expand(out_k, in_n, *k)
-                self.lokr_w2.data.copy_(w2_expanded.to(self.lokr_w2.dtype))
-            else:
-                self.lokr_w2.data.copy_(w2_init.to(self.lokr_w2.dtype))
+            self.lokr_w2.data.copy_(w2_init.to(self.lokr_w2.dtype))
         else:
             # Factor w2 into w2_a @ w2_b via SVD
-            U2, S2, Vh2 = torch.linalg.svd(w2_init, full_matrices=False)
+            w2_init_2d = w2_init.reshape(out_k, -1)
+            U2, S2, Vh2 = torch.linalg.svd(w2_init_2d, full_matrices=False)
             r2 = min(self.lokr_w2_a.shape[0], len(S2))
-            if k:
-                # Conv: w2_a is (r2, out_k), w2_b is (r2, in_n, *k)
-                self.lokr_w2_a.data.copy_(
-                    (U2[:, :r2] @ torch.diag(torch.sqrt(S2[:r2]))).T.to(self.lokr_w2_a.dtype)
-                )
-                w2b_2d = torch.diag(torch.sqrt(S2[:r2])) @ Vh2[:r2, :]
-                self.lokr_w2_b.data.copy_(
-                    w2b_2d.reshape(r2, in_n, 1, 1).expand(r2, in_n, *k).to(self.lokr_w2_b.dtype)
-                )
-            else:
-                self.lokr_w2_a.data.copy_(
-                    (U2[:, :r2] @ torch.diag(torch.sqrt(S2[:r2]))).to(self.lokr_w2_a.dtype)
-                )
-                self.lokr_w2_b.data.copy_(
-                    (torch.diag(torch.sqrt(S2[:r2])) @ Vh2[:r2, :]).to(self.lokr_w2_b.dtype)
-                )
+            self.lokr_w2_a.data.zero_()
+            self.lokr_w2_b.data.zero_()
+            self.lokr_w2_a.data[:r2].copy_(
+                (U2[:, :r2] @ torch.diag(torch.sqrt(S2[:r2]))).T.to(self.lokr_w2_a.dtype)
+            )
+            w2b_2d = torch.diag(torch.sqrt(S2[:r2])) @ Vh2[:r2, :]
+            self.lokr_w2_b.data[:r2].copy_(
+                w2b_2d.reshape(r2, -1).to(self.lokr_w2_b.dtype)
+            )
 
-        # Adjust org_weight with the reconstructed Kronecker product
+        # Adjust org_weight with the *actual* initialized factors.  Using
+        # w1_init/w2_init here is wrong when one of the factor matrices has
+        # insufficient rank, and also ignored the optional scalar parameter.
         from ..functional.lokr import make_kron
-        diff = make_kron(w1_init.to(M.dtype), w2_init.to(M.dtype), 1.0)
-        if k:
-            diff = diff.unsqueeze(-1).unsqueeze(-1).expand(*orig_shape)
-        self.org_module[0].weight.data -= diff.to(self.org_module[0].weight.dtype) * self.scale
+        if self.use_w1:
+            w1_actual = self.lokr_w1
+        else:
+            w1_actual = self.lokr_w1_a @ self.lokr_w1_b
+        if self.use_w2:
+            w2_actual = self.lokr_w2
+        else:
+            w2_actual = self.lokr_w2_a @ self.lokr_w2_b
+            if k:
+                w2_actual = w2_actual.view(out_k, in_n, *k)
+        diff = make_kron(w1_actual, w2_actual, 1.0).to(
+            self.org_module[0].weight.device, dtype=M.dtype
+        )
+        scalar = self.scalar.to(diff.device, dtype=diff.dtype)
+        self.org_module[0].weight.data -= (
+            diff * self.scale * scalar
+        ).to(self.org_module[0].weight.dtype)
         logger.info(f"SVD segment init ({segment}): {self.lora_name}")
 
     @classmethod
@@ -415,60 +443,69 @@ class LokrModule(LycorisBaseModule):
         t2,
         alpha,
         dora_scale,
+        lokr_factor=None,
+        lokr_unbalanced=None,
     ):
-        full_matrix = False
+        is_conv = isinstance(orig_module, (nn.Conv1d, nn.Conv2d, nn.Conv3d))
+        kernel_elements = math.prod(orig_module.kernel_size) if is_conv else 1
+
+        # Functional LoKr checkpoints may retain the convolution kernel
+        # dimensions on w2_b, while module checkpoints flatten them.  Use one
+        # canonical representation before inferring channel factors and
+        # copying into the module's 2-D parameter.
+        if is_conv and t2 is None and w2b is not None and w2b.dim() > 2:
+            w2b = w2b.reshape(w2b.size(0), -1)
+
+        # Tucker stores rank in dimension 0; the non-Tucker convolution
+        # representation stores it in w2a's last dimension.
         if w1a is not None:
             lora_dim = w1a.size(1)
+        elif t2 is not None:
+            lora_dim = t2.size(0)
         elif w2a is not None:
             lora_dim = w2a.size(1)
         else:
-            full_matrix = True
             lora_dim = 1
 
-        if w1 is None:
-            out_dim = w1a.size(0)
-            in_dim = w1b.size(1)
+        w1_shape = w1.shape if w1 is not None else (w1a.size(0), w1b.size(1))
+        if w2 is not None:
+            w2_shape = (w2.size(0), w2.size(1))
+        elif t2 is not None:
+            w2_shape = (w2a.size(1), w2b.size(1))
+        elif is_conv:
+            # w2b is (rank, in_n * kernel_elements) in the serialized
+            # non-Tucker convolution format.
+            w2_shape = (w2a.size(0), w2b.size(1) // kernel_elements)
         else:
-            out_dim, in_dim = w1.shape
+            w2_shape = (w2a.size(0), w2b.size(1))
 
-        shape_s = [out_dim, in_dim]
+        out_dim = orig_module.out_channels if is_conv else orig_module.out_features
+        in_dim = orig_module.in_channels if is_conv else orig_module.in_features
+        out_pair = (w1_shape[0], w2_shape[0])
+        in_pair = (w1_shape[1], w2_shape[1])
 
-        if w2 is None:
-            out_dim *= w2a.size(0)
-            in_dim *= w2b.size(1)
+        if lokr_factor is not None:
+            factor = int(lokr_factor.item())
         else:
-            out_dim *= w2.size(0)
-            in_dim *= w2.size(1)
+            # Recover an effective factor from the channel dimensions only.
+            # In particular, never use max(w2.shape), since conv kernel
+            # dimensions are not factorization dimensions.
+            candidates = set()
+            for dimension in (in_dim, out_dim):
+                for value in range(1, int(math.sqrt(dimension)) + 1):
+                    if dimension % value == 0:
+                        candidates.add(value)
+                        candidates.add(dimension // value)
+            factor = None
+            for candidate in sorted(candidates):
+                if factorization(in_dim, candidate) == tuple(sorted(in_pair)) and factorization(out_dim, candidate) == tuple(sorted(out_pair)):
+                    factor = candidate
+                    break
+            if factor is None:
+                factor = min(in_pair)
 
-        if (
-            shape_s[0] == factorization(out_dim, -1)[0]
-            and shape_s[1] == factorization(in_dim, -1)[0]
-        ):
-            factor = -1
-        else:
-            w1_shape = w1.shape if w1 is not None else (w1a.size(0), w1b.size(1))
-            w2_shape = w2.shape if w2 is not None else (w2a.size(0), w2b.size(1))
-            shape_group_1 = (w1_shape[0], w2_shape[0])
-            shape_group_2 = (w1_shape[1], w2_shape[1])
-            w_shape = (w1_shape[0] * w2_shape[0], w1_shape[1] * w2_shape[1])
-            factor1 = max(w1.shape) if w1 is not None else max(w1a.size(0), w1b.size(1))
-            factor2 = max(w2.shape) if w2 is not None else max(w2a.size(0), w2b.size(1))
-            if (
-                w_shape[0] % factor1 == 0
-                and w_shape[1] % factor1 == 0
-                and factor1 in shape_group_1
-                and factor1 in shape_group_2
-            ):
-                factor = factor1
-            elif (
-                w_shape[0] % factor2 == 0
-                and w_shape[1] % factor2 == 0
-                and factor2 in shape_group_1
-                and factor2 in shape_group_2
-            ):
-                factor = factor2
-            else:
-                factor = min(factor1, factor2)
+        unbalanced = bool(lokr_unbalanced.item()) if lokr_unbalanced is not None else False
+        full_matrix = w2 is not None and w1a is None
 
         module = cls(
             lora_name,
@@ -477,32 +514,47 @@ class LokrModule(LycorisBaseModule):
             lora_dim,
             float(alpha),
             use_tucker=t2 is not None,
-            decompose_both=w1 is None and w2 is None,
+            decompose_both=w1a is not None,
             factor=factor,
             weight_decompose=dora_scale is not None,
             full_matrix=full_matrix,
+            unbalanced_factorization=unbalanced,
         )
         if w1 is not None:
-            module.lokr_w1.copy_(w1)
+            module.lokr_w1.data.copy_(w1)
         else:
-            module.lokr_w1_a.copy_(w1a)
-            module.lokr_w1_b.copy_(w1b)
+            module.lokr_w1_a.data.copy_(w1a)
+            module.lokr_w1_b.data.copy_(w1b)
         if w2 is not None:
-            module.lokr_w2.copy_(w2)
+            module.lokr_w2.data.copy_(w2)
         else:
-            module.lokr_w2_a.copy_(w2a)
-            module.lokr_w2_b.copy_(w2b)
+            module.lokr_w2_a.data.copy_(w2a)
+            module.lokr_w2_b.data.copy_(w2b)
         if t2 is not None:
-            module.lokr_t2.copy_(t2)
+            module.lokr_t2.data.copy_(t2)
         if dora_scale is not None:
-            module.dora_scale.copy_(dora_scale)
+            module.dora_scale.data.copy_(dora_scale)
+        # Scalars are baked into the serialized factors, matching the normal
+        # load-state-dict hook.  Reset here as well for direct factory users.
+        if isinstance(module.scalar, nn.Parameter):
+            module.scalar.data.fill_(1)
         return module
 
     def load_weight_hook(self, module: nn.Module, incompatible_keys):
         missing_keys = incompatible_keys.missing_keys
-        for key in missing_keys:
-            if "scalar" in key:
-                del missing_keys[missing_keys.index(key)]
+        missing_keys[:] = [
+            key for key in missing_keys
+            if "scalar" not in key and "lokr_factor" not in key
+            and "lokr_unbalanced" not in key
+        ]
+        # Optional orientation metadata is consumed while constructing a
+        # module from a checkpoint and is intentionally not a live parameter
+        # or buffer.  Ignore it when loading into an already-created module.
+        incompatible_keys.unexpected_keys[:] = [
+            key for key in incompatible_keys.unexpected_keys
+            if not key.endswith("lokr_factor")
+            and not key.endswith("lokr_unbalanced")
+        ]
         if isinstance(self.scalar, nn.Parameter):
             self.scalar.data.copy_(torch.ones_like(self.scalar))
         elif getattr(self, "scalar", None) is not None:
@@ -513,6 +565,12 @@ class LokrModule(LycorisBaseModule):
             )
 
     def get_weight(self, shape):
+        """Return the scaled Kronecker update.
+
+        This method owns ``self.scale``.  Callers add only their runtime
+        multiplier, which keeps rebuild, merge, parametrization, and bypass
+        numerically consistent.
+        """
         if self.use_w1:
             w1 = self._orthogonalize(self.lokr_w1)
         else:
@@ -536,16 +594,19 @@ class LokrModule(LycorisBaseModule):
         if shape is not None:
             weight = weight.view(shape)
         if self.training and self.rank_dropout:
-            drop = (torch.rand(weight.size(0)) > self.rank_dropout).to(dtype)
+            drop = (torch.rand(weight.size(0), device=weight.device) > self.rank_dropout).to(dtype)
             drop = drop.view(-1, *[1] * len(weight.shape[1:]))
             if self.rank_dropout_scale:
-                drop /= drop.mean()
+                drop /= drop.mean().clamp_min(torch.finfo(dtype).eps)
             weight *= drop
+        if self.training and self.dropout:
+            weight = self.drop(weight)
         return weight
 
     def get_diff_weight(self, multiplier=1, shape=None, device=None):
-        scale = self.scale * multiplier
-        diff = self.get_weight(shape) * scale
+        # get_weight() already applies alpha/rank.  Do not apply self.scale a
+        # second time in merge or parametrization paths.
+        diff = self.get_weight(shape) * self.scalar * multiplier
         if device is not None:
             diff = diff.to(device)
         return diff, None
@@ -602,6 +663,13 @@ class LokrModule(LycorisBaseModule):
             destination["lokr_w2_b"] = self.lokr_w2_b
             if self.tucker:
                 destination["lokr_t2"] = self.lokr_t2
+        if self.unbalanced_factorization:
+            destination["lokr_factor"] = torch.tensor(
+                self.lokr_factor, dtype=torch.int64, device=self.alpha.device
+            )
+            destination["lokr_unbalanced"] = torch.tensor(
+                1, dtype=torch.int64, device=self.alpha.device
+            )
         return destination
 
     @torch.no_grad()
@@ -648,9 +716,23 @@ class LokrModule(LycorisBaseModule):
             if self.tucker:
                 t = self.lokr_t2
                 a = a.view(*a.shape, *[1] * (len(t.shape) - 2))
+                # w2_a is stored as (rank, out_factor), but convolution
+                # weights use (out_channels, in_channels, ...).
+                b = b.transpose(0, 1).contiguous()
                 b = b.view(*b.shape, *[1] * (len(t.shape) - 2))
             elif is_conv:
-                a = a.view(*a.shape, *self.shape[2:])
+                # Non-Tucker convolution w2_b is serialized as a flattened
+                # (rank, in_factor * kernel_elements) matrix.
+                kernel_elements = math.prod(self.shape[2:])
+                if a.shape[1] % kernel_elements != 0:
+                    raise RuntimeError(
+                        "Invalid LoKr convolution factor shape: flattened input "
+                        f"elements ({a.shape[1]}) are not divisible by kernel "
+                        f"size ({kernel_elements})"
+                    )
+                a = a.view(
+                    a.shape[0], a.shape[1] // kernel_elements, *self.shape[2:]
+                )
                 b = b.view(*b.shape, *[1] * (len(self.shape) - 2))
 
         if self.use_w1:
@@ -663,8 +745,8 @@ class LokrModule(LycorisBaseModule):
 
         if is_conv:
             # (b, uq), vq, ...
-            b, _, *rest = h.shape
-            h_in_group = h.reshape(b * uq, -1, *rest)
+            batch_size, _, *rest = h.shape
+            h_in_group = h.reshape(batch_size * uq, -1, *rest)
         else:
             # b, ..., uq, vq
             h_in_group = h.reshape(*h.shape[:-1], uq, -1)
@@ -674,12 +756,12 @@ class LokrModule(LycorisBaseModule):
         else:
             if is_conv:
                 if self.tucker:
-                    ha = self._call_op(h_in_group, a)
+                    ha = self._call_op_1x1(h_in_group, a)
                     ht = self._call_op(ha, t)
-                    hb = self._call_op(ht, b)
+                    hb = self._call_op_1x1(ht, b)
                 else:
                     ha = self._call_op(h_in_group, a)
-                    hb = self._call_op(ha, b)
+                    hb = self._call_op_1x1(ha, b)
             else:
                 ha = self._call_op(h_in_group, a)
                 hb = self._call_op(ha, b)
@@ -688,7 +770,7 @@ class LokrModule(LycorisBaseModule):
             # (b, uq), vp, ..., f
             # -> b, uq, vp, ..., f
             # -> b, f, vp, ..., uq
-            hb = hb.view(b, -1, *hb.shape[1:])
+            hb = hb.view(batch_size, -1, *hb.shape[1:])
             h_cross_group = hb.transpose(1, -1)
         else:
             # b, ..., uq, vq
@@ -701,7 +783,7 @@ class LokrModule(LycorisBaseModule):
             # -> b, up, vp, ... ,f
             # -> b, c, ..., f
             hc = hc.transpose(1, -1)
-            h = hc.reshape(b, -1, *hc.shape[3:])
+            h = hc.reshape(batch_size, -1, *hc.shape[3:])
         else:
             # b, ..., vp, up
             # -> b, ..., up, vp
@@ -709,7 +791,20 @@ class LokrModule(LycorisBaseModule):
             hc = hc.transpose(-1, -2)
             h = hc.reshape(*hc.shape[:-2], -1)
 
-        return self.drop(h * scale * self.scalar)
+        # get_weight() applies the alpha/rank scale in rebuild mode.  Apply
+        # that factor here too, followed only by the runtime multiplier.
+        h = h * scale * self.scale * self.scalar
+        if self.training and self.rank_dropout:
+            drop_size = h.shape[1] if is_conv else h.shape[-1]
+            drop = (torch.rand(drop_size, device=h.device) > self.rank_dropout).to(h.dtype)
+            if self.rank_dropout_scale:
+                drop /= drop.mean().clamp_min(torch.finfo(h.dtype).eps)
+            if is_conv:
+                drop = drop.view(1, -1, *([1] * (h.dim() - 2)))
+            else:
+                drop = drop.view(*([1] * (h.dim() - 1)), -1)
+            h = h * drop
+        return self.drop(h)
 
     def bypass_forward(self, x, scale=1):
         return self.org_forward(x) + self.bypass_forward_diff(x, scale=scale)
@@ -791,5 +886,5 @@ if __name__ == "__main__":
     net2.load_state_dict(sd)
     print(net2)
 
-    test_output2 = net(test_input)
+    test_output2 = net2(test_input)
     print(F.mse_loss(test_output, test_output2))
