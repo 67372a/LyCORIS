@@ -2,6 +2,7 @@
 
 import copy
 import math
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -69,6 +70,53 @@ def _conv_pair(dim, **kwargs):
     spatial = (15,) * dim
     x = torch.randn((2, 4, *spatial), device=CUDA)
     return rebuild_base, bypass_base, rebuild, bypass, x
+
+
+def test_lokr_warns_when_factor_does_not_evenly_divide_module_dimensions():
+    _require_cuda()
+    base = nn.Linear(127, 127, bias=False, device=CUDA)
+
+    with patch("lycoris.modules.lokr.logger.warning") as warning:
+        LokrModule(
+            "nondivisible",
+            base,
+            lora_dim=1,
+            alpha=1,
+            factor=4,
+        )
+
+    messages = [call.args[0] for call in warning.call_args_list]
+    assert len(messages) == 2
+    assert any(
+        "LoKr module 'nondivisible'" in message
+        and "input dimension=127" in message
+        and "factor pair=(1, 127)" in message
+        and "effective factor=1" in message
+        for message in messages
+    )
+    assert any(
+        "LoKr module 'nondivisible'" in message
+        and "output dimension=127" in message
+        and "factor pair=(1, 127)" in message
+        and "effective factor=1" in message
+        for message in messages
+    )
+
+
+def test_lokr_does_not_warn_when_factor_evenly_divides_module_dimensions():
+    _require_cuda()
+    base = nn.Linear(16, 16, bias=False, device=CUDA)
+
+    with patch("lycoris.modules.lokr.logger.warning") as warning:
+        LokrModule(
+            "divisible",
+            base,
+            lora_dim=1,
+            alpha=1,
+            factor=4,
+        )
+
+    warning.assert_not_called()
 
 
 def test_lokr_scale_is_applied_once_for_rebuild_merge_and_parametrize():

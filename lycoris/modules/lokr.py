@@ -22,6 +22,22 @@ def logging_force_full_matrix(lora_dim, dim, factor):
     )
 
 
+def factorization_with_warning(
+    dimension, factor, lora_name, dimension_name, unbalanced=False
+):
+    factors = factorization(dimension, factor)
+    if unbalanced:
+        factors = factors[::-1]
+
+    if factor > 0 and dimension % factor != 0:
+        logger.warning(
+            f"LoKr module '{lora_name}': requested factor={factor} does not "
+            f"evenly divide {dimension_name} dimension={dimension}; using "
+            f"factor pair={factors} (effective factor={factors[0]})."
+        )
+    return factors
+
+
 class LokrModule(LycorisBaseModule):
     name = "kron"
     support_module = {
@@ -124,10 +140,12 @@ class LokrModule(LycorisBaseModule):
             out_dim = org_module.out_channels
             self.shape = (out_dim, in_dim, *k_size)
 
-            in_m, in_n = factorization(in_dim, factor)
-            out_l, out_k = factorization(out_dim, factor)
-            if unbalanced_factorization:
-                out_l, out_k = out_k, out_l
+            in_m, in_n = factorization_with_warning(
+                in_dim, factor, lora_name, "input"
+            )
+            out_l, out_k = factorization_with_warning(
+                out_dim, factor, lora_name, "output", unbalanced_factorization
+            )
             shape = ((out_l, out_k), (in_m, in_n), *k_size)  # ((a, b), (c, d), *k_size)
             self.tucker = use_tucker and any(i != 1 for i in k_size)
             if (
@@ -172,10 +190,12 @@ class LokrModule(LycorisBaseModule):
             out_dim = org_module.out_features
             self.shape = (out_dim, in_dim)
 
-            in_m, in_n = factorization(in_dim, factor)
-            out_l, out_k = factorization(out_dim, factor)
-            if unbalanced_factorization:
-                out_l, out_k = out_k, out_l
+            in_m, in_n = factorization_with_warning(
+                in_dim, factor, lora_name, "input"
+            )
+            out_l, out_k = factorization_with_warning(
+                out_dim, factor, lora_name, "output", unbalanced_factorization
+            )
             shape = (
                 (out_l, out_k),
                 (in_m, in_n),
