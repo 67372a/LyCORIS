@@ -9,6 +9,7 @@ through rebuild (v1 scope).
 
 import torch
 
+from ..dispatch import eager_under_dynamo
 from ..ops import get_ops
 from ..precision import promote, restore
 
@@ -97,6 +98,7 @@ def rank_scale(w1a, w2a, gamma):
     return gamma / rank
 
 
+@eager_under_dynamo
 def lokr_kron_weight(w1, w1a, w1b, w2, w2a, w2b, t2=None, scale=1.0, backend=None):
     """DeltaW = scale * kron(w1, w2), the scale-explicit form."""
     # Kronecker halves go to the kernel unbuilt; only tucker w2 needs torch.
@@ -130,6 +132,7 @@ def lokr_diff_weight(w1, w1a, w1b, w2, w2a, w2b, t2=None, gamma=1.0, backend=Non
     )
 
 
+@eager_under_dynamo
 def lokr_kron_bypass(x, w1, w1a, w1b, w2, w2a, w2b, t2=None, scale=1.0, backend=None):
     """Linear bypass: per-token vec(w1 @ X @ w2^T) * scale, DeltaW never built."""
     w1_ = w1 if w1 is not None else w1a @ w1b

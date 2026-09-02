@@ -8,6 +8,7 @@ eager-compatible reshapes.
 
 import torch
 
+from ..dispatch import eager_under_dynamo
 from ..ops import get_ops
 from ..precision import promote, restore
 
@@ -49,6 +50,7 @@ class BlockDiagFusedFn(torch.autograd.Function):
         return (*grads, None, None, None, None)
 
 
+@eager_under_dynamo
 def diag_oft_diff_weight(
     org_weight, oft_blocks, rescale=None, constraint=None, backend=None
 ):
@@ -60,6 +62,7 @@ def diag_oft_diff_weight(
     return out.reshape(org_weight.shape).to(org_weight.dtype)
 
 
+@eager_under_dynamo
 def diag_oft_bypass_diff(
     org_out,
     oft_blocks,

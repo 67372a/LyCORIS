@@ -13,6 +13,7 @@ its own leaf's dtype.
 
 import torch
 
+from ..dispatch import eager_under_dynamo
 from ..ops import get_ops
 from ..precision import promote, restore
 
@@ -82,6 +83,7 @@ def _scale(gamma) -> float:
     return float(gamma) if not isinstance(gamma, torch.Tensor) else float(gamma.item())
 
 
+@eager_under_dynamo
 def locon_diff_weight(down, up, mid=None, gamma=1.0, backend=None):
     """DeltaW for LoCon; drop-in for functional.locon.diff_weight."""
     r = down.shape[0]
@@ -100,6 +102,7 @@ def locon_diff_weight(down, up, mid=None, gamma=1.0, backend=None):
     return TuckerRebuildFn.apply(up2, mid, down2, _scale(gamma), backend)
 
 
+@eager_under_dynamo
 def locon_bypass_diff(x, down, up, gamma=1.0, backend=None):
     """Linear bypass delta: gamma * (x @ down^T) @ up^T, one kernel each way.
 

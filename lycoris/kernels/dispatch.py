@@ -10,6 +10,8 @@ first failure costs a fallback rather than the process.
 import importlib.util
 import os
 
+import torch
+
 _PROBE = {
     "triton": "triton",
     "tilelang": "tilelang",
@@ -52,6 +54,23 @@ def demote(name: str) -> None:
     """Drop a backend that imported but could not run."""
     global _available
     _available = tuple(b for b in available_backends() if b != name)
+
+
+def eager_under_dynamo(fn):
+    """Keep fused-kernel entry points out of dynamo-traced graphs.
+
+    ``torch.compile``-wrapped module forwards (``_forward_rebuild_core`` and
+    friends) trace through these entry points into the triton/tilelang launch
+    paths, where symbolic shape math (SymInt grid computation, tuning
+    shortlists, kernel-launch kwargs) crashes dynamo with
+    ``'SymNodeVariable' object has no attribute 'value'``.
+
+    The autograd Functions these entries wrap are opaque single-op calls that
+    gain nothing from being inlined, so marking them user-disabled makes
+    dynamo graph-break and run them eagerly instead — identical results,
+    identical autograd, no crash. Eager (uncompiled) callers are unaffected.
+    """
+    return torch.compiler.disable(fn, recursive=True)
 
 
 def resolve_backend(requested: str | None = None) -> str:

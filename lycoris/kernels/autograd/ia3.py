@@ -2,6 +2,7 @@
 
 import torch
 
+from ..dispatch import eager_under_dynamo
 from ..ops import get_ops
 
 
@@ -20,6 +21,7 @@ class ChannelScaleFn(torch.autograd.Function):
         return gx, gw, None, None, None, None
 
 
+@eager_under_dynamo
 def ia3_diff_weight(
     org_weight, weight, on_input, multiplier=1.0, diff=True, backend=None
 ):
@@ -33,6 +35,7 @@ def ia3_diff_weight(
     )
 
 
+@eager_under_dynamo
 def ia3_bypass(x, weight, channel_axis, multiplier=1.0, diff=False, backend=None):
     """x * (weight*mult + (0 if diff else 1)) matching IA3Module._bypass_forward."""
     alpha = 0.0 if diff else 1.0

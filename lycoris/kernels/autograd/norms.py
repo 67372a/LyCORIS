@@ -2,6 +2,7 @@
 
 import torch
 
+from ..dispatch import eager_under_dynamo
 from ..ops import get_ops
 
 
@@ -16,6 +17,7 @@ class AddScaledFn(torch.autograd.Function):
         return grad, grad * ctx.gamma, None, None
 
 
+@eager_under_dynamo
 def norm_diff_weights(org_w, org_b, w_norm, b_norm, multiplier=1.0, backend=None):
     w = AddScaledFn.apply(org_w, w_norm, float(multiplier), backend)
     b = None

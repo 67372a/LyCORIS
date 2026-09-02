@@ -12,6 +12,7 @@ exception, same convention as diag_oft).
 
 import torch
 
+from ..dispatch import eager_under_dynamo
 from ..ops import get_ops
 from ..precision import promote, restore
 from .diag_oft import _cscale
@@ -79,6 +80,7 @@ class ButterflyFusedFn(torch.autograd.Function):
         return (*grads, None, None, None, None, None)
 
 
+@eager_under_dynamo
 def boft_diff_weight(
     org_weight, oft_blocks, rescale=None, constraint=None, scale=1, backend=None
 ):
@@ -91,6 +93,7 @@ def boft_diff_weight(
     )
 
 
+@eager_under_dynamo
 def boft_bypass_diff(
     org_out,
     oft_blocks,

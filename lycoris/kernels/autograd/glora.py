@@ -6,6 +6,7 @@ torch chains its grad to a1. Backward here is four skinny GEMMs.
 
 import torch
 
+from ..dispatch import eager_under_dynamo
 from ..ops import get_ops
 
 
@@ -27,6 +28,7 @@ class DualLowRankRebuildFn(torch.autograd.Function):
         return g_u, g_a2, g_b1, g_b2, None, None
 
 
+@eager_under_dynamo
 def glora_diff_weight(w, a1, a2, b1, b2, gamma=1.0, backend=None):
     """DeltaW = gamma * (W @ a1 @ a2 + b1 @ b2).
 

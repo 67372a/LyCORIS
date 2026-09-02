@@ -7,6 +7,7 @@ tests compare directly. Tucker backward recomputes the two rebuilds in torch
 
 import torch
 
+from ..dispatch import eager_under_dynamo
 from ..ops import get_ops
 from ..precision import promote, restore
 
@@ -100,6 +101,7 @@ def _scale(gamma) -> float:
     return float(gamma) if not isinstance(gamma, torch.Tensor) else float(gamma.item())
 
 
+@eager_under_dynamo
 def loha_diff_weight(w1d, w1u, w2d, w2u, t1=None, t2=None, gamma=1.0, backend=None):
     """DeltaW for LoHa; drop-in for functional.loha.diff_weight (same layout)."""
     if t1 is not None:
@@ -113,6 +115,7 @@ def loha_diff_weight(w1d, w1u, w2d, w2u, t1=None, t2=None, gamma=1.0, backend=No
     )
 
 
+@eager_under_dynamo
 def loha_bypass_diff(x, w1d, w1u, w2d, w2u, gamma=1.0, backend=None):
     """Linear bypass: y_diff = gamma * x @ DeltaW^T with DeltaW never built.
 

@@ -10,6 +10,7 @@ the multiplier interpolation; wd_on_out=False uses the column axis.
 
 import torch
 
+from ..dispatch import eager_under_dynamo
 from ..ops import get_ops
 from ..precision import promote, restore
 
@@ -42,6 +43,7 @@ class DoraScaleFn(torch.autograd.Function):
         return (*grads, None, None, None)
 
 
+@eager_under_dynamo
 def apply_dora(weight, dora_scale, multiplier=1.0, wd_on_out=True, backend=None):
     """Weight-decompose scaling of the (already merged) weight tensor.
 
