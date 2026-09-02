@@ -1,17 +1,58 @@
 from collections import OrderedDict
 import re
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils.parametrize as parametrize
 
-from ..utils.quant import QuantLinears, log_bypass, log_suspect
+from ..utils.quant import QuantLinears, log_bypass, log_fp8_bypass, log_suspect
 from ..logging import logger
 from typing import Optional
 import math
 import torch._dynamo
 torch._dynamo.config.recompile_limit = max(32, torch._dynamo.config.recompile_limit)
+
+try:
+    from peft.tuners.tuners_utils import BaseTunerLayer
+except Exception:  # pragma: no cover - PEFT is optional
+    BaseTunerLayer = None
+
+
+def is_weight_only_fp8_linear(module: nn.Module) -> bool:
+    return (
+        module.__class__.__name__ == "Fp8Linear"
+        and hasattr(module, "in_features")
+        and hasattr(module, "out_features")
+        and hasattr(module, "weight")
+        and hasattr(module, "weight_scale")
+    )
+
+
+def is_linear_like_module(module: nn.Module) -> bool:
+    return isinstance(module, nn.Linear) or is_weight_only_fp8_linear(module)
+
+
+_FP8_BYPASS_ALGOS = frozenset({"lora", "locon", "loha", "lokr", "glora"})
+
+
+def is_supported_linear_module(
+    module: nn.Module, algo_name: str, *, weight_decompose: bool = False
+) -> bool:
+    if is_weight_only_fp8_linear(module):
+        return algo_name in _FP8_BYPASS_ALGOS and (
+            algo_name == "lokr" or not weight_decompose
+        )
+    return isinstance(module, nn.Linear)
+
+
+def dequantize_weight_only_fp8(module: nn.Module) -> torch.Tensor:
+    weight = module.weight.to(torch.float32)
+    scale = module.weight_scale.to(device=weight.device, dtype=torch.float32)
+    if scale.ndim == 1:
+        scale = scale.unsqueeze(1)
+    return weight * scale
 
 try:
     from ramtorch.modules.linear import CPUBouncingLinear
@@ -151,6 +192,19 @@ class ModuleCustomSD(nn.Module):
             )
 
 
+@dataclass
+class _MergeContext:
+    precise: bool
+    target_device: torch.device
+    target_dtype: torch.dtype
+    compute_dtype: torch.dtype
+    param_device: torch.device | None
+    param_dtype: torch.dtype | None
+    module: nn.Module
+    weight_param: torch.Tensor
+    bias_param: torch.Tensor | None
+
+
 class LycorisBaseModule(ModuleCustomSD):
     name: str
     dtype_tensor: torch.Tensor
@@ -186,8 +240,19 @@ class LycorisBaseModule(ModuleCustomSD):
         if self.is_ramtorch_org:
             logger.info(f"RamTorch module detected: {lora_name}")
 
+        self.peft_wrapper = None
+        if BaseTunerLayer is not None and isinstance(org_module, BaseTunerLayer):
+            self.peft_wrapper = org_module
+            base_layer = getattr(org_module, "base_layer", None)
+            if base_layer is None and hasattr(org_module, "get_base_layer"):
+                base_layer = org_module.get_base_layer()
+            if base_layer is not None:
+                org_module = base_layer
+
         self.module = type(org_module)
-        if isinstance(org_module, (nn.Linear, CPUBouncingLinear)):
+        if is_linear_like_module(org_module) or isinstance(
+            org_module, CPUBouncingLinear
+        ):
             self.module_type = "linear"
             self.shape = (org_module.out_features, org_module.in_features)
             self.op = F.linear
@@ -195,9 +260,10 @@ class LycorisBaseModule(ModuleCustomSD):
             self.kw_dict = {}
         elif isinstance(org_module, nn.Conv1d):
             self.module_type = "conv1d"
+            # Weight layout matches torch.nn.Conv*d: (out, in/groups, *kernel)
             self.shape = (
                 org_module.out_channels,
-                org_module.in_channels,
+                org_module.in_channels // org_module.groups,
                 *org_module.kernel_size,
             )
             self.op = F.conv1d
@@ -212,7 +278,7 @@ class LycorisBaseModule(ModuleCustomSD):
             self.module_type = "conv2d"
             self.shape = (
                 org_module.out_channels,
-                org_module.in_channels,
+                org_module.in_channels // org_module.groups,
                 *org_module.kernel_size,
             )
             self.op = F.conv2d
@@ -227,7 +293,7 @@ class LycorisBaseModule(ModuleCustomSD):
             self.module_type = "conv3d"
             self.shape = (
                 org_module.out_channels,
-                org_module.in_channels,
+                org_module.in_channels // org_module.groups,
                 *org_module.kernel_size,
             )
             self.op = F.conv3d
@@ -299,13 +365,18 @@ class LycorisBaseModule(ModuleCustomSD):
         self._cached_dtype = self.dtype_tensor.dtype
 
         self.is_quant = False
-        if isinstance(org_module, QuantLinears):
+        if is_weight_only_fp8_linear(org_module):
+            if not bypass_mode:
+                log_fp8_bypass()
+            self.is_quant = True
+            bypass_mode = True
+        elif isinstance(org_module, QuantLinears):
             if not bypass_mode:
                 log_bypass()
             self.is_quant = True
             bypass_mode = True
         if (
-            isinstance(org_module, nn.Linear)
+            is_linear_like_module(org_module)
             and org_module.__class__.__name__ != "Linear"
         ):
             if bypass_mode is None:
@@ -756,9 +827,14 @@ class LycorisBaseModule(ModuleCustomSD):
     
     def get_org_weight_for_compute(self, device: torch.device):
         """Get org_weight on compute device with async transfer if needed"""
-        if self.org_module[0].weight is None:
+        org_module = self.org_module[0]
+        if org_module.weight is None:
             return None
-        weight = self.org_module[0].weight
+        if is_weight_only_fp8_linear(org_module):
+            # Weight-only FP8 weights cannot be materialised in their
+            # quantized form; compute against the dequantized weight.
+            return dequantize_weight_only_fp8(org_module).to(device)
+        weight = org_module.weight
         return transfer_ramtensor_to_device(weight, device)
     
     def get_org_bias_for_compute(self, device: torch.device):
@@ -772,38 +848,100 @@ class LycorisBaseModule(ModuleCustomSD):
     def org_weight(self, value):
         self.org_module[0].weight.data.copy_(value)
 
+    def _current_weight(self):
+        if is_weight_only_fp8_linear(self.org_module[0]):
+            return dequantize_weight_only_fp8(self.org_module[0])
+        return self.org_module[0].weight.detach()
+
+    def _current_bias(self):
+        bias = self.org_module[0].bias
+        return None if bias is None else bias.detach()
+
     def apply_to(self, **kwargs):
         if self.not_supported:
             return
-        self.org_forward = self.org_module[0].forward
-        self.org_module[0].forward = self.forward
+
+        module = self.org_module[0]
+        if not hasattr(module, "_lycoris_original_forward"):
+            module._lycoris_original_forward = module.forward
+
+        wrappers = list(getattr(module, "_lycoris_wrappers", []))
+        if self in wrappers:
+            wrappers.remove(self)
+
+        self.org_forward = module.forward
+        wrappers.append(self)
+
+        module._lycoris_wrappers = wrappers
+        module.forward = self.forward
 
     def restore(self):
         if self.not_supported:
             return
-        self.org_module[0].forward = self.org_forward
+        module = self.org_module[0]
+        wrappers = list(getattr(module, "_lycoris_wrappers", []))
 
-    def merge_to(self, multiplier=1.0):
+        if not wrappers:
+            module.forward = getattr(
+                module, "_lycoris_original_forward", self.org_forward
+            )
+            return
+
+        try:
+            idx = wrappers.index(self)
+        except ValueError:
+            module.forward = (
+                wrappers[-1].forward
+                if wrappers
+                else getattr(module, "_lycoris_original_forward", self.org_forward)
+            )
+            return
+
+        wrappers.pop(idx)
+
+        if idx < len(wrappers):
+            wrappers[idx].org_forward = self.org_forward
+
+        if wrappers:
+            module._lycoris_wrappers = wrappers
+            module.forward = wrappers[-1].forward
+        else:
+            module.forward = getattr(
+                module, "_lycoris_original_forward", self.org_forward
+            )
+            module.__dict__.pop("_lycoris_wrappers", None)
+            module.__dict__.pop("_lycoris_original_forward", None)
+
+    def merge_to(self, multiplier=1.0, *, precise: bool = False):
         if self.not_supported:
             return
-        self_device = next(self.parameters()).device
-        self_dtype = next(self.parameters()).dtype
-        self.to(self.org_weight)
-        weight, bias = self.get_merged_weight(
-            multiplier, self.org_weight.shape, self.org_weight.device
-        )
-        self.org_weight = weight.to(self.org_weight)
-        if bias is not None:
-            bias = bias.to(self.org_weight)
-            if self.org_module[0].bias is not None:
-                self.org_module[0].bias.data.copy_(bias)
-            else:
-                self.org_module[0].bias = nn.Parameter(bias)
-        self.to(self_device, self_dtype)
+        if is_weight_only_fp8_linear(self.org_module[0]):
+            raise RuntimeError(
+                "Merging LyCORIS modules into weight-only FP8 Linear is not supported."
+            )
+
+        ctx = self._prepare_merge_context(precise)
+
+        if precise:
+            weight_prec, bias_prec = self._compute_precise_result(ctx, multiplier)
+            self._apply_precise_weights(ctx, weight_prec, bias_prec)
+        else:
+            weight, bias = self.get_merged_weight(
+                multiplier,
+                ctx.weight_param.shape,
+                ctx.target_device,
+            )
+            self._apply_merged_weights(ctx, weight, bias)
+
+        self._restore_merge_context(ctx)
 
     def onfly_merge(self, multiplier=1.0):
         if self.not_supported:
             return
+        if is_weight_only_fp8_linear(self.org_module[0]):
+            raise RuntimeError(
+                "Merging LyCORIS modules into weight-only FP8 Linear is not supported."
+            )
         self_device = next(self.parameters()).device
         self_dtype = next(self.parameters()).dtype
         self.to(self.org_weight)
@@ -1298,3 +1436,182 @@ class LycorisBaseModule(ModuleCustomSD):
             noise_sq += float(noise.pow(2).sum())
             w.add_(noise)
         return noise_sq
+
+    def _prepare_merge_context(self, precise: bool) -> _MergeContext:
+        module = self.org_module[0]
+        weight_param = module.weight
+        bias_param = module.bias
+
+        params = tuple(self.parameters())
+        first_param = params[0] if params else None
+        param_device = first_param.device if first_param is not None else None
+        param_dtype = first_param.dtype if first_param is not None else None
+
+        target_device = weight_param.device
+        target_dtype = weight_param.dtype
+        compute_dtype = torch.float64 if precise else target_dtype
+
+        if first_param is not None:
+            self.to(device=target_device, dtype=compute_dtype)
+        else:
+            self.to(target_device)
+            if precise:
+                self.to(dtype=compute_dtype)
+
+        if precise:
+            self._ensure_precise_snapshot(module, weight_param, bias_param)
+            self._load_precise_snapshot(
+                module,
+                weight_param,
+                bias_param,
+                target_device,
+                compute_dtype,
+            )
+
+        return _MergeContext(
+            precise=precise,
+            target_device=target_device,
+            target_dtype=target_dtype,
+            compute_dtype=compute_dtype,
+            param_device=param_device,
+            param_dtype=param_dtype,
+            module=module,
+            weight_param=weight_param,
+            bias_param=bias_param,
+        )
+
+    def _apply_merged_weights(
+        self,
+        ctx: _MergeContext,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> None:
+        merged_weight = weight.to(ctx.target_dtype)
+        ctx.weight_param.data.copy_(merged_weight)
+
+        if bias is not None:
+            merged_bias = bias.to(ctx.target_dtype)
+            if ctx.bias_param is not None:
+                ctx.bias_param.data.copy_(merged_bias)
+            else:
+                ctx.module.bias = nn.Parameter(merged_bias)
+        elif ctx.bias_param is None:
+            ctx.module.bias = None
+
+        if ctx.precise:
+            ctx.module._lycoris_precise_weight_current = weight.to(torch.float64).cpu()
+            if ctx.bias_param is not None:
+                if bias is not None:
+                    ctx.module._lycoris_precise_bias_current = bias.to(
+                        torch.float64
+                    ).cpu()
+                else:
+                    ctx.module._lycoris_precise_bias_current = (
+                        ctx.module._lycoris_precise_bias_base
+                    )
+
+    def _restore_merge_context(self, ctx: _MergeContext) -> None:
+        if ctx.param_device is not None and ctx.param_dtype is not None:
+            self.to(device=ctx.param_device, dtype=ctx.param_dtype)
+        elif ctx.param_device is not None:
+            self.to(ctx.param_device)
+        elif ctx.param_dtype is not None:
+            self.to(dtype=ctx.param_dtype)
+
+    def _compute_precise_result(
+        self, ctx: _MergeContext, multiplier: float
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        base_weight = ctx.module._lycoris_precise_weight_current
+        diff_weight, diff_bias = self.get_diff_weight(
+            multiplier=1.0, device=ctx.target_device
+        )
+        diff_weight_prec = diff_weight.to(torch.float64).cpu()
+        new_weight = base_weight + diff_weight_prec * multiplier
+
+        new_bias = None
+        if diff_bias is not None:
+            diff_bias_prec = diff_bias.to(torch.float64).cpu()
+            base_bias = ctx.module._lycoris_precise_bias_current
+            if base_bias is None:
+                base_bias = torch.zeros_like(diff_bias_prec)
+            new_bias = base_bias + diff_bias_prec * multiplier
+        else:
+            new_bias = ctx.module._lycoris_precise_bias_current
+
+        ctx.module._lycoris_precise_weight_current = new_weight.clone()
+        if diff_bias is not None:
+            ctx.module._lycoris_precise_bias_current = (
+                new_bias.clone() if new_bias is not None else None
+            )
+
+        return new_weight, new_bias
+
+    def _apply_precise_weights(
+        self,
+        ctx: _MergeContext,
+        weight_prec: torch.Tensor,
+        bias_prec: torch.Tensor | None,
+    ) -> None:
+        ctx.weight_param.data.copy_(weight_prec.to(ctx.target_device, ctx.target_dtype))
+
+        if bias_prec is not None:
+            if ctx.bias_param is not None:
+                ctx.bias_param.data.copy_(
+                    bias_prec.to(ctx.target_device, ctx.target_dtype)
+                )
+            else:
+                ctx.module.bias = nn.Parameter(
+                    bias_prec.to(ctx.target_device, ctx.target_dtype)
+                )
+        elif ctx.bias_param is None:
+            ctx.module.bias = None
+
+    @staticmethod
+    def _ensure_precise_snapshot(
+        module: nn.Module,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> None:
+        if not hasattr(module, "_lycoris_precise_weight_base"):
+            base = weight.detach().cpu().double()
+            module._lycoris_precise_weight_base = base
+            module._lycoris_precise_weight_current = base.clone()
+        if not hasattr(module, "_lycoris_precise_weight_current"):
+            module._lycoris_precise_weight_current = (
+                module._lycoris_precise_weight_base.clone()
+            )
+
+        if not hasattr(module, "_lycoris_precise_bias_base"):
+            if bias is not None:
+                base_bias = bias.detach().cpu().double()
+            else:
+                base_bias = None
+            module._lycoris_precise_bias_base = base_bias
+            module._lycoris_precise_bias_current = (
+                base_bias.clone() if base_bias is not None else None
+            )
+        if not hasattr(module, "_lycoris_precise_bias_current"):
+            module._lycoris_precise_bias_current = (
+                module._lycoris_precise_bias_base.clone()
+                if module._lycoris_precise_bias_base is not None
+                else None
+            )
+
+    @staticmethod
+    def _load_precise_snapshot(
+        module: nn.Module,
+        weight_param: torch.Tensor,
+        bias_param: torch.Tensor | None,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        weight_param.data.copy_(
+            module._lycoris_precise_weight_current.to(device=device, dtype=dtype)
+        )
+        if bias_param is not None:
+            bias_snapshot = module._lycoris_precise_bias_current
+            if bias_snapshot is None and module._lycoris_precise_bias_base is not None:
+                bias_snapshot = module._lycoris_precise_bias_base
+                module._lycoris_precise_bias_current = bias_snapshot
+            if bias_snapshot is not None:
+                bias_param.data.copy_(bias_snapshot.to(device=device, dtype=dtype))

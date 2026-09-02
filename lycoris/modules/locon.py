@@ -6,7 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .base import LycorisBaseModule
-from ..functional.general import rebuild_tucker
+from ..functional.general import rebuild_tucker, weight_decompose
+from ..functional.locon import bypass_forward_diff as bypass_diff, diff_weight
 from ..logging import logger
 
 from typing import Optional, Callable, Dict
@@ -111,8 +112,9 @@ class LoConModule(LycorisBaseModule):
 
         if self.module_type.startswith("conv"):
             self.isconv = True
-            # For general LoCon
-            in_dim = org_module.in_channels
+            # For general LoCon. in_dim follows torch Conv weight layout (in/groups)
+            # so rebuild_weight matches F.conv*d when groups != 1 (#260).
+            in_dim = org_module.in_channels // org_module.groups
             k_size = org_module.kernel_size
             stride = org_module.stride
             padding = org_module.padding
@@ -120,7 +122,12 @@ class LoConModule(LycorisBaseModule):
             use_tucker = use_tucker and any(i != 1 for i in k_size)
             self.down_op = self.op
             self.up_op = self.op
-            if use_tucker:
+            if org_module.groups != 1 and self.bypass_mode:
+                # Adapter Conv modules are groups=1 and take in/groups channels;
+                # bypass forward on the full activation is not valid for grouped
+                # originals, so force the weight-rebuild path.
+                self.bypass_mode = False
+            if use_tucker and any(i != 1 for i in k_size):
                 self.lora_down = self.module(in_dim, lora_dim, 1, bias=False)
                 self.lora_mid = self.module(
                     lora_dim, lora_dim, k_size, stride, padding, bias=False
@@ -131,7 +138,7 @@ class LoConModule(LycorisBaseModule):
                     in_dim, lora_dim, k_size, stride, padding, bias=False
                 )
             self.lora_up = self.module(lora_dim, out_dim, 1, bias=False)
-        elif self.module_type == "linear" or isinstance(org_module, nn.Linear):
+        elif self.module_type == "linear":
             self.isconv = False
             self.down_op = F.linear
             self.up_op = F.linear
@@ -467,7 +474,17 @@ class LoConModule(LycorisBaseModule):
 
     @classmethod
     def make_module_from_state_dict(
-        cls, lora_name, orig_module, up, down, mid, alpha, dora_scale
+        cls,
+        lora_name,
+        orig_module,
+        up,
+        down,
+        mid,
+        alpha,
+        dora_scale,
+        pissa_A_init=None,
+        pissa_B_init=None,
+        pissa_converted=None,
     ):
         module = cls(
             lora_name,
@@ -484,6 +501,13 @@ class LoConModule(LycorisBaseModule):
             module.lora_mid.weight.data.copy_(mid)
         if dora_scale is not None:
             module.dora_scale.copy_(dora_scale)
+        # PiSSA init snapshots (fork feature): optional, may be None.
+        if pissa_A_init is not None:
+            module.pissa_A_init = pissa_A_init
+        if pissa_B_init is not None:
+            module.pissa_B_init = pissa_B_init
+        if pissa_converted is not None:
+            module.pissa_converted = pissa_converted
         return module
 
     @staticmethod
@@ -588,7 +612,7 @@ class LoConModule(LycorisBaseModule):
         return self._make_weight_single(device)
 
     def _make_weight_single(self, device=None):
-        """Original single-task weight computation (used when olora=False)."""
+        """Single-task weight computation (used when olora=False)."""
         wa = self._maybe_orthogonalize(self.lora_up.weight.to(device))
         wb = self._maybe_orthogonalize(self.lora_down.weight.to(device))
         # T-LoRA: zero out masked rank dimensions in the down weight so the
@@ -596,16 +620,18 @@ class LoConModule(LycorisBaseModule):
         # masking the bottleneck activation but works in rebuild mode.
         if self.use_timestep_mask and self.training:
             wb = wb * self._timestep_mask.to(wb).view(-1, *([1] * (wb.dim() - 1)))
-        if self.tucker:
-            t = self._maybe_orthogonalize(self.lora_mid.weight.to(device))
-            wa = wa.view(wa.size(0), -1).transpose(0, 1)
-            wb = wb.view(wb.size(0), -1)
-            weight = rebuild_tucker(t, wa, wb)
-        else:
-            weight = wa.view(wa.size(0), -1) @ wb.view(wb.size(0), -1)
-
-        weight = weight.view(self.shape)
-        weight = self._apply_rank_dropout(weight, device)
+        t = self._maybe_orthogonalize(self.lora_mid.weight.to(device)) if self.tucker else None
+        # gamma=1: self.scale belongs to the caller and self.scalar can be a
+        # parameter, so neither folds into the rebuild's scale.
+        weight = diff_weight(wb, wa, t, gamma=1.0).view(self.shape)
+        if self.training and self.rank_dropout:
+            drop = (torch.rand(weight.size(0), device=device) > self.rank_dropout).to(
+                weight.dtype
+            )
+            drop = drop.view(-1, *[1] * len(weight.shape[1:]))
+            if self.rank_dropout_scale:
+                drop /= drop.mean()
+            weight *= drop
 
         return self._apply_scalar(weight, device)
 
@@ -1194,6 +1220,10 @@ class LoConModule(LycorisBaseModule):
         dtype = self._cached_dtype
         device = x.device
         multiplier = self.multiplier_buf
+        if multiplier.device != x.device:
+            # Stacked wrappers / post-creation device moves can leave the
+            # buffer behind; keep the compiled core device-consistent.
+            multiplier = multiplier.to(x.device)
 
         # Weight difference computation
         # Path 1: _compute_diff_weight_single/multitask already includes
@@ -1207,6 +1237,10 @@ class LoConModule(LycorisBaseModule):
                 diff_weight = self._compute_diff_weight_single(device, dtype)
         else:
             diff_weight = self.make_weight(device).to(dtype)
+        # Device safety: stacked wrappers and post-creation device moves can
+        # leave adapter params on a different device than the activation.
+        if diff_weight.device != x.device:
+            diff_weight = diff_weight.to(x.device)
 
         # Merge weights
         weight = org_weight
@@ -1271,7 +1305,7 @@ class LoConModule(LycorisBaseModule):
 
         return self.drop(up * scale)
 
-    def forward(self, x):
+    def forward(self, x, *args, **kwargs):
         if self.module_dropout and self.training:
             if torch.rand(1) < self.module_dropout:
                 return self.org_forward(x)

@@ -30,9 +30,12 @@ from .modules.tlora import TLoraModule
 from .modules.tsm import TSMModule, set_tsm_timestep, get_tsm_timestep, clear_tsm_timestep
 from .modules.lora2 import LoRA2Module
 from .modules.ortholora import OrthoLoRAModule
+from .modules.ia3 import IA3Module
 from .modules import get_module, make_module
+from .modules.base import is_supported_linear_module, is_weight_only_fp8_linear
 
 from .config import PRESET
+from .config_sdk import VALID_PRESET_KEYS
 from .utils.preset import read_preset
 from .utils import str_bool
 from .logging import logger
@@ -43,26 +46,6 @@ try:
     from ramtorch.modules.linear import CPUBouncingLinear
 except ImportError:
     CPUBouncingLinear = type(None)
-
-
-VALID_PRESET_KEYS = [
-    "enable_conv",
-    "target_module",
-    "target_name",
-    "module_algo_map",
-    "name_algo_map",
-    "lora_prefix",
-    "use_fnmatch",
-    "unet_target_module",
-    "unet_target_name",
-    "text_encoder_target_module",
-    "text_encoder_target_name",
-    "exclude_name",
-    "exclude_patterns",
-    "include_patterns",
-    "network_reg_dims",
-    "network_reg_lrs",
-]
 
 
 network_module_dict = {
@@ -92,7 +75,14 @@ deprecated_arg_dict = {
 }
 
 
-def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwargs):
+def create_lycoris(
+    module,
+    multiplier=1.0,
+    linear_dim=4,
+    linear_alpha=1,
+    warn_on_unmatched=True,
+    **kwargs,
+):
     for key, value in list(kwargs.items()):
         if key in deprecated_arg_dict:
             logger.warning(
@@ -490,6 +480,7 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
         tsm_num_timesteps=tsm_num_timesteps,
         tsm_stage=tsm_stage,
         tsm_router_input=tsm_router_input,
+        warn_on_unmatched=warn_on_unmatched,
     )
 
     if torch_compile:
@@ -628,6 +619,7 @@ class LycorisNetwork(torch.nn.Module):
         train_norm=False,
         init_only=False,
         train_llm_adapter=False,
+        warn_on_unmatched=True,
         exclude_patterns=None,
         include_patterns=None,
         network_reg_dims=None,
@@ -842,7 +834,14 @@ class LycorisNetwork(torch.nn.Module):
                     **kwargs,
                 )
             lora = None
-            if isinstance(module, (torch.nn.Linear, CPUBouncingLinear)) and lora_dim > 0:
+            if (
+                is_supported_linear_module(
+                    module,
+                    algo_name,
+                    weight_decompose=kwargs.get("weight_decompose", False),
+                )
+                or isinstance(module, CPUBouncingLinear)
+            ) and lora_dim > 0:
                 dim = dim or lora_dim
                 alpha = alpha or self.alpha
             elif isinstance(
@@ -941,11 +940,14 @@ class LycorisNetwork(torch.nn.Module):
             target_replace_modules,
             target_replace_names=[],
             target_exclude_names=[],
-        ) -> List:
+        ) -> tuple:
             logger.info("Create LyCORIS Module")
             loras = []
             lora_map = {}
             next_config = {}
+            # Track which targets were matched
+            matched_modules = set()
+            matched_names = set()
             for name, module in root_module.named_modules():
                 if _is_excluded(name, target_exclude_names):
                     continue
@@ -954,6 +956,7 @@ class LycorisNetwork(torch.nn.Module):
                 if module_name in target_replace_modules and not any(
                     self.match_fn(t, name) for t in target_replace_names
                 ):
+                    matched_modules.add(module_name)
                     if module_name in self.MODULE_ALGO_MAP:
                         next_config = self.MODULE_ALGO_MAP[module_name]
                         algo = next_config.get("algo", network_module)
@@ -976,6 +979,13 @@ class LycorisNetwork(torch.nn.Module):
                 elif name in target_replace_names or any(
                     self.match_fn(t, name) for t in target_replace_names
                 ):
+                    # Track which pattern matched and the module class
+                    matched_modules.add(module_name)
+                    if name in target_replace_names:
+                        matched_names.add(name)
+                    for t in target_replace_names:
+                        if self.match_fn(t, name):
+                            matched_names.add(t)
                     conf_from_name = self.find_conf_for_name(name)
                     if conf_from_name is not None:
                         next_config = conf_from_name
@@ -1001,9 +1011,9 @@ class LycorisNetwork(torch.nn.Module):
                         lora.original_name = name
                         lora_map[lora.lora_name] = lora
                         loras.append(lora)
-            return loras
+            return loras, matched_modules, matched_names
 
-        target_replace_modules = list(
+        target_modules = list(
             set(
                 [
                     *LycorisNetwork.TARGET_REPLACE_MODULE,
@@ -1011,24 +1021,46 @@ class LycorisNetwork(torch.nn.Module):
                 ]
             )
         )
-        if self.train_llm_adapter:
-            target_replace_modules.append("LLMAdapterTransformerBlock")
-            
-        self.loras = create_modules(
+        target_names = list(
+            set(
+                [
+                    *LycorisNetwork.TARGET_REPLACE_NAME,
+                    *LycorisNetwork.NAME_ALGO_MAP.keys(),
+                ]
+            )
+        )
+
+        if not self.train_llm_adapter:
+            if "LLMAdapterTransformerBlock" in target_modules:
+                target_modules.remove("LLMAdapterTransformerBlock")
+
+        self.loras, matched_modules, matched_names = create_modules(
             LycorisNetwork.LORA_PREFIX,
             module,
-            target_replace_modules,
-            list(
-                set(
-                    [
-                        *LycorisNetwork.TARGET_REPLACE_NAME,
-                        *LycorisNetwork.NAME_ALGO_MAP.keys(),
-                    ]
-                )
-            ),
+            target_modules,
+            target_names,
             target_exclude_names=LycorisNetwork.TARGET_EXCLUDE_NAME,
         )
         logger.info(f"create LyCORIS: {len(self.loras)} modules.")
+
+        # Warn about unmatched targets if enabled
+        if warn_on_unmatched:
+            unmatched_modules = set(target_modules) - matched_modules
+            unmatched_names = set(target_names) - matched_names
+            if unmatched_modules:
+                logger.warning(
+                    f"No modules matched the following target module classes: {sorted(unmatched_modules)}"
+                )
+            if unmatched_names:
+                logger.warning(
+                    f"No modules matched the following target names/patterns: {sorted(unmatched_names)}"
+                )
+            if len(self.loras) == 0:
+                logger.warning(
+                    "No LyCORIS modules were created. "
+                    "This may indicate a mismatch between your LyCORIS config and the model architecture. "
+                    "Please verify your preset/target settings match the model you are using."
+                )
 
         algo_table = {}
         for lora in self.loras:
@@ -1369,17 +1401,27 @@ class LycorisNetwork(torch.nn.Module):
             logger.info(f"weights are loaded: {info}")
 
     def is_mergeable(self):
-        return True
+        return not any(
+            is_weight_only_fp8_linear(lora.org_module[0]) for lora in self.loras
+        )
+
+    def _ensure_mergeable(self):
+        if not self.is_mergeable():
+            raise RuntimeError(
+                "Merging LyCORIS modules into weight-only FP8 Linear is not supported."
+            )
 
     def restore(self):
         for lora in self.loras:
             lora.restore()
 
-    def merge_to(self, weight=1.0):
+    def merge_to(self, weight=1.0, *, precise: bool = False):
+        self._ensure_mergeable()
         for lora in self.loras:
-            lora.merge_to(weight)
+            lora.merge_to(weight, precise=precise)
 
     def onfly_merge(self, weight=1.0):
+        self._ensure_mergeable()
         for lora in self.loras:
             lora.onfly_merge(weight)
 

@@ -1,3 +1,46 @@
+.internal/
+out/
+coverage_report/
+.ruff_cache/
+
+# Triton objects on Windows
+*.exp
+*.lib
+*.obj
+
+# example
+data/
+*experiments/
+
+# test
+models/
+test_model/
+huggingface/
+logs/
+output/
+exps/
+*.ps1
+*.safetensors
+*.pt
+*.ckpt
+test*.py
+!test/*.py
+!test/**/*.py
+
+# Editors
+.vscode/
+.idea/
+
+# Vagrant
+.vagrant/
+
+# Mac/OSX
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Source for the following rules: https://raw.githubusercontent.com/github/gitignore/master/Python.gitignore
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

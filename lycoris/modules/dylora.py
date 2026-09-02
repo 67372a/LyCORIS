@@ -5,9 +5,16 @@ import torch
 import torch.nn as nn
 
 from .base import LycorisBaseModule
+from ..kernels.autograd.dylora import dylora_diff_weight
+from ..kernels.select import FUSED, call_compiled, choose, static_scale
 from ..utils import product
 
 from typing import Optional
+
+
+def _dylora_weight(down, up, gamma):
+    """ΔW = gamma·(up @ down) over the rank blocks in play."""
+    return up @ (down * gamma)
 
 
 class DyLoraModule(LycorisBaseModule):
@@ -120,7 +127,14 @@ class DyLoraModule(LycorisBaseModule):
             down, up, scale = self.get_random_rank_weight()
         else:
             down, up, scale = self.get_weight(rank)
-        w = up @ (down * (scale * multiplier))
+        gamma = scale * multiplier
+        backend = choose((down, up), supported=static_scale(gamma))
+        if backend in FUSED:
+            w = dylora_diff_weight(down, up, gamma=gamma, backend=backend)
+        elif backend == "compile":
+            w = call_compiled(_dylora_weight, down, up, gamma)
+        else:
+            w = _dylora_weight(down, up, gamma)
         if device is not None:
             w = w.to(device)
         if shape is not None:
@@ -155,14 +169,15 @@ class DyLoraModule(LycorisBaseModule):
     def forward(self, x, *args, **kwargs):
         if self.module_dropout and self.training:
             if torch.rand(1) < self.module_dropout:
-                return self.org_forward(x)
+                return self.org_forward(x, *args, **kwargs)
         if self.bypass_mode:
             return self.bypass_forward(x, self.multiplier)
         else:
-            weight = self.get_merged_weight(multiplier=self.multiplier)[0]
-            
-            bias = self.get_org_bias_for_compute(x.device)
-            if bias is not None:
-                bias = bias.to(self.dtype, non_blocking=True).data
-
-            return self.op(x, weight, bias, **self.kw_dict)
+            base = self.org_forward(x, *args, **kwargs)
+            base_weight = self._current_weight().to(x.device)
+            merged_weight = self.get_merged_weight(multiplier=self.multiplier)[0].to(
+                base_weight.dtype
+            )
+            delta_weight = merged_weight - base_weight
+            delta = self.op(x, delta_weight, None, **self.kw_dict)
+            return base + delta

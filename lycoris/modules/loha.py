@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 
 from .base import LycorisBaseModule
+from ..functional.general import weight_decompose
+from ..functional.loha import bypass_forward_diff as loha_bypass_diff
 from ..functional.loha import diff_weight as loha_diff_weight
 from ..logging import logger
 
@@ -82,7 +84,7 @@ class LohaModule(LycorisBaseModule):
 
         w_shape = self.shape
         if self.module_type.startswith("conv"):
-            in_dim = org_module.in_channels
+            in_dim = org_module.in_channels // org_module.groups
             k_size = org_module.kernel_size
             out_dim = org_module.out_channels
             self.shape = (out_dim, in_dim, *k_size)
@@ -440,22 +442,51 @@ class LohaModule(LycorisBaseModule):
         return unscaled_norm
 
     def bypass_forward_diff(self, x, scale=1):
-        diff_weight = self.get_weight(self.shape)
-        if self.scalar_type == "scalar":
-            diff_weight = diff_weight * self.scalar * scale
-        elif self.scalar_type == "row":
-            rs = self.row_scalar.view(-1, *([1] * (diff_weight.dim() - 1)))
-            diff_weight = diff_weight * rs * scale
-        elif self.scalar_type == "column":
-            cs = self.col_scalar.view(1, -1, *([1] * (diff_weight.dim() - 2)))
-            diff_weight = diff_weight * cs * scale
-        elif self.scalar_type == "row_column":
-            rs = self.row_scalar.view(-1, *([1] * (diff_weight.dim() - 1)))
-            cs = self.col_scalar.view(1, -1, *([1] * (diff_weight.dim() - 2)))
-            diff_weight = diff_weight * rs * cs * scale
-        else:
-            diff_weight = diff_weight * scale
-        return self.drop(self._call_op(x, diff_weight))
+        if self.scalar_type != "scalar":
+            # Fork feature: vector scalars (row/column/row_column) cannot be
+            # expressed by the fused kernel fast path.
+            diff_weight = self.get_weight(self.shape)
+            if self.scalar_type == "row":
+                rs = self.row_scalar.view(-1, *([1] * (diff_weight.dim() - 1)))
+                diff_weight = diff_weight * rs * scale
+            elif self.scalar_type == "column":
+                cs = self.col_scalar.view(1, -1, *([1] * (diff_weight.dim() - 2)))
+                diff_weight = diff_weight * cs * scale
+            elif self.scalar_type == "row_column":
+                rs = self.row_scalar.view(-1, *([1] * (diff_weight.dim() - 1)))
+                cs = self.col_scalar.view(1, -1, *([1] * (diff_weight.dim() - 2)))
+                diff_weight = diff_weight * rs * cs * scale
+            else:
+                diff_weight = diff_weight * scale
+            diff_weight = diff_weight.to(device=x.device, dtype=x.dtype)
+            return self.drop(self._call_op(x, diff_weight))
+
+        scalar = self.scalar.to(device=x.device, dtype=x.dtype)
+        if (
+            self.module_type != "linear"
+            or self.tucker
+            or (self.training and self.rank_dropout)
+        ):
+            # Rank dropout masks ΔW's rows, and a conv ΔW carries the org
+            # weight's spatial shape that the 2D factors here have flattened.
+            diff_weight = self.get_weight(self.shape).to(x) * scalar * scale
+            return self.drop(self.op(x, diff_weight, **self.kw_dict))
+        # .to(x) so a quantized or fp8 base still works: the adapter weights
+        # meet the activation, not the other way around.
+        gamma = torch.tensor(self.scale * scale, dtype=x.dtype, device=x.device)
+        diff = loha_bypass_diff(
+            x,
+            None,
+            self.hada_w1_b.to(x),
+            self.hada_w1_a.to(x),
+            self.hada_w2_b.to(x),
+            self.hada_w2_a.to(x),
+            None,
+            None,
+            gamma=gamma,
+            extra_args=self.kw_dict,
+        )
+        return self.drop(diff * scalar)
 
     def bypass_forward(self, x, scale=1):
         return self.org_forward(x) + self.bypass_forward_diff(x, scale=scale)
@@ -467,19 +498,23 @@ class LohaModule(LycorisBaseModule):
         merges with the pre-fetched original weight, and runs the fused
         linear/conv operation.  All inputs are pre-fetched GPU tensors.
         """
-        diff_weight = self.get_weight(self.shape).to(self._cached_dtype)
+        diff_weight = self.get_weight(self.shape).to(
+            device=org_weight.device, dtype=self._cached_dtype
+        )
+        # Device safety: stacked wrappers / post-creation device moves can
+        # leave scalars and buffers behind.
         if self.scalar_type == "scalar":
-            diff_weight = diff_weight * self.scalar
+            diff_weight = diff_weight * self.scalar.to(org_weight.device)
         elif self.scalar_type == "row":
-            diff_weight = diff_weight * self.row_scalar.view(-1, *([1] * (diff_weight.dim() - 1)))
+            diff_weight = diff_weight * self.row_scalar.to(org_weight.device).view(-1, *([1] * (diff_weight.dim() - 1)))
         elif self.scalar_type == "column":
-            diff_weight = diff_weight * self.col_scalar.view(1, -1, *([1] * (diff_weight.dim() - 2)))
+            diff_weight = diff_weight * self.col_scalar.to(org_weight.device).view(1, -1, *([1] * (diff_weight.dim() - 2)))
         elif self.scalar_type == "row_column":
-            r = self.row_scalar.view(-1, *([1] * (diff_weight.dim() - 1)))
-            c = self.col_scalar.view(1, -1, *([1] * (diff_weight.dim() - 2)))
+            r = self.row_scalar.to(org_weight.device).view(-1, *([1] * (diff_weight.dim() - 1)))
+            c = self.col_scalar.to(org_weight.device).view(1, -1, *([1] * (diff_weight.dim() - 2)))
             diff_weight = diff_weight * r * c
         weight = org_weight
-        multiplier = self.multiplier_buf
+        multiplier = self.multiplier_buf.to(org_weight.device)
         if self.wd:
             weight = self.apply_weight_decompose(weight + diff_weight, multiplier)
         else:

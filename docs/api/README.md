@@ -82,6 +82,21 @@ def forward_with_diff_activation(x, org_weight, weights):
 
 Although different algorithm will have different extra arguments for weight_diff and bypass_forward_diff, the overall logic is same.
 
+### Backends
+
+Every functional entry point keeps this signature and picks a backend for the
+call underneath it — a fused Triton/TileLang kernel, a `torch.compile`d
+version of the same op, or the eager body. Nothing about the call changes; see
+[kernels/README.md](../kernels/README.md), and
+[kernels/backends.md](../kernels/backends.md) for how to pin one.
+
+`lycoris.functional.general` also exposes the two ops that are shared between
+algorithms rather than owned by one:
+
+* `weight_decompose`: the DoRA epilogue, `W · (m·(d/‖W‖ − 1) + 1)`, used by
+  dora, doha and dokr alike.
+* `add_scaled`: `W_org + γ·ΔW`, used by the `full` and `norm` modules.
+
 ## Others
 
 ### wrapper
@@ -89,6 +104,10 @@ Although different algorithm will have different extra arguments for weight_diff
 * `LycorisNetwork`: the wrapper class to patch any pytorch modules to apply LyCORIS algorithms.
 * `create_lycoris`: see example
 * `create_lycoris_from_weights`: see example
+
+`LycorisNetwork.apply_to()` can be invoked multiple times on the same module with different wrapper instances. Each wrapper is stacked on top of the previous one, and calling `restore()` on a wrapper removes only its own contribution while keeping earlier wrappers active.
+
+See `example/stacked_wrapper_demo.py` for a script that showcases stacking and selective removal in practice.
 
 ### kohya
 

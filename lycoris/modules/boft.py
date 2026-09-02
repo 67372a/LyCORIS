@@ -9,6 +9,8 @@ from einops import rearrange
 
 from .base import LycorisBaseModule
 from ..functional import power2factorization
+from ..functional.boft import bypass_forward_diff as boft_bypass_diff
+from ..functional.boft import diff_weight as boft_diff_weight
 from ..logging import logger
 
 from typing import Optional
@@ -193,48 +195,17 @@ class ButterflyOFTModule(LycorisBaseModule):
         return r_dropped
 
     def make_weight(self, scale=1, device=None, diff=False):
-        m = self.boft_m
-        b = self.boft_b
-        r_b = b // 2
-        r = self.get_r()
-        
-        r = self._apply_multiplicative_dropout(r)
-        
-        # Ensure org_weight is on the correct device and dtype early
-        org_weight = self.get_org_weight_for_compute(device)
-        org_weight_dtype = org_weight.dtype
-        r_dtype = r.dtype # Usually float32 due to inverse, ensure consistency
-        target_dtype = torch.promote_types(org_weight_dtype, r_dtype)
-
-        if device is None:
-            device = self.oft_blocks.device
-            org_weight
-        inp = org = org_weight.to(target_dtype, non_blocking=True)
-
-        for i in range(m):
-            bi = r[i]  # b_num, b_size, b_size
-            g = 2
-            k = 2**i * r_b
-            if scale != 1:
-                bi = bi * scale + (1 - scale) * self.I.to(device=bi.device, dtype=bi.dtype)
-            inp = (
-                inp.unflatten(0, (-1, g, k))
-                .transpose(1, 2)
-                .flatten(0, 2)
-                .unflatten(0, (-1, b))
-            )
-            inp = torch.einsum("b i j, b j ...-> b i ...", bi, inp)
-            inp = (
-                inp.flatten(0, 1).unflatten(0, (-1, k, g)).transpose(1, 2).flatten(0, 2)
-            )
-
-        if self.rescaled:
-            inp = inp * self.rescale.to(device=inp.device, dtype=inp.dtype)
-
-        if diff:
-            inp = inp - org
-
-        return inp.to(org_weight_dtype)
+        org = self.org_weight.to(device)
+        delta = boft_diff_weight(
+            org,
+            self.oft_blocks,
+            self.rescale if self.rescaled else None,
+            constraint=self.constraint,
+            scale=scale,
+        )
+        if not diff:
+            delta = delta + org.to(delta.dtype)
+        return delta.to(self.oft_blocks.dtype)
 
     def get_diff_weight(self, multiplier=1, shape=None, device=None):
         diff = self.make_weight(scale=multiplier, device=device, diff=True)
@@ -269,44 +240,16 @@ class ButterflyOFTModule(LycorisBaseModule):
         return unscaled_norm
 
     def _bypass_forward(self, x, scale=1, diff=False):
-        m = self.boft_m
-        b = self.boft_b
-        r_b = b // 2
-        r = self.get_r()
-        r = self._apply_multiplicative_dropout(r)
-        inp = org = self.org_forward(x)
-        if self.op in {F.conv2d, F.conv1d, F.conv3d}:
-            inp = inp.transpose(1, -1)
-
-        for i in range(m):
-            bi = r[i]  # b_num, b_size, b_size
-            g = 2
-            k = 2**i * r_b
-            if scale != 1:
-                bi = bi * scale + (1 - scale) * self.I.to(device=bi.device, dtype=bi.dtype)
-            inp = (
-                inp.unflatten(-1, (-1, g, k))
-                .transpose(-2, -1)
-                .flatten(-3)
-                .unflatten(-1, (-1, b))
-            )
-            # Use "m i j, ... m j -> ... m i" so the einsum applies butterfly
-            # blocks (m) to the last two dims regardless of leading
-            # batch/spatial dimensions.
-            inp = torch.einsum("m i j, ... m j -> ... m i", bi, inp)
-            inp = (
-                inp.flatten(-2).unflatten(-1, (-1, k, g)).transpose(-2, -1).flatten(-3)
-            )
-
-        if self.rescaled:
-            inp = inp * self.rescale.to(device=inp.device, dtype=inp.dtype).transpose(0, -1)
-
-        if self.op in {F.conv2d, F.conv1d, F.conv3d}:
-            inp = inp.transpose(1, -1)
-
-        if diff:
-            inp = inp - org
-        return inp
+        org_out = self.org_forward(x)
+        delta = boft_bypass_diff(
+            org_out,
+            self.oft_blocks,
+            self.rescale if self.rescaled else None,
+            constraint=self.constraint,
+            need_transpose=self.op in {F.conv2d, F.conv1d, F.conv3d},
+            scale=scale,
+        )
+        return delta if diff else org_out + delta
 
     def bypass_forward_diff(self, x, scale=1):
         return self._bypass_forward(x, scale, diff=True)
@@ -362,7 +305,7 @@ class ButterflyOFTModule(LycorisBaseModule):
     def forward(self, x, *args, **kwargs):
         if self.module_dropout and self.training:
             if torch.rand(1) < self.module_dropout:
-                return self.org_forward(x)
+                return self.org_forward(x, *args, **kwargs)
         scale = self.multiplier
 
         if self.bypass_mode:
@@ -378,4 +321,3 @@ class ButterflyOFTModule(LycorisBaseModule):
             bias = None
 
         return self._forward_rebuild_core(x, org_weight, bias)
-

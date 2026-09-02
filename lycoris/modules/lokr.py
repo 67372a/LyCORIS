@@ -5,9 +5,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .base import LycorisBaseModule
-from ..functional import factorization, rebuild_tucker
-from ..functional.lokr import make_kron
+from .base import LycorisBaseModule, is_weight_only_fp8_linear
+from ..functional import factorization
+from ..functional.general import weight_decompose
+from ..functional.lokr import kron_bypass, kron_weight
 from ..logging import logger
 
 from typing import Optional
@@ -108,8 +109,14 @@ class LokrModule(LycorisBaseModule):
         )
         # DoRA is a weight-space operation.  Applying it to a direct-factor
         # bypass would omit the magnitude normalization, so keep the same
-        # invariant here as the network wrappers do.
-        if weight_decompose and self.bypass_mode:
+        # invariant here as the network wrappers do.  Weight-only FP8 modules
+        # are exempt: their base weight cannot be materialised, so the fused
+        # fp8_weight_decompose path keeps both bypass and DoRA alive.
+        if (
+            weight_decompose
+            and self.bypass_mode
+            and not is_weight_only_fp8_linear(self.org_module[0])
+        ):
             self.bypass_mode = False
             logger.info(
                 "Because weight decomposition (DoRA) is enabled, bypass mode "
@@ -135,7 +142,7 @@ class LokrModule(LycorisBaseModule):
             use_scalar = True
 
         if self.module_type.startswith("conv"):
-            in_dim = org_module.in_channels
+            in_dim = org_module.in_channels // org_module.groups
             k_size = org_module.kernel_size
             out_dim = org_module.out_channels
             self.shape = (out_dim, in_dim, *k_size)
@@ -227,7 +234,7 @@ class LokrModule(LycorisBaseModule):
         self.wd = weight_decompose
         self.wd_on_output = wd_on_output
         if self.wd:
-            org_weight = org_module.weight.cpu().clone().float()
+            org_weight = self._current_weight().cpu().clone().float()
             ndim = org_weight.dim()
             self.dora_norm_dims = ndim - 1
 
@@ -589,27 +596,21 @@ class LokrModule(LycorisBaseModule):
 
         This method owns ``self.scale``.  Callers add only their runtime
         multiplier, which keeps rebuild, merge, parametrization, and bypass
-        numerically consistent.
+        numerically consistent.  Runtime orthogonalization (fork feature) is
+        applied to the factors before the kernel dispatch; it is a no-op
+        unless ``use_orthogonal_weights`` is enabled while training.
         """
-        if self.use_w1:
-            w1 = self._orthogonalize(self.lokr_w1)
-        else:
-            w1_a_ortho = self._orthogonalize(self.lokr_w1_a)
-            w1_b_ortho = self._orthogonalize(self.lokr_w1_b)
-            w1 = w1_a_ortho @ w1_b_ortho
-
-        if self.use_w2:
-            w2 = self._orthogonalize(self.lokr_w2)
-        else:
-            w2_a_ortho = self._orthogonalize(self.lokr_w2_a)
-            w2_b_ortho = self._orthogonalize(self.lokr_w2_b)
-            if self.tucker:
-                # We don't orthogonalize the core tensor `lokr_t2`
-                w2 = rebuild_tucker(self.lokr_t2, w2_a_ortho, w2_b_ortho)
-            else:
-                w2 = w2_a_ortho @ w2_b_ortho
-        
-        weight = make_kron(w1, w2, self.scale)
+        weight = kron_weight(
+            self._orthogonalize(self.lokr_w1) if self.use_w1 else None,
+            None if self.use_w1 else self._orthogonalize(self.lokr_w1_a),
+            None if self.use_w1 else self._orthogonalize(self.lokr_w1_b),
+            self._orthogonalize(self.lokr_w2) if self.use_w2 else None,
+            None if self.use_w2 else self._orthogonalize(self.lokr_w2_a),
+            None if self.use_w2 else self._orthogonalize(self.lokr_w2_b),
+            # The core tensor `lokr_t2` is never orthogonalized.
+            self.lokr_t2 if (self.tucker and not self.use_w2) else None,
+            scale=self.scale,
+        )
         dtype = weight.dtype
         if shape is not None:
             weight = weight.view(shape)
@@ -726,9 +727,30 @@ class LokrModule(LycorisBaseModule):
         return unscaled_norm
 
     def bypass_forward_diff(self, h, scale=1):
+        device = h.device
+        dtype = h.dtype
+
+        def to_input_dtype(tensor):
+            return tensor.to(device=device, dtype=dtype)
+
         is_conv = self.module_type.startswith("conv")
+        if not is_conv:
+            # Linear: the whole grouped chain is one dispatched call, and the
+            # fused kernel never builds kron(w1, w2).
+            diff = kron_bypass(
+                h,
+                to_input_dtype(self.lokr_w1) if self.use_w1 else None,
+                None if self.use_w1 else to_input_dtype(self.lokr_w1_a),
+                None if self.use_w1 else to_input_dtype(self.lokr_w1_b),
+                to_input_dtype(self.lokr_w2) if self.use_w2 else None,
+                None if self.use_w2 else to_input_dtype(self.lokr_w2_a),
+                None if self.use_w2 else to_input_dtype(self.lokr_w2_b),
+                None,
+                scale=self.scale * scale,
+            )
+            return self.drop(diff * self.scalar.to(device=device, dtype=dtype))
         if self.use_w2:
-            ba = self._orthogonalize(self.lokr_w2)
+            ba = to_input_dtype(self._orthogonalize(self.lokr_w2))
         else:
             a = self._orthogonalize(self.lokr_w2_b)
             b = self._orthogonalize(self.lokr_w2_a)
@@ -740,6 +762,7 @@ class LokrModule(LycorisBaseModule):
                 # weights use (out_channels, in_channels, ...).
                 b = b.transpose(0, 1).contiguous()
                 b = b.view(*b.shape, *[1] * (len(t.shape) - 2))
+                t = to_input_dtype(t)
             elif is_conv:
                 # Non-Tucker convolution w2_b is serialized as a flattened
                 # (rank, in_factor * kernel_elements) matrix.
@@ -754,6 +777,8 @@ class LokrModule(LycorisBaseModule):
                     a.shape[0], a.shape[1] // kernel_elements, *self.shape[2:]
                 )
                 b = b.view(*b.shape, *[1] * (len(self.shape) - 2))
+            a = to_input_dtype(a)
+            b = to_input_dtype(b)
 
         if self.use_w1:
             c = self._orthogonalize(self.lokr_w1)
@@ -761,6 +786,7 @@ class LokrModule(LycorisBaseModule):
             w1_a_ortho = self._orthogonalize(self.lokr_w1_a)
             w1_b_ortho = self._orthogonalize(self.lokr_w1_b)
             c = w1_a_ortho @ w1_b_ortho
+        c = to_input_dtype(c)
         uq = c.size(1)
 
         if is_conv:
@@ -813,7 +839,7 @@ class LokrModule(LycorisBaseModule):
 
         # get_weight() applies the alpha/rank scale in rebuild mode.  Apply
         # that factor here too, followed only by the runtime multiplier.
-        h = h * scale * self.scale * self.scalar
+        h = h * scale * self.scale * self.scalar.to(device=device, dtype=dtype)
         if self.training and self.rank_dropout:
             drop_size = h.shape[1] if is_conv else h.shape[-1]
             drop = (torch.rand(drop_size, device=h.device) > self.rank_dropout).to(h.dtype)
@@ -828,6 +854,30 @@ class LokrModule(LycorisBaseModule):
 
     def bypass_forward(self, x, scale=1):
         return self.org_forward(x) + self.bypass_forward_diff(x, scale=scale)
+
+    def _rebuild_forward(self, x, *args, **kwargs):
+        """High-precision rebuild path for weight-only FP8 base weights.
+
+        The quantized weight cannot be materialised for the fused rebuild,
+        so the delta is computed against the dequantized base and added to
+        the base forward output, preserving the activation dtype.
+        """
+        base = self.org_forward(x, *args, **kwargs)
+        base_weight = self._current_weight().to(x.device)
+        diff_weight = self.get_weight(self.shape).to(base_weight.dtype) * self.scalar
+
+        if self.wd:
+            new_weight = self.apply_weight_decompose(
+                base_weight + diff_weight, self.multiplier
+            )
+        elif self.multiplier == 1:
+            new_weight = base_weight + diff_weight
+        else:
+            new_weight = base_weight + diff_weight * self.multiplier
+
+        delta_weight = (new_weight - base_weight).to(device=x.device, dtype=x.dtype)
+        delta = self.op(x, delta_weight, None, **self.kw_dict)
+        return base + delta
 
     def _forward_rebuild_core(self, x, org_weight, bias):
         """Rebuild-mode forward pass — the torch.compile target.
@@ -850,10 +900,14 @@ class LokrModule(LycorisBaseModule):
     def forward(self, x: torch.Tensor, *args, **kwargs):
         if self.module_dropout and self.training:
             if torch.rand(1) < self.module_dropout:
-                return self.org_forward(x)
-        if self.bypass_mode:
-            return self.bypass_forward(x, self.multiplier)
+                return self.org_forward(x, *args, **kwargs)
 
+        fp8_weight_decompose = self.wd and is_weight_only_fp8_linear(self.org_module[0])
+        if self.bypass_mode and not fp8_weight_decompose:
+            return self.bypass_forward(x, self.multiplier)
+        if fp8_weight_decompose:
+            return self._rebuild_forward(x, *args, **kwargs)
+        activation_dtype = x.dtype
         x = x.to(self._cached_dtype)
         org_weight = self.get_org_weight_for_compute(x.device).data.to(self._cached_dtype, non_blocking=True)
         org_bias = self.get_org_bias_for_compute(x.device)
@@ -863,7 +917,10 @@ class LokrModule(LycorisBaseModule):
         else:
             bias = None
 
-        return self._forward_rebuild_core(x, org_weight, bias)
+        out = self._forward_rebuild_core(x, org_weight, bias)
+        # Preserve the caller's activation dtype (the compiled core computes
+        # in the cached compute dtype, which may be wider than bf16/fp16).
+        return out if out.dtype == activation_dtype else out.to(activation_dtype)
 
 
 if __name__ == "__main__":

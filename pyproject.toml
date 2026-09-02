@@ -19,12 +19,16 @@ classifiers = [
     "Environment :: GPU :: NVIDIA CUDA :: 11.8",
     "Environment :: GPU :: NVIDIA CUDA :: 12",
     "Environment :: GPU :: NVIDIA CUDA :: 12 :: 12.1",
+    "Environment :: GPU :: NVIDIA CUDA :: 13",
+    "Environment :: GPU :: NVIDIA CUDA :: 13 :: 13.2",
     "Intended Audience :: Developers",
     "Intended Audience :: End Users/Desktop",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Operating System :: OS Independent",
 ]
 dependencies = [
@@ -73,6 +77,13 @@ kohya = [
     # sd-scripts: install separately via pip install git+https://github.com/67372a/sd-scripts
 ]
 
+# The fused kernels are optional: without them everything falls back to torch.
+kernels = [
+    "triton; sys_platform == 'linux'",
+    "triton-windows; sys_platform == 'win32'",
+    "tilelang",
+]
+
 [dependency-groups]
 dev = [
     "coverage~=7.10.1",
@@ -91,3 +102,13 @@ packages = ["lycoris"]
 Homepage = "https://github.com/KohakuBlueleaf/LyCORIS"
 Repository = "https://github.com/KohakuBlueleaf/LyCORIS"
 Issues = "https://github.com/KohakuBlueleaf/LyCORIS/issues"
+
+[tool.black]
+line-length = 88
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+# Breakage only (syntax, undefined names); style is black's job.
+select = ["E9", "F63", "F7", "F82"]

@@ -1,0 +1,71 @@
+name: Nightly
+
+on:
+  schedule:
+    # 03:00 UTC daily
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build even if dev has not moved since the last nightly"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  # Computes the version and hands off. Release is the only workflow that
+  # builds or uploads, so PyPI needs exactly one trusted publisher.
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compute the nightly version
+        id: compute
+        shell: bash
+        run: |
+          version=$(python scripts/ci/version.py nightly)
+          {
+            echo "version=${version}"
+            echo "sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+          echo "nightly ${version}"
+
+      - name: Skip when dev has not moved
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          last=$(gh release list --limit 30 --json tagName,body \
+            --jq '[.[] | select(.tagName | contains(".dev"))][0].body // ""' \
+            | grep -oE '[0-9a-f]{40}' | head -n1 || true)
+          if [ "${{ inputs.force }}" = "true" ] || [ "${last}" != "${{ steps.compute.outputs.sha }}" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "dev is unchanged since ${last}; nothing to build"
+          fi
+
+      - name: Dispatch the release workflow
+        if: steps.gate.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run release.yml \
+            -f ref=dev \
+            -f version="${{ steps.compute.outputs.version }}"

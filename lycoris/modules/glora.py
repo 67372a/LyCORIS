@@ -6,10 +6,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .base import LycorisBaseModule
-from ..functional.general import tucker_weight_from_conv
+from ..functional import tucker_weight_from_conv
+from ..kernels.autograd.glora import glora_diff_weight
+from ..kernels.select import FUSED, call_compiled, choose
 from ..logging import logger
 
-from .base import LycorisBaseModule
 
 @cache
 def log_glora_drop():
@@ -18,6 +19,23 @@ def log_glora_drop():
         "being applied to the forward input instead of the layers. Requiring much lower values for dropout." \
         "Note: Bypass mode may not behave the same, so test and compare if desired."
     )
+
+
+def _glora_weight(org_weight, a1, a2, b1, b2, bm, gamma):
+    """ΔW = gamma·(W·a1·a2 + b1·b2); the b half is tucker-chained when bm is given."""
+    if bm is not None:
+        wb = tucker_weight_from_conv(b1, b2, bm)
+    else:
+        wb = b1.view(b1.size(0), -1) @ b2.view(b2.size(0), -1)
+        wb = wb.view(*org_weight.shape)
+    wa1 = a1.view(a1.size(0), -1)
+    wa2 = a2.view(a2.size(0), -1)
+    if org_weight.dim() > 2:
+        w_wa1 = torch.einsum("o i ..., i j -> o j ...", org_weight, wa1)
+        w_wa2 = torch.einsum("o i ..., i j -> o j ...", w_wa1, wa2)
+    else:
+        w_wa2 = (org_weight @ wa1) @ wa2
+    return (wb + w_wa2) * gamma
 
 
 class GLoRAModule(LycorisBaseModule):
@@ -224,30 +242,27 @@ class GLoRAModule(LycorisBaseModule):
             )
 
     def make_weight(self, device=None):
-        wa1 = self._orthogonalize(self.a1.weight.to(device)).view(self.a1.weight.size(0), -1)
-        wa2 = self._orthogonalize(self.a2.weight.to(device)).view(self.a2.weight.size(0), -1)
-
-        orig = self.get_org_weight_for_compute(device)
-
-        if orig.dtype != wa1.dtype:
-            orig = orig.to(wa1.dtype)
-
-        if self.tucker:
-            wb1 = self._orthogonalize(self.b1.weight.to(device))
-            wb2 = self._orthogonalize(self.b2.weight.to(device))
-            wbm = self._orthogonalize(self.bm.weight.to(device))
-            wb = tucker_weight_from_conv(wb1, wb2, wbm)
+        orig = self.org_weight
+        bm = self.bm.weight if self.tucker else None
+        # Runtime orthogonalization (fork feature): a no-op unless
+        # use_orthogonal_weights is enabled and the module is training.
+        a1 = self._orthogonalize(self.a1.weight)
+        a2 = self._orthogonalize(self.a2.weight)
+        b1 = self._orthogonalize(self.b1.weight)
+        b2 = self._orthogonalize(self.b2.weight)
+        if bm is not None:
+            bm = self._orthogonalize(bm)
+        args = (orig, a1, a2, b1, b2)
+        # W@a1 keeps its spatial axes on a conv, which the flat 2D fused
+        # rebuild cannot express.
+        backend = choose((*args, bm), supported=bm is None and orig.dim() == 2)
+        if backend in FUSED:
+            weight = glora_diff_weight(*args, gamma=self.scale, backend=backend)
+        elif backend == "compile":
+            weight = call_compiled(_glora_weight, *args, bm, self.scale)
         else:
-            wb1 = self._orthogonalize(self.b1.weight.to(device)).view(self.b1.weight.size(0), -1)
-            wb2 = self._orthogonalize(self.b2.weight.to(device)).view(self.b2.weight.size(0), -1)
-            wb = wb1 @ wb2
-            wb = wb.view(*orig.shape)
-        if orig.dim() > 2:
-            w_wa1 = torch.einsum("o i ..., i j -> o j ...", orig, wa1)
-            w_wa2 = torch.einsum("o i ..., i j -> o j ...", w_wa1, wa2)
-        else:
-            w_wa2 = (orig @ wa1) @ wa2
-        return (wb + w_wa2) * self.scale * self.scalar.to(device=device)
+            weight = _glora_weight(*args, bm, self.scale)
+        return weight * self.scalar
 
     def get_diff_weight(self, multiplier=1.0, shape=None, device=None):
         weight = self.make_weight(device) * multiplier
@@ -266,28 +281,12 @@ class GLoRAModule(LycorisBaseModule):
         return weight + diff_w, None
 
     def _bypass_forward(self, x, scale=1, diff=False):
-        scale = self.scale * scale
-        
-        # Orthogonalize all weights on the fly
-        wa1 = self._orthogonalize(self.a1.weight).to(x.device, dtype=x.dtype)
-        wa2 = self._orthogonalize(self.a2.weight).to(x.device, dtype=x.dtype)
-        wb1 = self._orthogonalize(self.b1.weight).to(x.device, dtype=x.dtype)
-        wb2 = self._orthogonalize(self.b2.weight).to(x.device, dtype=x.dtype)
-        
-        # Branch A: a2 is always 1x1 conv, so default stride/padding is fine
-        ax_mid = self.down_op(x, wa2) * scale
-        
-        # Branch B: b2 may have a non-1x1 kernel, so pass correct conv params
-        if self.isconv:
-            bx_mid = self.op(
-                x, wb2, bias=None,
-                stride=self.b2.stride,
-                padding=self.b2.padding,
-                dilation=self.b2.dilation,
-                groups=self.b2.groups,
-            ) * scale
+        if self.module_type == "linear":
+            ax_mid = F.linear(x, self.a2.weight.to(x))
+            bx_mid = F.linear(x, self.b2.weight.to(x))
         else:
-            bx_mid = self.down_op(x, wb2) * scale
+            ax_mid = self.a2(x)
+            bx_mid = self.b2(x)
 
         if self.rank_dropout and self.training:
             drop_a = (
@@ -307,32 +306,16 @@ class GLoRAModule(LycorisBaseModule):
                 drop_b = drop_b.view(*[1] * (dims - 1), -1)
             ax_mid = ax_mid * drop_a
             bx_mid = bx_mid * drop_b
-            
-        # Finish branch A
-        ax = self.up_op(ax_mid, wa1)
-
-        # Finish branch B
-        if self.tucker:
-            wbm = self._orthogonalize(self.bm.weight)
-            # Use functional call for the middle convolution
-            bx_mid = self.op(
-                bx_mid,
-                wbm,
-                bias=None,
-                stride=self.bm.stride,
-                padding=self.bm.padding,
-                dilation=self.bm.dilation,
-                groups=self.bm.groups,
-            )
-        bx = self.up_op(bx_mid, wb1)
-
-        # W(X + A(X)) + B(X)
-        return (
-            self.org_forward(
-                (0 if diff else x) + self.drop(ax) * self.scale
-            )
-            + self.drop(bx) * self.scale
-        )
+        if self.module_type == "linear":
+            ax = F.linear(ax_mid, self.a1.weight.to(ax_mid))
+            bx = F.linear(bx_mid, self.b1.weight.to(bx_mid))
+        else:
+            ax = self.a1(ax_mid)
+            bx = self.b1(bx_mid)
+        ax_scale = self.scalar.to(ax) * self.scale * scale
+        bx_scale = self.scalar.to(bx) * self.scale * scale
+        base_input = (0 if diff else x) + self.drop(ax) * ax_scale
+        return self.org_forward(base_input) + self.drop(bx) * bx_scale
 
     def bypass_forward_diff(self, x, scale=1):
         return self._bypass_forward(x, scale=scale, diff=True)
@@ -387,7 +370,7 @@ class GLoRAModule(LycorisBaseModule):
     def forward(self, x, *args, **kwargs):
         if self.module_dropout and self.training:
             if torch.rand(1) < self.module_dropout:
-                return self.org_forward(x)
+                return self.org_forward(x, *args, **kwargs)
         if self.bypass_mode:
             return self.bypass_forward(x, self.multiplier)
 
@@ -401,7 +384,7 @@ class GLoRAModule(LycorisBaseModule):
             bias = None
 
         return self._forward_rebuild_core(x, org_weight, bias)
-        
+
     @torch.no_grad()
     def apply_max_norm(self, max_norm, device=None):
         orig_norm = self.make_weight(device).norm() * self.scale

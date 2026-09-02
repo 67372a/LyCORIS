@@ -22,8 +22,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .base import LycorisBaseModule
+from ..functional.locon import diff_weight as lora_diff_weight
 from ..logging import logger
-
 
 SigType = Literal["principal", "last", "middle"]
 
@@ -78,7 +78,10 @@ def compute_timestep_mask(
     Returns:
         Binary mask of shape (1, max_rank)
     """
-    r = int(((max_timestep - timestep) / max_timestep) ** alpha * (max_rank - min_rank)) + min_rank
+    r = (
+        int(((max_timestep - timestep) / max_timestep) ** alpha * (max_rank - min_rank))
+        + min_rank
+    )
     r = min(r, max_rank)  # Clamp to max_rank
     mask = torch.zeros((1, max_rank))
     mask[:, :r] = 1.0
@@ -314,6 +317,12 @@ class TLoraModule(LycorisBaseModule):
         else:
             self.register_buffer("scalar", torch.tensor(1.0), persistent=False)
 
+        # Dropout
+        if dropout:
+            self.dropout = nn.Dropout(dropout)
+        else:
+            self.dropout = nn.Identity()
+
     def _initialize_from_svd(
         self,
         org_module: nn.Module,
@@ -342,22 +351,22 @@ class TLoraModule(LycorisBaseModule):
         # Select singular vectors based on sig_type
         if self.sig_type == "principal":
             # Use top singular vectors (largest singular values)
-            q_init = vh[:self.lora_dim]  # (lora_dim, in_dim)
-            p_init = u[:, :self.lora_dim]  # (out_dim, lora_dim)
-            lambda_init = s[:self.lora_dim]
+            q_init = vh[: self.lora_dim]  # (lora_dim, in_dim)
+            p_init = u[:, : self.lora_dim]  # (out_dim, lora_dim)
+            lambda_init = s[: self.lora_dim]
         elif self.sig_type == "last":
             # Use bottom singular vectors (smallest singular values)
-            q_init = vh[-self.lora_dim:]
-            p_init = u[:, -self.lora_dim:]
-            lambda_init = s[-self.lora_dim:]
+            q_init = vh[-self.lora_dim :]
+            p_init = u[:, -self.lora_dim :]
+            lambda_init = s[-self.lora_dim :]
         elif self.sig_type == "middle":
             # Use middle singular vectors
             start_q = (vh.shape[0] - self.lora_dim) // 2
             start_p = (u.shape[1] - self.lora_dim) // 2
             start_s = (s.shape[0] - self.lora_dim) // 2
-            q_init = vh[start_q:start_q + self.lora_dim]
-            p_init = u[:, start_p:start_p + self.lora_dim]
-            lambda_init = s[start_s:start_s + self.lora_dim]
+            q_init = vh[start_q : start_q + self.lora_dim]
+            p_init = u[:, start_p : start_p + self.lora_dim]
+            lambda_init = s[start_s : start_s + self.lora_dim]
         else:
             raise ValueError(f"Unknown sig_type: {self.sig_type}")
 
@@ -373,12 +382,16 @@ class TLoraModule(LycorisBaseModule):
             # For conv, q_layer is 1x1 conv: weight shape (lora_dim, in_channels, 1, ...)
             # We need to reshape q_init from (lora_dim, in_dim) to conv format
             kernel_ones = [1] * (len(self.conv_shape) - 2)
-            self.q_layer.weight.data = q_init[:, :self.shape[1]].reshape(
-                self.lora_dim, self.shape[1], *kernel_ones
-            ).contiguous()
-            self.p_layer.weight.data = p_init[:self.shape[0], :].reshape(
-                self.shape[0], self.lora_dim, *kernel_ones
-            ).contiguous()
+            self.q_layer.weight.data = (
+                q_init[:, : self.shape[1]]
+                .reshape(self.lora_dim, self.shape[1], *kernel_ones)
+                .contiguous()
+            )
+            self.p_layer.weight.data = (
+                p_init[: self.shape[0], :]
+                .reshape(self.shape[0], self.lora_dim, *kernel_ones)
+                .contiguous()
+            )
         else:
             # For linear: q_layer.weight is (lora_dim, in_features)
             # p_layer.weight is (out_features, lora_dim)
@@ -406,7 +419,7 @@ class TLoraModule(LycorisBaseModule):
             mask = torch.ones(1, self.lora_dim)
         # Ensure mask covers our rank (in case max_rank > lora_dim)
         if mask.shape[1] > self.lora_dim:
-            mask = mask[:, :self.lora_dim]
+            mask = mask[:, : self.lora_dim]
         elif mask.shape[1] < self.lora_dim:
             # Pad with ones if mask is smaller
             mask = F.pad(mask, (0, self.lora_dim - mask.shape[1]), value=1.0)
@@ -426,7 +439,7 @@ class TLoraModule(LycorisBaseModule):
         base_lambda: Optional[torch.Tensor] = None,
     ):
         """Reconstruct module from saved state dict."""
-        lora_dim = q_weight.shape[0] if q_weight.dim() == 2 else q_weight.shape[0]
+        lora_dim = q_weight.shape[0]
         module = cls(
             lora_name,
             orig_module,
@@ -511,8 +524,8 @@ class TLoraModule(LycorisBaseModule):
 
             # Current: P @ diag(λ) @ Q
             # diag(λ) @ Q = λ.T * Q (broadcasting)
-            curr = p_2d @ (lam.T * q_2d)  # (out_ch, in_ch)
-            base = p_base_2d @ (lam_base.T * q_base_2d)
+            curr = lora_diff_weight(lam.T * q_2d, p_2d, None)  # (out_ch, in_ch)
+            base = lora_diff_weight(lam_base.T * q_base_2d, p_base_2d, None)
 
             # Reshape back to conv shape with 1x1 kernel
             kernel_ones = [1] * (len(self.shape) - 2)
@@ -520,8 +533,8 @@ class TLoraModule(LycorisBaseModule):
         else:
             # For linear: P @ diag(λ) @ Q
             # p: (out_features, lora_dim), λ: (1, lora_dim), q: (lora_dim, in_features)
-            curr = p @ (lam.T * q)  # (out_features, in_features)
-            base = p_base @ (lam_base.T * q_base)
+            curr = lora_diff_weight(lam.T * q, p, None)  # (out_features, in_features)
+            base = lora_diff_weight(lam_base.T * q_base, p_base, None)
             diff = curr - base
 
         diff = diff * self.scalar.to(device) * self.scale * multiplier
@@ -533,7 +546,9 @@ class TLoraModule(LycorisBaseModule):
 
     def get_merged_weight(self, multiplier=1.0, shape=None, device=None):
         """Get original weight + LoRA delta."""
-        diff, _ = self.get_diff_weight(multiplier=multiplier, shape=shape, device=device)
+        diff, _ = self.get_diff_weight(
+            multiplier=multiplier, shape=shape, device=device
+        )
         weight = self.get_org_weight_for_compute(diff.device)
         if weight.dtype != diff.dtype:
             weight = weight.to(diff.dtype)

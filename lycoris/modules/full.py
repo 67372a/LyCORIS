@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 
 from .base import LycorisBaseModule, transfer_ramtensor_to_device
+from ..functional.general import add_scaled
 from ..logging import logger
 
 from typing import Optional
@@ -182,10 +183,18 @@ class FullModule(LycorisBaseModule):
             state_dict[f"{prefix}bias"] = diff_bias + self.bias.data.to(diff_bias)
 
     def make_weight(self, scale=1, device=None):
+        dropping = bool(self.rank_dropout) and self.training
+        if self.is_diff and not dropping:
+            # self.weight IS the diff here, so the merge is one scaled add.
+            weight = add_scaled(self.org_weight.to(device), self.weight, scale)
+            bias = None
+            if self.bias is not None and self.org_bias is not None:
+                # org_bias is cached as a one-element list, like _org_weight.
+                bias = add_scaled(self.org_bias[0].to(device), self.bias, scale)
+            return weight, bias
+
         drop = (
-            torch.rand(self.dim, device=device) > self.rank_dropout
-            if self.rank_dropout and self.training
-            else 1
+            torch.rand(self.dim, device=device) > self.rank_dropout if dropping else 1
         )
         if drop != 1 or scale != 1 or self.is_diff:
             diff_w, diff_b = self.get_diff_weight(scale, device=device)
@@ -260,12 +269,18 @@ class FullModule(LycorisBaseModule):
             and self.training
             and torch.rand(1) < self.module_dropout
         ):
-            original = True
-        else:
-            original = False
-        if original:
-            return self.org_forward(x)
-        scale = self.multiplier
-        weight, bias = self.make_weight(scale, x.device)
-        kw_dict = self.kw_dict | {"weight": weight, "bias": bias}
-        return self.op(x, **kw_dict)
+            # The org module's weight attribute is deleted after apply_to
+            # (stored in self._org_weight); use the snapshot for passthrough.
+            org_weight = self.get_org_weight_for_compute(x.device).to(x.dtype)
+            bias = self.get_org_bias_for_compute(x.device)
+            bias = bias.to(x.dtype) if bias is not None else None
+            return self._call_op(x, org_weight, bias)
+
+        # make_weight returns the merged weight/bias; the org module's weight
+        # attribute no longer exists, so apply the op directly.
+        weight, bias = self.make_weight(self.multiplier, x.device)
+        if weight.dtype != x.dtype:
+            weight = weight.to(x.dtype)
+        if bias is not None and bias.dtype != x.dtype:
+            bias = bias.to(x.dtype)
+        return self._call_op(x, weight, bias)
