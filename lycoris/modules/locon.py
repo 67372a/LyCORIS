@@ -66,6 +66,8 @@ class LoConModule(LycorisBaseModule):
         ggpo_conv_weight_sample_size: int = 100,
         orthogonalize=False,
         orthogonal_init=False,
+        nora_init: bool = False,
+        nora: bool = False,
         pissa_niter: int = 0,
         pissa_convert: bool = True,
         olora: bool = False,
@@ -99,6 +101,9 @@ class LoConModule(LycorisBaseModule):
         if orthogonalize and not orthogonal_init:
             orthogonal_init = True
         self.use_orthogonal_init = orthogonal_init
+        self.use_nora = bool(nora)
+        self.use_nora_init = bool(nora_init or nora)
+        self._has_svd_residual = False
         if self.use_orthogonal_weights and not use_scalar:
             use_scalar = True
 
@@ -297,6 +302,19 @@ class LoConModule(LycorisBaseModule):
         # QPiSSA: iterative quantization-aware SVD
         qpissa_iter = kwargs.get("qpissa_iter", 0)
         quant_fn = kwargs.get("quant_fn", None)
+        svd_segment = kwargs.get("svd_segment", None)
+
+        # Residual compensation is additive. DoRA's magnitude normalization is
+        # nonlinear, so reject this combination before SVD mutates the base.
+        if (
+            self.use_nora_init
+            and self.wd
+            and ((quant_fn is not None and qpissa_iter > 0) or svd_segment is not None)
+        ):
+            raise ValueError(
+                "NoRA initialization cannot currently be combined with PiSSA/SVD "
+                "initialization and weight_decompose=True."
+            )
 
         if quant_fn is not None and qpissa_iter > 0:
             # QPiSSA: iterative quantization-aware initialization
@@ -308,7 +326,6 @@ class LoConModule(LycorisBaseModule):
             self._init_qpissa(quant_fn, niter=qpissa_iter)
         else:
             # Standard SVD segment initialization (PiSSA-style)
-            svd_segment = kwargs.get("svd_segment", None)
             if svd_segment is not None:
                 if self.use_orthogonal_init:
                     logger.warning(
@@ -316,6 +333,9 @@ class LoConModule(LycorisBaseModule):
                         f"SVD segment init will replace orthogonal initialization for {self.lora_name}."
                     )
                 self._init_svd_segment(svd_segment)
+
+        if self.use_nora_init:
+            self._initialize_nora_down()
 
     @torch.no_grad()
     def _init_svd_segment(self, segment: str):
@@ -391,6 +411,7 @@ class LoConModule(LycorisBaseModule):
             self.org_module[0].weight.data -= (
                 diff.to(self.org_module[0].weight.dtype) * self.scale
             )
+        self._has_svd_residual = True
 
     @torch.no_grad()
     def _init_qpissa(self, quant_fn, niter: int = 5):
@@ -451,6 +472,7 @@ class LoConModule(LycorisBaseModule):
         self.org_module[0].weight.data.copy_(
             dequant_res.reshape(orig_shape).to(self.org_module[0].weight.dtype)
         )
+        self._has_svd_residual = True
 
         # Mark as PiSSA and store initial weights for later conversion
         self.is_pissa = True
@@ -554,6 +576,61 @@ class LoConModule(LycorisBaseModule):
             return self._orthogonalize(weight)
         return weight
 
+    @staticmethod
+    def _normalize_nora_weight(weight):
+        """Normalize down-factor columns over rank dimension zero."""
+        norm = torch.linalg.vector_norm(weight.float(), ord=2, dim=0, keepdim=True)
+        return weight / (norm.to(dtype=weight.dtype) + 1e-6)
+
+    @torch.no_grad()
+    def _initialize_nora_down(self, weight=None):
+        """Apply one-time NoRA initialization and preserve any SVD residual."""
+        if weight is None:
+            weight = self.lora_down.weight
+        original = weight.detach().clone()
+        normalized = self._normalize_nora_weight(original)
+
+        if weight is self.lora_down.weight and self._has_svd_residual:
+            if self.tucker:
+                raise ValueError("NoRA residual compensation does not support Tucker PiSSA initialization.")
+            original_delta = (
+                self.lora_up.weight.reshape(self.lora_up.weight.size(0), -1)
+                @ original.reshape(original.size(0), -1)
+            ).view(self.shape)
+            effective_down = (
+                self._normalize_nora_weight(normalized) if self.use_nora else normalized
+            )
+            normalized_delta = (
+                self.lora_up.weight.reshape(self.lora_up.weight.size(0), -1)
+                @ effective_down.reshape(effective_down.size(0), -1)
+            ).view(self.shape)
+            original_delta = self._apply_scalar(original_delta) * self.scale
+            normalized_delta = self._apply_scalar(normalized_delta) * self.scale
+            org_weight = self.org_module[0].weight
+            org_weight.data.add_(
+                (original_delta - normalized_delta).to(
+                    device=org_weight.device, dtype=org_weight.dtype
+                )
+            )
+
+        weight.copy_(normalized)
+        if weight is self.lora_down.weight and self.is_pissa and self.pissa_B_init is not None:
+            snapshot = self._normalize_nora_weight(self.pissa_B_init)
+            if self.use_nora:
+                snapshot = self._normalize_nora_weight(snapshot)
+            self.pissa_B_init = snapshot
+
+    def _maybe_nora_down(self, weight):
+        """Apply current orthogonalization, followed by NoRA if enabled."""
+        weight = self._maybe_orthogonalize(weight)
+        if self.use_nora:
+            weight = self._normalize_nora_weight(weight)
+        return weight
+
+    def _nora_export_weight(self, weight):
+        """Return the effective down factor for checkpoint export/merge."""
+        return self._normalize_nora_weight(weight) if self.use_nora else weight
+
     def _apply_scalar(self, weight, device=None, dtype=None):
         """Apply the appropriate scalar (single, row, col, or row+col) to weight."""
         if self.scalar_type == "scalar":
@@ -590,7 +667,7 @@ class LoConModule(LycorisBaseModule):
     def _make_weight_single(self, device=None):
         """Original single-task weight computation (used when olora=False)."""
         wa = self._maybe_orthogonalize(self.lora_up.weight.to(device))
-        wb = self._maybe_orthogonalize(self.lora_down.weight.to(device))
+        wb = self._maybe_nora_down(self.lora_down.weight.to(device))
         # T-LoRA: zero out masked rank dimensions in the down weight so the
         # up×down product has those rank components zeroed.  Equivalent to
         # masking the bottleneck activation but works in rebuild mode.
@@ -615,7 +692,7 @@ class LoConModule(LycorisBaseModule):
         num_tasks = len(self.lora_down_modules)
         for idx in range(num_tasks):
             wa = self._maybe_orthogonalize(self.lora_up_modules[idx].weight.to(device))
-            wb = self._maybe_orthogonalize(self.lora_down_modules[idx].weight.to(device))
+            wb = self._maybe_nora_down(self.lora_down_modules[idx].weight.to(device))
             if self.tucker and len(self.lora_mid_modules) > idx:
                 t = self._maybe_orthogonalize(self.lora_mid_modules[idx].weight.to(device))
                 wa = wa.view(wa.size(0), -1).transpose(0, 1)
@@ -636,7 +713,7 @@ class LoConModule(LycorisBaseModule):
     def _compute_diff_weight_single(self, device, dtype):
         """Single-task diff_weight for non-bypass forward (tucker or rank_dropout case)."""
         wa = self._maybe_orthogonalize(self.lora_up.weight).to(device=device, dtype=dtype)
-        wb = self._maybe_orthogonalize(self.lora_down.weight).to(device=device, dtype=dtype)
+        wb = self._maybe_nora_down(self.lora_down.weight).to(device=device, dtype=dtype)
         # T-LoRA: mask rank dimensions in the down weight (rebuild-mode path).
         if self.use_timestep_mask and self.training:
             wb = wb * self._timestep_mask.to(device=device, dtype=dtype).view(-1, *([1] * (wb.dim() - 1)))
@@ -663,7 +740,7 @@ class LoConModule(LycorisBaseModule):
         num_tasks = len(self.lora_down_modules)
         for idx in range(num_tasks):
             wa = self._maybe_orthogonalize(self.lora_up_modules[idx].weight).to(device=device, dtype=dtype)
-            wb = self._maybe_orthogonalize(self.lora_down_modules[idx].weight).to(device=device, dtype=dtype)
+            wb = self._maybe_nora_down(self.lora_down_modules[idx].weight).to(device=device, dtype=dtype)
 
             if self.tucker and len(self.lora_mid_modules) > idx:
                 t = self._maybe_orthogonalize(self.lora_mid_modules[idx].weight).to(device=device, dtype=dtype)
@@ -734,6 +811,9 @@ class LoConModule(LycorisBaseModule):
         else:
             nn.init.kaiming_uniform_(new_down.weight, a=math.sqrt(5))
             nn.init.zeros_(new_up.weight)
+
+        if self.use_nora_init:
+            self._initialize_nora_down(new_down.weight)
 
         # 4. Register new modules
         self.lora_down_modules.append(new_down)
@@ -833,7 +913,7 @@ class LoConModule(LycorisBaseModule):
                     self.lora_up_modules[task_idx].weight
                     * scalar.to(device=self.lora_up_modules[task_idx].weight.device, non_blocking=True)
                 )
-                destination[f"lora_down_task{task_idx}.weight"] = (
+                destination[f"lora_down_task{task_idx}.weight"] = self._nora_export_weight(
                     self.lora_down_modules[task_idx].weight
                 )
                 if self.tucker and task_idx < len(self.lora_mid_modules):
@@ -853,7 +933,9 @@ class LoConModule(LycorisBaseModule):
                 [lora_up_w, self.pissa_A_init.to(lora_up_w.device)], dim=1
             )
             # Concatenate: trained B (down) with negated initial B₀ (down init)
-            lora_down_w = self._apply_col_scalar(self.lora_down.weight)
+            lora_down_w = self._apply_col_scalar(
+                self._nora_export_weight(self.lora_down.weight)
+            )
             converted_down = torch.cat(
                 [lora_down_w, -self.pissa_B_init.to(lora_down_w.device)], dim=0
             )
@@ -866,7 +948,9 @@ class LoConModule(LycorisBaseModule):
             )
         else:
             destination["lora_up.weight"] = self._apply_row_scalar(self.lora_up.weight)
-            destination["lora_down.weight"] = self._apply_col_scalar(self.lora_down.weight)
+            destination["lora_down.weight"] = self._apply_col_scalar(
+                self._nora_export_weight(self.lora_down.weight)
+            )
             # Preserve PiSSA init weights in state dict for round-trip loading
             if self.is_pissa and self.pissa_A_init is not None:
                 destination["pissa_A_init"] = self.pissa_A_init
@@ -901,7 +985,9 @@ class LoConModule(LycorisBaseModule):
         # Bake scalar into lora_up before concatenation so the converted
         # adapter produces  scalar*A'B' - A₀B₀  (matching custom_state_dict).
         lora_up_curr = self._apply_row_scalar(self.lora_up.weight.data.clone())
-        lora_down_curr = self._apply_col_scalar(self.lora_down.weight.data.clone())
+        lora_down_curr = self._apply_col_scalar(
+            self._nora_export_weight(self.lora_down.weight.data.clone())
+        )
         pissa_up_init = self.pissa_A_init.to(lora_up_curr.device)
         pissa_down_init = self.pissa_B_init.to(lora_down_curr.device)
 
@@ -1045,7 +1131,9 @@ class LoConModule(LycorisBaseModule):
         # Merge all tasks except the last (current, trainable) one
         for task_idx in range(len(self.lora_down_modules) - 1):
             wa = self.lora_up_modules[task_idx].weight.data
-            wb = self.lora_down_modules[task_idx].weight.data
+            wb = self._nora_export_weight(
+                self.lora_down_modules[task_idx].weight.data
+            )
             delta = (wa.view(wa.size(0), -1) @ wb.view(wb.size(0), -1)).view(self.shape)
             delta = delta * self.scale
             scalar = (
@@ -1088,7 +1176,7 @@ class LoConModule(LycorisBaseModule):
         """Single-task bypass forward diff — pre-fetches weights, delegates to compiled core."""
         # Pre-fetch and orthogonalize weights outside the compiled region
         # to avoid graph breaks from conditional device transfers.
-        wb = self._maybe_orthogonalize(self.lora_down.weight).to(x.device, dtype=x.dtype)
+        wb = self._maybe_nora_down(self.lora_down.weight).to(x.device, dtype=x.dtype)
         wa = self._maybe_orthogonalize(self.lora_up.weight).to(x.device, dtype=x.dtype)
         wc = None
         if self.tucker:
@@ -1123,7 +1211,7 @@ class LoConModule(LycorisBaseModule):
         for idx in range(num_tasks):
             down_module = self.lora_down_modules[idx]
             up_module = self.lora_up_modules[idx]
-            wb = self._maybe_orthogonalize(down_module.weight).to(x.device, dtype=x.dtype)
+            wb = self._maybe_nora_down(down_module.weight).to(x.device, dtype=x.dtype)
             wa = self._maybe_orthogonalize(up_module.weight).to(x.device, dtype=x.dtype)
 
             if self.isconv:
@@ -1647,6 +1735,8 @@ class RaLoRAModule(LoConModule):
                     nn.init.orthogonal_(self.lora_down.weight)
                 else:
                     nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
+                if self.use_nora_init:
+                    self._initialize_nora_down(self.lora_down.weight)
                 nn.init.zeros_(self.lora_up.weight)
 
             self._update_scaling(avg_rank, rank)
@@ -1711,6 +1801,8 @@ class RaLoRAModule(LoConModule):
                 nn.init.orthogonal_(mini_a)
             else:
                 nn.init.kaiming_uniform_(mini_a, a=math.sqrt(5))
+            if self.use_nora_init:
+                self._initialize_nora_down(mini_a)
 
         # Mini-B stays zero-initialized (standard LoRA convention)
 
@@ -1745,7 +1837,7 @@ class RaLoRAModule(LoConModule):
         # Block-diagonal: assemble via torch.block_diag for linear,
         # manual placement for conv.
         wa_list = [
-            self._orthogonalize(a.to(device)) for a in self._mini_lora_A
+            self._maybe_nora_down(a.to(device)) for a in self._mini_lora_A
         ]
         wb_list = [
             self._orthogonalize(b.to(device)) for b in self._mini_lora_B
@@ -1791,7 +1883,7 @@ class RaLoRAModule(LoConModule):
             return super()._compute_diff_weight_single(device, dtype)
 
         wa_list = [
-            self._maybe_orthogonalize(a).to(device=device, dtype=dtype) for a in self._mini_lora_A
+            self._maybe_nora_down(a).to(device=device, dtype=dtype) for a in self._mini_lora_A
         ]
         wb_list = [
             self._maybe_orthogonalize(b).to(device=device, dtype=dtype) for b in self._mini_lora_B
@@ -1834,7 +1926,7 @@ class RaLoRAModule(LoConModule):
             up_parts = []
             for i in range(self.n_split):
                 mini_x = x[:, i * self.mini_in_features:(i + 1) * self.mini_in_features, ...]
-                wa = self._maybe_orthogonalize(self._mini_lora_A[i]).to(device=device, dtype=dtype)
+                wa = self._maybe_nora_down(self._mini_lora_A[i]).to(device=device, dtype=dtype)
                 wb = self._maybe_orthogonalize(self._mini_lora_B[i]).to(device=device, dtype=dtype)
                 mid = self.down_op(
                     mini_x, wa,
@@ -1869,7 +1961,7 @@ class RaLoRAModule(LoConModule):
             for i in range(self.n_split):
                 in_s = i * self.mini_in_features
                 mini_x = x[..., in_s:in_s + self.mini_in_features]
-                wa = self._maybe_orthogonalize(self._mini_lora_A[i]).to(device=device, dtype=dtype)
+                wa = self._maybe_nora_down(self._mini_lora_A[i]).to(device=device, dtype=dtype)
                 wb = self._maybe_orthogonalize(self._mini_lora_B[i]).to(device=device, dtype=dtype)
                 mid = F.linear(x[..., in_s:in_s + self.mini_in_features], wa)
 
@@ -1941,7 +2033,9 @@ class RaLoRAModule(LoConModule):
             destination[f"lora_up_block{i}.weight"] = (
                 self._mini_lora_B[i] * scalar_val
             )
-            destination[f"lora_down_block{i}.weight"] = self._mini_lora_A[i]
+            destination[f"lora_down_block{i}.weight"] = self._nora_export_weight(
+                self._mini_lora_A[i]
+            )
 
         if self.tucker:
             destination["lora_mid.weight"] = self.lora_mid.weight

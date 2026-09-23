@@ -125,6 +125,14 @@ Arguments to put in `network_args` for kohya sd scripts
 - Will force `orthogonal_init=True` and `use_scalar=True` when enabled
 - Can be used together with `orthogonal_init` explicitly, or alone (which implies it)
 
+### NoRA Down-Factor Normalization
+
+- Valid for LoRA/LoCon and RaLoRA.
+- `nora_init=True` normalizes the down factor once after adapter initialization.
+- `nora=True` includes the one-time initialization and applies differentiable normalization across the rank dimension whenever the down factor is used, including forward, merge, and adapter export.
+- Both options default to `False`; `nora` implies `nora_init`.
+- Settings are stored in LyCORIS checkpoint metadata. SVD/PiSSA initialization with NoRA and `dora_wd=True` is rejected because the DoRA residual transform is nonlinear.
+
 ### Data-Dependent Initialization (T-LoRA)
 
 - Enabled with `use_data_init=True` (default)

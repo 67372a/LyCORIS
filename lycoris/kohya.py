@@ -112,6 +112,12 @@ def create_network(
     unbalanced_factorization = str_bool(kwargs.get("unbalanced_factorization", False))
     orthogonalize = str_bool(kwargs.get("orthogonalize", False))
     orthogonal_init = str_bool(kwargs.get("orthogonal_init", False))
+    nora_init = str_bool(kwargs.get("nora_init", False))
+    nora = str_bool(kwargs.get("nora", False))
+    if nora:
+        nora_init = True
+    if (nora or nora_init) and algo not in ("lora", "locon", "ralora"):
+        raise ValueError("NoRA options are supported only for LoRA/LoCon and RaLoRA.")
     if orthogonalize:
         logger.info("Runtime orthogonalization of weights for Lycoris is enabled")
         if not orthogonal_init:
@@ -448,6 +454,8 @@ def create_network(
         weight_noise_dynamic_sigma=weight_noise_dynamic_sigma,
         orthogonalize=orthogonalize,
         orthogonal_init=orthogonal_init,
+        nora_init=nora_init,
+        nora=nora,
         svd_segment=svd_segment,
         pissa_niter=pissa_niter,
         pissa_convert=pissa_convert,
@@ -531,13 +539,24 @@ def create_network_from_weights(
     for_inference=False,
     **kwargs,
 ):
+    nora_metadata = {}
     if weights_sd is None:
         if os.path.splitext(file)[1] == ".safetensors":
             from safetensors.torch import load_file, safe_open
 
+            with safe_open(file, framework="pt", device="cpu") as f:
+                nora_metadata = f.metadata() or {}
             weights_sd = load_file(file)
         else:
             weights_sd = torch.load(file, map_location="cpu")
+            nora_metadata = getattr(weights_sd, "_metadata", {}).get("", {})
+    else:
+        nora_metadata = getattr(weights_sd, "_metadata", {}).get("", {})
+
+    nora = str_bool(nora_metadata.get("lycoris_nora", kwargs.get("nora", False)))
+    nora_init = str_bool(
+        nora_metadata.get("lycoris_nora_init", kwargs.get("nora_init", False))
+    ) or nora
 
     # get dim/alpha mapping
     unet_loras = {}
@@ -577,7 +596,9 @@ def create_network_from_weights(
 
     original_level = logger.level
     logger.setLevel(logging.ERROR)
-    network = LycorisNetworkKohya(text_encoder, unet)
+    network = LycorisNetworkKohya(
+        text_encoder, unet, nora=nora, nora_init=nora_init
+    )
     network.unet_loras = []
     network.text_encoder_loras = []
     logger.setLevel(original_level)
@@ -606,6 +627,9 @@ def create_network_from_weights(
 
     for lora in network.unet_loras + network.text_encoder_loras:
         lora.multiplier = multiplier
+        if hasattr(lora, "use_nora"):
+            lora.use_nora = nora
+            lora.use_nora_init = nora_init
 
     return network, weights_sd
 
@@ -759,6 +783,8 @@ class LycorisNetworkKohya(LycorisNetwork):
         self.weight_noise_sigma = kwargs.get("weight_noise_sigma", None)
         self.weight_noise_mode = kwargs.get("weight_noise_mode", "relative")
         self.weight_noise_dynamic_sigma = kwargs.get("weight_noise_dynamic_sigma", False)
+        self.nora = str_bool(kwargs.get("nora", False))
+        self.nora_init = str_bool(kwargs.get("nora_init", False)) or self.nora
         if self.weight_noise_sigma is not None:
             self.weight_noise_sigma = float(self.weight_noise_sigma)
 
@@ -1300,9 +1326,14 @@ class LycorisNetworkKohya(LycorisNetwork):
         if os.path.splitext(file)[1] == ".safetensors":
             from safetensors.torch import load_file, safe_open
 
+            with safe_open(file, framework="pt", device="cpu") as f:
+                self._apply_nora_metadata(f.metadata() or {})
             self.weights_sd = load_file(file)
         else:
             self.weights_sd = torch.load(file, map_location="cpu")
+            self._apply_nora_metadata(
+                getattr(self.weights_sd, "_metadata", {}).get("", {})
+            )
         missing, unexpected = self.load_state_dict(self.weights_sd, strict=False)
         state = {}
         if missing:
@@ -1649,7 +1680,13 @@ class LycorisNetworkKohya(LycorisNetwork):
             model_hash = precalculate_safetensors_hashes(state_dict)
             metadata["sshs_model_hash"] = model_hash
             metadata["wd_on_output"] = str(self.wd_on_output)
+            metadata["lycoris_nora"] = str(self.nora).lower()
+            metadata["lycoris_nora_init"] = str(self.nora_init).lower()
 
             save_file(state_dict, file, metadata)
         else:
+            if hasattr(state_dict, "_metadata"):
+                root_metadata = state_dict._metadata.setdefault("", {})
+                root_metadata["lycoris_nora"] = str(self.nora).lower()
+                root_metadata["lycoris_nora_init"] = str(self.nora_init).lower()
             torch.save(state_dict, file)
