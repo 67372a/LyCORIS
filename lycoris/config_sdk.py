@@ -54,6 +54,12 @@ ALGO_REGISTRY: Dict[str, AlgoSpec] = {
             "weight_decompose",
             "wd_on_output",
             "bypass_mode",
+            "nora_init",
+            "nora",
+        ),
+        notes=(
+            "nora_init normalizes the LoRA down factor once after initialization. "
+            "nora also applies differentiable rank-axis normalization during use."
         ),
     ),
     "locon": AlgoSpec(
@@ -70,6 +76,12 @@ ALGO_REGISTRY: Dict[str, AlgoSpec] = {
             "weight_decompose",
             "wd_on_output",
             "bypass_mode",
+            "nora_init",
+            "nora",
+        ),
+        notes=(
+            "nora_init normalizes the LoCon down factor once after initialization. "
+            "nora also applies differentiable rank-axis normalization during use."
         ),
     ),
     "loha": AlgoSpec(
@@ -245,8 +257,13 @@ ALGO_REGISTRY: Dict[str, AlgoSpec] = {
             "ralora_svd_threshold",
             "ralora_cumulative_variance",
             "ralora_forward_method",
+            "nora_init",
+            "nora",
         ),
-        notes="Requires a precomputation phase via RaLoRAModule.precompute_and_init().",
+        notes=(
+            "Requires a precomputation phase via RaLoRAModule.precompute_and_init(). "
+            "Also supports nora_init and nora on its LoCon down factors."
+        ),
     ),
     "tsm": AlgoSpec(
         name="tsm",

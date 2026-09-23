@@ -9,6 +9,7 @@ However, newer methods may only be available in the latest release / the dev bra
 
 * Trigged by `algo=lora` or `algo=locon` (Just alias)
 * Includes Conv layer implementation from LoCon.
+* NoRA options are available for LoRA/LoCon: `nora_init=True` normalizes the down factor once after initialization, while `nora=True` also reapplies differentiable rank-axis normalization during forward, merge, and export. The latter includes initialization. Both default to `False`; NoRA settings are recorded in LyCORIS checkpoint metadata.
 * Recommended settings
   * dim <= 64
   * alpha from 1 (or lower, like 0.3) to half dimension
